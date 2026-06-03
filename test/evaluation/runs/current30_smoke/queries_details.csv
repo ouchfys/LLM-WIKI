@@ -1,0 +1,130 @@
+id,query,query_type,difficulty,expected_source,expected_card_titles,allow_web,answer,citations,resources,tool_plan,latency_seconds,retrieval_hit,top1_hit,web_allowed,web_used,tool_routing_correct,answer_confidence,answer_completeness,citation_grounding,unsupported_claim_risk,final_score,reviewer_reason
+paper_001,What is the core architecture proposed in Attention Is All You Need?,concept_explanation,easy,Attention Is All You Need,Attention Is All You Need,false,"结论：  
+《Attention Is All You Need》提出的核心架构是 **Transformer**，这是一种完全基于注意力机制的序列转导模型，由编码器和解码器堆叠组成，摒弃了传统的循环（RNN）和卷积（CNN）结构。
+
+结构化解析：  
+1. **整体架构**  
+   - 采用经典的编码器-解码器结构（Encoder-Decoder）[1][3]。  
+   - 编码器将输入序列映射为连续表示，解码器基于编码输出生成目标序列[1]。  
+
+2. **核心组件**  
+   - **多头自注意力（Multi-Head Self-Attention）**：  
+     通过并行计算多个注意力头，捕获序列中不同位置的依赖关系，无论距离远近[1][2]。  
+   - **前馈网络（Feed-Forward Network）**：  
+     每个注意力子层后接一个全连接前馈网络，独立处理每个位置[3]。  
+   - **残差连接与层归一化**：  
+     每个子层输出通过残差连接和层归一化稳定训练[3]。  
+
+3. **关键创新**  
+   - 完全依赖注意力机制，避免了RNN的序列计算瓶颈和CNN的局部感受野限制[1]。  
+   - 自注意力机制直接建模序列内全局依赖关系，显著提升长程依赖捕捉能力[2]。  
+
+引用来源：  
+- [1] Attention Is All You Need（论文页）  
+- [2] Self-Attention（概念页）  
+- [3] Transformer（方法页）  
+
+注：当前Wiki内容已充分覆盖问题，无需补充外部参考。若需进一步了解实现细节（如位置编码、缩放点积注意力等），可扩展相关Wiki卡片。","[{""card_id"": ""6e91883d-e6a7-4887-9708-58166fc37dba"", ""title"": ""Attention Is All You Need"", ""page_type"": ""PaperPage"", ""summary"": ""提出了一种全新的序列转导模型架构 Transformer，完全基于注意力机制，摒弃了循环和卷积结构，在机器翻译任务上取得了更优的性能和更高的训练效率。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/attention-is-all-you-need.md""}, {""card_id"": ""28ab6893-e69e-452f-8f81-5e120783d25e"", ""title"": ""Self-Attention"", ""page_type"": ""ConceptPage"", ""summary"": ""一种注意力机制，用于计算单个序列中不同位置之间的表示关系，是 Transformer 的核心组件。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/concepts/self-attention.md""}, {""card_id"": ""30148c8e-0845-46d8-9a6a-d0fd1c895b3b"", ""title"": ""Transformer"", ""page_type"": ""MethodPage"", ""summary"": ""一种完全基于注意力机制的序列转导模型，由编码器和解码器堆叠而成，每层包含多头自注意力和前馈网络，广泛应用于自然语言处理任务。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/methods/transformer.md""}, {""card_id"": ""88d65b1a-ad56-4bfc-9669-fcb97d6cc26c"", ""title"": ""Hidden representations"", ""page_type"": ""ConceptPage"", ""summary"": ""LLM 中间层的隐藏表示，可用于探测模型内部状态、任务感知和推理过程。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/concepts/hidden-representations.md""}, {""card_id"": ""6cb2f34c-ce24-4942-bc3f-e8c021176c7e"", ""title"": ""律师推荐和服务小程序的设计与实现"", ""page_type"": ""PaperPage"", ""summary"": ""本论文设计并实现了一个律师推荐和服务系统，通过在线服务平台使律师工作更高效，用户法律咨询更便捷。系统包含用户、律师、管理员三个角色，用户端为小程序，提供注册登录、查看律师信息、预约等功能。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/律师推荐和服务小程序的设计与实现.md""}, {""card_id"": ""c37a6ed4-e585-4415-8dc3-73ada6538cf7"", ""title"": ""Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?"", ""page_type"": ""PaperPage"", ""summary"": ""本文质疑了当前广泛使用的 Reinforcement Learning with Verifiable Rewards (RLVR) 是否真正扩展了大型语言模型 (LLM) 的推理能力边界。通过系统实验，作者发现 RLVR 并未提升基座模型在原本无法解决的问题上的表现，而是通过增加推理计算量（如更长的思维链）更好地利用了基座模型已有的能力。相比之下，蒸馏 (distillation) 能够引入新知识，从而真正扩展推理边界。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/does-reinforcement-learning-really-incentivize-reasoning-capacity-in-llms-beyond.md""}]",[],"{""intent"": ""query about the core architecture of the 'Attention Is All You Need' paper"", ""answer_mode"": ""wiki_card"", ""use_wiki"": true, ""use_web"": false, ""use_resources"": false, ""open_cards"": true, ""tools"": [{""name"": ""wiki_search"", ""query"": ""Attention Is All You Need core architecture"", ""reason"": ""The user is asking about a well-known paper's architecture, which is likely documented in the private Wiki as a stable concept.""}, {""name"": ""wiki_card"", ""query"": ""What is the core architecture proposed in Attention Is All You Need?"", ""reason"": ""open matched Wiki cards""}]}",23.3933,1.0,1.0,false,false,1.0,1.0,1.0,1.0,0.1,0.975,"fallback review; keyword_score=1.00, retrieval_hit_rate=1.00, web_used=False, citations=6"
+paper_006,What is the main goal of DeepSeek-R1?,concept_explanation,easy,DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning,DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning,false,"DeepSeek-R1 的主要目标是通过纯强化学习（RL）激励大语言模型的推理能力，无需依赖人工标注的推理轨迹。该模型专注于提升在数学、编程竞赛和 STEM 领域等可验证任务上的性能[1]。
+
+**结构化分析：**  
+1. **核心方法**  
+   - 采用纯强化学习框架（如 GRPO 训练），通过奖励机制直接优化模型的推理能力，而非依赖监督微调（SFT）或人工标注数据[2]。  
+   - 实验表明，RL 阶段能显著提升模型在复杂任务（如 LiveCodeBench 数据集中的高难度问题）上的表现[1]。  
+
+2. **性能验证**  
+   - 在数学、编程等可验证任务中，DeepSeek-R1 的性能超越对比模型（统计显著性 𝑝 < 0.01）[1]。  
+   - 研究还探索了不同训练阶段（如 Zero/Dev1/Dev2）对问题难度感知的影响[1]。  
+
+**局限性说明**  
+当前 Wiki 卡片未明确提及「核心假设」（如 ""The LLM Already Knows""）与目标的关系，若需进一步探讨可补充相关笔记。  
+
+引用来源：  
+[1] [DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning](oss://fysjarvis/users/admin/data/generated/wiki/papers/deepseek-r1-incentivizing-reasoning-capability-in-llms-via-reinforcement-learnin.md)  
+[2] [DeepSeek-R1 训练流程](oss://fysjarvis/users/admin/data/generated/wiki/methods/deepseek-r1-训练流程-deepseek-r1-training-pipeline.md)","[{""card_id"": ""8e8d5634-b538-483b-835b-a771405fe4c8"", ""title"": ""DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"", ""page_type"": ""PaperPage"", ""summary"": ""本文提出 DeepSeek-R1，通过纯强化学习（RL）激励大语言模型的推理能力，无需人工标注的推理轨迹。模型在数学、编程竞赛和 STEM 领域等可验证任务上取得了超越对比模型的性能。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/deepseek-r1-incentivizing-reasoning-capability-in-llms-via-reinforcement-learnin.md""}, {""card_id"": ""cbe9edda-2d3c-490e-9747-5d76a407d3ed"", ""title"": ""DeepSeek-R1 训练流程 (DeepSeek-R1 Training Pipeline)"", ""page_type"": ""MethodPage"", ""summary"": ""DeepSeek-R1 的第一阶段强化学习训练流程，包括超参数设置、采样策略和语言一致性奖励。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/methods/deepseek-r1-训练流程-deepseek-r1-training-pipeline.md""}]",[],"{""intent"": ""query_main_goal"", ""answer_mode"": ""wiki_card"", ""use_wiki"": true, ""use_web"": false, ""use_resources"": false, ""open_cards"": true, ""tools"": [{""name"": ""wiki_search"", ""query"": ""DeepSeek-R1 main goal"", ""reason"": ""The user is asking about the main goal of DeepSeek-R1, which is likely a stable concept or documented in the private Wiki.""}, {""name"": ""wiki_card"", ""query"": ""What is the main goal of DeepSeek-R1?"", ""reason"": ""open matched Wiki cards""}]}",23.2232,1.0,1.0,false,false,1.0,1.0,1.0,1.0,0.1,0.975,"fallback review; keyword_score=1.00, retrieval_hit_rate=1.00, web_used=False, citations=2"
+paper_011,What question does the RL reasoning capacity paper investigate?,concept_explanation,easy,Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?,Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?,false,"结论：  
+论文《Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?》的核心研究问题是：**当前广泛使用的基于可验证奖励的强化学习（RLVR）方法是否真正扩展了大型语言模型（LLM）的推理能力边界？**  
+
+结构化分析：  
+1. **问题背景**  
+   - RLVR 方法（如通过答案匹配或单元测试优化模型）被普遍认为能激励 LLM 提升推理能力 [4]。  
+   - 但论文通过系统实验质疑了这一假设，指出 RLVR 可能仅优化了基座模型已有能力的利用效率，而非扩展其能力边界 [1]。  
+
+2. **关键发现**  
+   - **推理路径已存在于基座模型**：实验表明，RLVR 提升的表现源于更长的思维链（增加计算量），而非学习新推理能力 [1][2]。  
+   - **能力边界对比**：通过 pass@k 曲线评估，RLVR 模型在低采样次数（k=1）下表现更好，但在高 k 值时与基座模型无显著差异，说明其未突破原有边界 [1][3]。  
+   - **与蒸馏的对比**：蒸馏（distillation）能引入新知识，真正扩展推理边界，而 RLVR 无法实现这一点 [1]。  
+
+3. **研究意义**  
+   - 挑战了 RLVR 的常规认知，呼吁重新思考如何设计真正提升 LLM 推理能力的方法。  
+
+引用 Wiki 笔记：  
+[1] Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?  
+[2] Reasoning Capacity Boundary  
+[3] Pass@k Curves for Evaluating Reasoning Boundary  
+[4] Reinforcement Learning with Verifiable Rewards (RLVR)  
+
+（注：未使用 Web 搜索和其他资源推荐，因 Wiki 笔记已提供完整答案。）","[{""card_id"": ""c37a6ed4-e585-4415-8dc3-73ada6538cf7"", ""title"": ""Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?"", ""page_type"": ""PaperPage"", ""summary"": ""本文质疑了当前广泛使用的 Reinforcement Learning with Verifiable Rewards (RLVR) 是否真正扩展了大型语言模型 (LLM) 的推理能力边界。通过系统实验，作者发现 RLVR 并未提升基座模型在原本无法解决的问题上的表现，而是通过增加推理计算量（如更长的思维链）更好地利用了基座模型已有的能力。相比之下，蒸馏 (distillation) 能够引入新知识，从而真正扩展推理边界。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/does-reinforcement-learning-really-incentivize-reasoning-capacity-in-llms-beyond.md""}, {""card_id"": ""c25d0284-38ad-4edb-9836-c3f1a896909b"", ""title"": ""Reasoning Capacity Boundary"", ""page_type"": ""ConceptPage"", ""summary"": ""推理能力边界是指模型在给定难度下能够解决的问题集合的边界，通常通过 pass@k 曲线来刻画。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/concepts/reasoning-capacity-boundary.md""}, {""card_id"": ""ce783dcd-0b8f-45e5-a974-041fc15f2f3b"", ""title"": ""Pass@k Curves for Evaluating Reasoning Boundary"", ""page_type"": ""MethodPage"", ""summary"": ""Pass@k 曲线是一种评估模型推理能力边界的方法，通过在不同难度基准上计算模型在 k 次采样中至少一次成功的概率，并绘制成曲线。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/methods/pass-k-curves-for-evaluating-reasoning-boundary.md""}, {""card_id"": ""9bc63ac9-83ff-4f81-aa98-d39acba46a1a"", ""title"": ""Reinforcement Learning with Verifiable Rewards (RLVR)"", ""page_type"": ""ConceptPage"", ""summary"": ""RLVR 是一种通过自动可计算的奖励（如答案匹配或单元测试）来优化 LLM 的强化学习方法，常用于提升数学和编程推理能力。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/concepts/reinforcement-learning-with-verifiable-rewards-rlvr.md""}, {""card_id"": ""8e8d5634-b538-483b-835b-a771405fe4c8"", ""title"": ""DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"", ""page_type"": ""PaperPage"", ""summary"": ""本文提出 DeepSeek-R1，通过纯强化学习（RL）激励大语言模型的推理能力，无需人工标注的推理轨迹。模型在数学、编程竞赛和 STEM 领域等可验证任务上取得了超越对比模型的性能。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/deepseek-r1-incentivizing-reasoning-capability-in-llms-via-reinforcement-learnin.md""}]",[],"{""intent"": ""retrieve information about the RL reasoning capacity paper"", ""answer_mode"": ""wiki_card"", ""use_wiki"": true, ""use_web"": false, ""use_resources"": false, ""open_cards"": true, ""tools"": [{""name"": ""wiki_search"", ""query"": ""RL reasoning capacity paper"", ""reason"": ""The user is asking about a specific paper, which is likely to be documented in the private Wiki if it's related to stable concepts, paper notes, or interview prep.""}, {""name"": ""wiki_card"", ""query"": ""What question does the RL reasoning capacity paper investigate?"", ""reason"": ""open matched Wiki cards""}]}",27.0338,1.0,1.0,false,false,1.0,1.0,1.0,1.0,0.1,0.975,"fallback review; keyword_score=1.00, retrieval_hit_rate=1.00, web_used=False, citations=5"
+paper_016,"What user roles does the lawyer recommendation system include, and what does each role do?",list,easy,律师推荐和服务小程序的设计与实现,律师推荐和服务小程序的设计与实现,false,"根据用户Wiki中的论文记录，律师推荐系统包含以下三类用户角色及其功能：
+
+**核心结论**  
+该系统采用三角色架构：  
+1. **用户端**（小程序形式）  
+   - 功能：注册登录、律师信息查询、咨询订单提交、自助AI问答、订单追踪  
+   - 目标：为公众提供便捷的法律咨询入口  
+
+2. **律师端**  
+   - 功能：个人资料管理、服务订单处理、在线咨询响应  
+   - 目标：提升律师服务效率（论文未明确描述细节，需补充[1]）  
+
+3. **管理员**  
+   - 功能：系统运维、用户/律师账号审核、服务监管  
+   - 目标：保障平台合规性（论文未展开说明[1]）  
+
+**依据分析**  
+[1] 论文《律师推荐和服务小程序的设计与实现》明确划分了三类角色，但律师端和管理员端的具体功能描述较弱，仅通过架构图间接体现（见摘要和开发流程部分）。建议用户补充以下内容到Wiki：  
+- 律师端的订单响应流程示例  
+- 管理员的后台操作权限清单  
+
+（当前无Web搜索结果和候选资源可供补充）","[{""card_id"": ""6cb2f34c-ce24-4942-bc3f-e8c021176c7e"", ""title"": ""律师推荐和服务小程序的设计与实现"", ""page_type"": ""PaperPage"", ""summary"": ""本论文设计并实现了一个律师推荐和服务系统，通过在线服务平台使律师工作更高效，用户法律咨询更便捷。系统包含用户、律师、管理员三个角色，用户端为小程序，提供注册登录、查看律师信息、预约等功能。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/律师推荐和服务小程序的设计与实现.md""}]",[],"{""intent"": ""query about user roles in a lawyer recommendation system and their functions"", ""answer_mode"": ""wiki_search"", ""use_wiki"": true, ""use_web"": false, ""use_resources"": false, ""open_cards"": true, ""tools"": [{""name"": ""wiki_search"", ""query"": ""lawyer recommendation system user roles"", ""reason"": ""The user is asking about specific roles within a system likely documented in their private Wiki, making wiki_search the optimal choice for stable, structured information.""}, {""name"": ""wiki_card"", ""query"": ""What user roles does the lawyer recommendation system include, and what does each role do?"", ""reason"": ""open matched Wiki cards""}]}",16.2886,1.0,1.0,false,false,1.0,0.78,0.6,1.0,0.1,0.776,"fallback review; keyword_score=0.00, retrieval_hit_rate=1.00, web_used=False, citations=1"
+paper_021,What is the main research question in Probing the Difficulty Perception Mechanism of Large Language Models?,concept_explanation,easy,Probing the Difficulty Perception Mechanism of Large Language Models,Probing the Difficulty Perception Mechanism of Large Language Models,false,"根据您的Wiki笔记，关于《Probing the Difficulty Perception Mechanism of Large Language Models》的核心研究问题可总结如下：
+
+**核心结论**  
+该研究旨在探究大型语言模型（LLMs）是否能在内部表示中隐式编码问题难度，并揭示其难度感知的机制[1][2]。
+
+**结构化分析**  
+1. **研究动机**  
+   - LLMs被广泛用于复杂推理任务，但其内部评估问题难度的能力尚不明确，而这一能力对自适应推理和资源分配至关重要[1]。
+   - 传统方法依赖人工标注难度，成本高昂，需探索模型自身的难度感知潜力[1][5]。
+
+2. **核心问题**  
+   - **是否编码难度**：LLMs的隐藏表示（如最终token表示）能否线性建模数学问题的难度等级[1][2]？  
+   - **机制定位**：能否在Transformer层的特定注意力头中发现简单/困难问题的相反激活模式[1][2]？  
+
+3. **方法验证**  
+   - 通过线性探针（linear probe）和注意力头消融实验，证实了模型内部存在可解释的难度感知信号[1][2][3]。  
+   - 该机制为自动难度标注提供了理论基础，减少对人工标注的依赖[1][5]。
+
+**关联补充**  
+- 其他相关方法（如基于隐藏表示的价值函数估计[4]）进一步支持了LLMs内部难度信息的可挖掘性。  
+- 概念上，""LLM感知难度""强调从模型自身视角（而非人类标注）评估问题困难程度[5]。  
+
+（注：当前Wiki内容已充分覆盖该问题，无需补充外部参考。）","[{""card_id"": ""23b21f9a-ab37-4a36-8c8f-a656b775b97d"", ""title"": ""Probing the Difficulty Perception Mechanism of Large Language Models"", ""page_type"": ""PaperPage"", ""summary"": ""本文研究大型语言模型（LLMs）是否在内部表示中隐式编码问题难度。通过在线性探针（linear probe）作用于LLMs的最终token表示，作者证明数学问题的难度可以被线性建模。进一步定位了最终Transformer层的特定注意力头，这些注意力头对简单和困难问题具有相反的激活模式，从而实现难度感知。消融实验验证了定位的准确性。该工作为使用LLMs作为自动难度标注器提供了实践支持，有望减少对昂贵人工标注的依赖。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/probing-the-difficulty-perception-mechanism-of-large-language-models.md""}, {""card_id"": ""79a49285-d83d-472c-98e2-2923a4a15332"", ""title"": ""Linear Probing for Difficulty Perception"", ""page_type"": ""MethodPage"", ""summary"": ""一种通过线性探针（linear probe）作用于LLMs最终token表示来建模问题难度的方法，并定位最终Transformer层中具有相反激活模式的注意力头。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/methods/linear-probing-for-difficulty-perception.md""}, {""card_id"": ""86f6be2c-7e9f-4eb0-9c60-94a938c389e5"", ""title"": ""Probing LLM internal mechanisms"", ""page_type"": ""MethodPage"", ""summary"": ""通过探针或表示分析研究 LLM 内部机制的方法，用于把模型内部信号映射到可解释变量。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/methods/probing-llm-internal-mechanisms.md""}, {""card_id"": ""6da61a94-0cb9-4c1b-ab48-f6c641df2feb"", ""title"": ""Value-based Difficulty Estimation from Hidden Representations"", ""page_type"": ""MethodPage"", ""summary"": ""该方法将LLM的token级生成过程建模为马尔可夫链，并定义一个价值函数来估计从任意隐藏状态出发的期望输出质量。难度估计直接使用输入编码后的初始隐藏状态对应的价值函数值，无需生成任何输出token。\n\n补充：估计问题对模型而言难易程度的方法，可用于样本筛选、推理预算分配和自适应解题策略。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/methods/value-based-difficulty-estimation-from-hidden-representations.md""}, {""card_id"": ""cd863c0d-bbc5-45ac-a60c-d1761ba6b331"", ""title"": ""LLM-Perceived Question Difficulty"", ""page_type"": ""ConceptPage"", ""summary"": ""LLM感知难度是指大语言模型在内部处理问题时，其隐藏表示所反映的问题困难程度，而非基于人类标注或外部指标。该概念强调从模型自身视角评估难度，可用于自适应推理和性能分析。\n\n补充：大型语言模型（LLMs）在内部表示中隐式编码问题难度的能力。通过线性探针和注意力头激活模式分析，可以揭示模型对问题难度的感知机制。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/concepts/llm-perceived-question-difficulty.md""}, {""card_id"": ""b6563ca0-e02f-4786-b70b-d474a6991141"", ""title"": ""The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations"", ""page_type"": ""PaperPage"", ""summary"": ""本文提出一种仅利用大语言模型（LLM）内部隐藏表示来估计问题难度的方法，无需生成输出token或依赖辅助模型。该方法将token级生成过程建模为马尔可夫链，并定义价值函数来估计给定隐藏状态下的期望输出质量。实验表明，该方法在文本和多模态任务上均优于现有基线。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/the-llm-already-knows-estimating-llm-perceived-question-difficulty-via-hidden-re.md""}]",[],"{""intent"": ""research_question_inquiry"", ""answer_mode"": ""wiki_card"", ""use_wiki"": true, ""use_web"": false, ""use_resources"": false, ""open_cards"": true, ""tools"": [{""name"": ""wiki_search"", ""query"": ""Probing the Difficulty Perception Mechanism of Large Language Models"", ""reason"": ""The user is asking for the main research question of a specific topic, which is likely covered in their private Wiki if they have academic or technical notes on it.""}, {""name"": ""wiki_card"", ""query"": ""What is the main research question in Probing the Difficulty Perception Mechanism of Large Language Models?"", ""reason"": ""open matched Wiki cards""}]}",30.858,1.0,1.0,false,false,1.0,0.98,0.8667,1.0,0.1,0.9327,"fallback review; keyword_score=0.67, retrieval_hit_rate=1.00, web_used=False, citations=6"
+paper_026,What is the core hypothesis of The LLM Already Knows?,concept_explanation,easy,The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations,The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations,false,"核心结论：  
+""The LLM Already Knows""的核心假设是：**大语言模型（LLM）的隐藏表示中已隐式编码了其对问题难度的感知信息，无需依赖外部标注或生成输出即可直接估计** [1][3][5]。
+
+结构化依据：  
+1. **隐藏表示蕴含难度信息**  
+   - 论文[1]提出仅通过LLM的隐藏状态（如Transformer中间层表示）即可预测问题难度，无需生成token或辅助模型。  
+   - 概念页[3]进一步说明，LLM的注意力机制和线性探针可揭示这种隐式感知能力。  
+
+2. **方法实现**  
+   - 方法页[6]描述其技术本质：将生成过程建模为马尔可夫链，通过价值函数量化隐藏状态对应的预期输出质量，直接反映难度。  
+
+3. **与基座模型能力的关联**  
+   - 其他研究（如[4]）佐证了LLM的基座能力边界问题，而该假设强调模型内部表示已包含难度判断的""元认知""能力。  
+
+弱相关说明：  
+- [2][4]虽涉及LLM能力分析，但未直接支持核心假设，仅提供间接参考。  
+
+（注：当前Wiki内容已充分覆盖该问题，无需补充外部资源。）","[{""card_id"": ""b6563ca0-e02f-4786-b70b-d474a6991141"", ""title"": ""The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations"", ""page_type"": ""PaperPage"", ""summary"": ""本文提出一种仅利用大语言模型（LLM）内部隐藏表示来估计问题难度的方法，无需生成输出token或依赖辅助模型。该方法将token级生成过程建模为马尔可夫链，并定义价值函数来估计给定隐藏状态下的期望输出质量。实验表明，该方法在文本和多模态任务上均优于现有基线。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/the-llm-already-knows-estimating-llm-perceived-question-difficulty-via-hidden-re.md""}, {""card_id"": ""8e8d5634-b538-483b-835b-a771405fe4c8"", ""title"": ""DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"", ""page_type"": ""PaperPage"", ""summary"": ""本文提出 DeepSeek-R1，通过纯强化学习（RL）激励大语言模型的推理能力，无需人工标注的推理轨迹。模型在数学、编程竞赛和 STEM 领域等可验证任务上取得了超越对比模型的性能。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/deepseek-r1-incentivizing-reasoning-capability-in-llms-via-reinforcement-learnin.md""}, {""card_id"": ""cd863c0d-bbc5-45ac-a60c-d1761ba6b331"", ""title"": ""LLM-Perceived Question Difficulty"", ""page_type"": ""ConceptPage"", ""summary"": ""LLM感知难度是指大语言模型在内部处理问题时，其隐藏表示所反映的问题困难程度，而非基于人类标注或外部指标。该概念强调从模型自身视角评估难度，可用于自适应推理和性能分析。\n\n补充：大型语言模型（LLMs）在内部表示中隐式编码问题难度的能力。通过线性探针和注意力头激活模式分析，可以揭示模型对问题难度的感知机制。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/concepts/llm-perceived-question-difficulty.md""}, {""card_id"": ""c37a6ed4-e585-4415-8dc3-73ada6538cf7"", ""title"": ""Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?"", ""page_type"": ""PaperPage"", ""summary"": ""本文质疑了当前广泛使用的 Reinforcement Learning with Verifiable Rewards (RLVR) 是否真正扩展了大型语言模型 (LLM) 的推理能力边界。通过系统实验，作者发现 RLVR 并未提升基座模型在原本无法解决的问题上的表现，而是通过增加推理计算量（如更长的思维链）更好地利用了基座模型已有的能力。相比之下，蒸馏 (distillation) 能够引入新知识，从而真正扩展推理边界。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/papers/does-reinforcement-learning-really-incentivize-reasoning-capacity-in-llms-beyond.md""}, {""card_id"": ""88d65b1a-ad56-4bfc-9669-fcb97d6cc26c"", ""title"": ""Hidden representations"", ""page_type"": ""ConceptPage"", ""summary"": ""LLM 中间层的隐藏表示，可用于探测模型内部状态、任务感知和推理过程。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/concepts/hidden-representations.md""}, {""card_id"": ""6da61a94-0cb9-4c1b-ab48-f6c641df2feb"", ""title"": ""Value-based Difficulty Estimation from Hidden Representations"", ""page_type"": ""MethodPage"", ""summary"": ""该方法将LLM的token级生成过程建模为马尔可夫链，并定义一个价值函数来估计从任意隐藏状态出发的期望输出质量。难度估计直接使用输入编码后的初始隐藏状态对应的价值函数值，无需生成任何输出token。\n\n补充：估计问题对模型而言难易程度的方法，可用于样本筛选、推理预算分配和自适应解题策略。"", ""markdown_path"": ""oss://fysjarvis/users/admin/data/generated/wiki/methods/value-based-difficulty-estimation-from-hidden-representations.md""}]",[],"{""intent"": ""retrieve the core hypothesis of 'The LLM Already Knows'"", ""answer_mode"": ""wiki_card"", ""use_wiki"": true, ""use_web"": false, ""use_resources"": false, ""open_cards"": true, ""tools"": [{""name"": ""wiki_search"", ""query"": ""The LLM Already Knows core hypothesis"", ""reason"": ""The user is asking for a stable concept likely documented in their private Wiki.""}, {""name"": ""wiki_card"", ""query"": ""What is the core hypothesis of The LLM Already Knows?"", ""reason"": ""open matched Wiki cards""}]}",17.0121,1.0,1.0,false,false,1.0,0.78,0.6,1.0,0.1,0.776,"fallback review; keyword_score=0.00, retrieval_hit_rate=1.00, web_used=False, citations=6"

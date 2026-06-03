@@ -1,0 +1,20 @@
+{
+  "count": 30,
+  "overall_final_score": 0.8287,
+  "overall_answer_confidence": 0.8632,
+  "overall_citation_grounding": 1.0,
+  "pass_rate": 0.8333,
+  "wrong_web_usage_rate": 0.2667,
+  "no_citation_rate": 0.0,
+  "retrieval_hit_rate": 1.0,
+  "top1_hit_rate": 0.7667,
+  "mean_citations_per_answer": 4.0333,
+  "splits": {
+    "current_papers_30": {
+      "count": 30,
+      "overall_final_score": 0.8287,
+      "overall_answer_confidence": 0.8632,
+      "overall_citation_grounding": 1.0
+    }
+  }
+}

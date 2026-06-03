@@ -1,0 +1,10 @@
+services:
+  docling-serve:
+    image: quay.io/docling-project/docling-serve-cpu:latest
+    container_name: docling-serve-local
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "1"
+      DOCLING_SERVE_MAX_SYNC_WAIT: "360"

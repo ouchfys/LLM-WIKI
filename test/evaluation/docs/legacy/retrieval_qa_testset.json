@@ -1,0 +1,99 @@
+{
+  "date": "2026-05-30",
+  "pipeline": [
+    "capture/import",
+    "raw markdown",
+    "wiki page",
+    "wiki_chunks FTS5",
+    "wiki chat"
+  ],
+  "sources": [
+    {
+      "id": "P1",
+      "type": "paper",
+      "input": "data/attention is all you need.pdf",
+      "goal": "paper ingestion and theory QA"
+    },
+    {
+      "id": "P2",
+      "type": "paper",
+      "input": "data/Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?.pdf",
+      "goal": "second paper ingestion sample"
+    },
+    {
+      "id": "X1",
+      "type": "xhs_direct",
+      "input": "https://www.xiaohongshu.com/discovery/item/69c1279f000000001b001165",
+      "goal": "direct xiaohongshu import plus OCR",
+      "import_result": {
+        "card_id": "cafb5e7c-ea74-4fef-91a7-8889beecf1e1",
+        "images_downloaded": 2,
+        "ocr_status": "done",
+        "ocr_chars": 18942,
+        "raw_source_path": "data/wiki/raw_sources/xiaohongshu_note/69c1279f000000001b001165.md"
+      }
+    },
+    {
+      "id": "X2",
+      "type": "xhs_short",
+      "input": "http://xhslink.com/o/30SfbNeUi0f",
+      "goal": "short-link redirect plus image-heavy OCR note",
+      "import_result": {
+        "card_id": "dfefd2a5-3c28-400e-b217-976da29db527",
+        "images_downloaded": 9,
+        "ocr_status": "done",
+        "ocr_chars": 2766033,
+        "raw_source_path": "data/wiki/raw_sources/xiaohongshu_note/6824cf20000000002100af19.md"
+      }
+    },
+    {
+      "id": "X3",
+      "type": "xhs_short",
+      "input": "http://xhslink.com/o/33nQxAVDUS8",
+      "goal": "short-link redirect plus agent interview recap",
+      "import_result": {
+        "card_id": "3bd8a586-3807-4c30-90f1-22916adf1230",
+        "images_downloaded": 12,
+        "ocr_status": "done",
+        "ocr_chars": 8764,
+        "raw_source_path": "data/wiki/raw_sources/xiaohongshu_note/6a180a2800000000070137cd.md"
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "Q1",
+      "query": "为什么现在大模型普遍用 RMSNorm，而不是 LayerNorm？",
+      "expected_source_ids": ["X2"],
+      "status": "partial",
+      "notes": "retrieval works, but Chinese output is mojibake"
+    },
+    {
+      "id": "Q2",
+      "query": "淘天 AI Agent 一面主要会深挖哪些项目细节？",
+      "expected_source_ids": ["X3"],
+      "status": "partial",
+      "notes": "retrieval works; answer themes are correct; display text is corrupted"
+    },
+    {
+      "id": "Q3",
+      "query": "Attention is All You Need 里为什么要除以 sqrt(dk)？",
+      "expected_source_ids": ["P1"],
+      "status": "fail",
+      "notes": "paper exists but answer says insufficient material"
+    },
+    {
+      "id": "Q4",
+      "query": "总结一下我库里那篇滴滴大模型实习面经里，多Agent系统和外部知识检索相关的问题。",
+      "expected_source_ids": ["X1"],
+      "status": "fail",
+      "notes": "retrieval missed Didi note and used other sources"
+    }
+  ],
+  "product_issues": [
+    "xiaohongshu text encoding corruption",
+    "import latency around 136-138 seconds for image-heavy notes",
+    "base64 OCR payload stored in raw markdown and indexed",
+    "paper retrieval weak on fine-grained theory questions"
+  ]
+}

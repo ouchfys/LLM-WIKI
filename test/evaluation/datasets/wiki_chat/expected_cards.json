@@ -1,0 +1,366 @@
+{
+  "paper_001": {
+    "expected_source": "Attention Is All You Need",
+    "expected_card_titles": [
+      "Attention Is All You Need"
+    ],
+    "expected_keywords": [
+      "Transformer",
+      "self-attention",
+      "encoder-decoder"
+    ],
+    "allow_web": false
+  },
+  "paper_002": {
+    "expected_source": "Attention Is All You Need",
+    "expected_card_titles": [
+      "Attention Is All You Need"
+    ],
+    "expected_keywords": [
+      "scaled dot-product attention",
+      "sqrt(d_k)",
+      "softmax stability"
+    ],
+    "allow_web": false
+  },
+  "paper_003": {
+    "expected_source": "Attention Is All You Need",
+    "expected_card_titles": [
+      "Attention Is All You Need"
+    ],
+    "expected_keywords": [
+      "multi-head attention",
+      "representation subspaces",
+      "parallel heads"
+    ],
+    "allow_web": false
+  },
+  "paper_004": {
+    "expected_source": "Attention Is All You Need",
+    "expected_card_titles": [
+      "Attention Is All You Need"
+    ],
+    "expected_keywords": [
+      "positional encoding",
+      "sequence order",
+      "sinusoidal"
+    ],
+    "allow_web": false
+  },
+  "paper_005": {
+    "expected_source": "Attention Is All You Need",
+    "expected_card_titles": [
+      "Attention Is All You Need"
+    ],
+    "expected_keywords": [
+      "encoder",
+      "decoder",
+      "interview answer"
+    ],
+    "allow_web": false
+  },
+  "paper_006": {
+    "expected_source": "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning",
+    "expected_card_titles": [
+      "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+    ],
+    "expected_keywords": [
+      "reasoning capability",
+      "reinforcement learning",
+      "DeepSeek-R1"
+    ],
+    "allow_web": false
+  },
+  "paper_007": {
+    "expected_source": "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning",
+    "expected_card_titles": [
+      "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+    ],
+    "expected_keywords": [
+      "reinforcement learning",
+      "reasoning behavior",
+      "verifiable rewards"
+    ],
+    "allow_web": false
+  },
+  "paper_008": {
+    "expected_source": "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning",
+    "expected_card_titles": [
+      "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+    ],
+    "expected_keywords": [
+      "GRPO",
+      "PPO",
+      "value model",
+      "group relative"
+    ],
+    "allow_web": false
+  },
+  "paper_009": {
+    "expected_source": "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning",
+    "expected_card_titles": [
+      "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+    ],
+    "expected_keywords": [
+      "emergent reasoning",
+      "reflection",
+      "long chain-of-thought"
+    ],
+    "allow_web": false
+  },
+  "paper_010": {
+    "expected_source": "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning",
+    "expected_card_titles": [
+      "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+    ],
+    "expected_keywords": [
+      "interview answer",
+      "RL",
+      "reasoning LLM"
+    ],
+    "allow_web": false
+  },
+  "paper_011": {
+    "expected_source": "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?",
+    "expected_card_titles": [
+      "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?"
+    ],
+    "expected_keywords": [
+      "RLVR",
+      "reasoning capacity",
+      "base model"
+    ],
+    "allow_web": false
+  },
+  "paper_012": {
+    "expected_source": "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?",
+    "expected_card_titles": [
+      "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?"
+    ],
+    "expected_keywords": [
+      "capacity boundary",
+      "RLVR",
+      "base model"
+    ],
+    "allow_web": false
+  },
+  "paper_013": {
+    "expected_source": "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?",
+    "expected_card_titles": [
+      "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?"
+    ],
+    "expected_keywords": [
+      "reinforcement learning",
+      "distillation",
+      "reasoning boundary"
+    ],
+    "allow_web": false
+  },
+  "paper_014": {
+    "expected_source": "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?",
+    "expected_card_titles": [
+      "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?"
+    ],
+    "expected_keywords": [
+      "experiments",
+      "RLVR",
+      "out-of-distribution"
+    ],
+    "allow_web": false
+  },
+  "paper_015": {
+    "expected_source": "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?",
+    "expected_card_titles": [
+      "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?"
+    ],
+    "expected_keywords": [
+      "interview answer",
+      "RLVR",
+      "reasoning capacity"
+    ],
+    "allow_web": false
+  },
+  "paper_016": {
+    "expected_source": "律师推荐和服务小程序的设计与实现",
+    "expected_card_titles": [
+      "律师推荐和服务小程序的设计与实现"
+    ],
+    "expected_keywords": [
+      "user",
+      "lawyer",
+      "administrator",
+      "roles"
+    ],
+    "allow_web": false
+  },
+  "paper_017": {
+    "expected_source": "律师推荐和服务小程序的设计与实现",
+    "expected_card_titles": [
+      "律师推荐和服务小程序的设计与实现"
+    ],
+    "expected_keywords": [
+      "collaborative filtering",
+      "lawyer recommendation",
+      "ratings"
+    ],
+    "allow_web": false
+  },
+  "paper_018": {
+    "expected_source": "律师推荐和服务小程序的设计与实现",
+    "expected_card_titles": [
+      "律师推荐和服务小程序的设计与实现"
+    ],
+    "expected_keywords": [
+      "frontend",
+      "backend",
+      "mini-program",
+      "framework"
+    ],
+    "allow_web": false
+  },
+  "paper_019": {
+    "expected_source": "律师推荐和服务小程序的设计与实现",
+    "expected_card_titles": [
+      "律师推荐和服务小程序的设计与实现"
+    ],
+    "expected_keywords": [
+      "AI legal consultation",
+      "self-service Q&A",
+      "lawyer service"
+    ],
+    "allow_web": false
+  },
+  "paper_020": {
+    "expected_source": "律师推荐和服务小程序的设计与实现",
+    "expected_card_titles": [
+      "律师推荐和服务小程序的设计与实现"
+    ],
+    "expected_keywords": [
+      "system value",
+      "online legal service",
+      "recommendation"
+    ],
+    "allow_web": false
+  },
+  "paper_021": {
+    "expected_source": "Probing the Difficulty Perception Mechanism of Large Language Models",
+    "expected_card_titles": [
+      "Probing the Difficulty Perception Mechanism of Large Language Models"
+    ],
+    "expected_keywords": [
+      "difficulty perception",
+      "probing",
+      "LLM internal representations"
+    ],
+    "allow_web": false
+  },
+  "paper_022": {
+    "expected_source": "Probing the Difficulty Perception Mechanism of Large Language Models",
+    "expected_card_titles": [
+      "Probing the Difficulty Perception Mechanism of Large Language Models"
+    ],
+    "expected_keywords": [
+      "linear probe",
+      "final token representation",
+      "difficulty"
+    ],
+    "allow_web": false
+  },
+  "paper_023": {
+    "expected_source": "Probing the Difficulty Perception Mechanism of Large Language Models",
+    "expected_card_titles": [
+      "Probing the Difficulty Perception Mechanism of Large Language Models"
+    ],
+    "expected_keywords": [
+      "attention heads",
+      "activation pattern",
+      "difficulty perception"
+    ],
+    "allow_web": false
+  },
+  "paper_024": {
+    "expected_source": "Probing the Difficulty Perception Mechanism of Large Language Models",
+    "expected_card_titles": [
+      "Probing the Difficulty Perception Mechanism of Large Language Models"
+    ],
+    "expected_keywords": [
+      "encoded difficulty",
+      "representations",
+      "ablation"
+    ],
+    "allow_web": false
+  },
+  "paper_025": {
+    "expected_source": "Probing the Difficulty Perception Mechanism of Large Language Models",
+    "expected_card_titles": [
+      "Probing the Difficulty Perception Mechanism of Large Language Models"
+    ],
+    "expected_keywords": [
+      "interview answer",
+      "probing",
+      "difficulty perception"
+    ],
+    "allow_web": false
+  },
+  "paper_026": {
+    "expected_source": "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations",
+    "expected_card_titles": [
+      "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations"
+    ],
+    "expected_keywords": [
+      "LLM-perceived question difficulty",
+      "hidden representations",
+      "hypothesis"
+    ],
+    "allow_web": false
+  },
+  "paper_027": {
+    "expected_source": "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations",
+    "expected_card_titles": [
+      "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations"
+    ],
+    "expected_keywords": [
+      "hidden representations",
+      "value function",
+      "difficulty estimation"
+    ],
+    "allow_web": false
+  },
+  "paper_028": {
+    "expected_source": "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations",
+    "expected_card_titles": [
+      "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations"
+    ],
+    "expected_keywords": [
+      "no token generation",
+      "efficiency",
+      "hidden state"
+    ],
+    "allow_web": false
+  },
+  "paper_029": {
+    "expected_source": "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations",
+    "expected_card_titles": [
+      "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations"
+    ],
+    "expected_keywords": [
+      "evidence",
+      "perceived difficulty",
+      "hidden states"
+    ],
+    "allow_web": false
+  },
+  "paper_030": {
+    "expected_source": "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations",
+    "expected_card_titles": [
+      "The LLM Already Knows: Estimating LLM-Perceived Question Difficulty via Hidden Representations"
+    ],
+    "expected_keywords": [
+      "comparison",
+      "hidden representations",
+      "linear probing",
+      "mechanism"
+    ],
+    "allow_web": false
+  }
+}
