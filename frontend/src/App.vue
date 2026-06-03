@@ -5,9 +5,9 @@
         <aside class="app-sidebar">
           <div class="sidebar-top">
             <div class="brand-lockup">
-              <img class="brand-logo" :src="logoUrl" alt="LLM Wiki logo" />
+              <img class="brand-logo" :src="logoUrl" alt="笔记贾维斯" />
               <div class="brand-copy">
-                <strong>LLM Wiki</strong>
+                <strong>笔记贾维斯</strong>
                 <span>Private Research OS</span>
               </div>
             </div>

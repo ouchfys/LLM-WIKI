@@ -1031,25 +1031,26 @@ onMounted(loadCards)
 
 .reader-title-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 18px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
   align-items: start;
 }
 
 .wiki-document h1 {
-  max-width: 760px;
+  max-width: 100%;
   margin: 0 0 12px;
   color: #fff;
-  font-size: clamp(28px, 2.6vw, 42px);
-  line-height: 1.15;
+  font-size: clamp(24px, 1.7vw, 32px);
+  line-height: 1.18;
   letter-spacing: 0;
-  text-wrap: balance;
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
 }
 
 .reader-actions {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 8px;
 }
 
