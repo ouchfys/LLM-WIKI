@@ -8,7 +8,7 @@ from typing import Any
 
 from system.document.docling_parser import DoclingParser, ParsedDocument
 from system.paper_index.parser import PaperIndexParser
-from system.storage import get_object_storage
+from system.storage import get_object_storage, get_storage_layout
 from system.wiki.paper_pipeline.models import SourcePacket, SourceSection
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 from system.wiki.raw_source_vault import RawSourceVault
@@ -32,7 +32,11 @@ def extract_paper_source(
     if not raw_markdown:
         raw_markdown = sanitize_wiki_text(_paper_markdown_from_blocks(title, summary, blocks))
 
-    pdf_storage_uri = get_object_storage().upload_file(pdf_path, content_type="application/pdf")
+    pdf_storage_uri = get_object_storage().upload_file(
+        pdf_path,
+        key=get_storage_layout().paper_original_key(pdf_path.name),
+        content_type="application/pdf",
+    )
     source_urls = [source_url] if source_url else [f"file://{pdf_path.resolve().as_posix()}"]
     raw_source_path = RawSourceVault().write_source(
         source_kind="paper_pdf",

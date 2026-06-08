@@ -181,6 +181,59 @@ class SiliconFlowChat:
         messages = [{"role": "user", "content": prompt}]
         return self._call_api(messages, **kwargs)
 
+    def tool_call(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: Any = "auto",
+        temperature: float = None,
+        max_tokens: int = None,
+    ) -> Dict[str, Any]:
+        """Call the chat API with OpenAI-compatible function-calling tools."""
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature if temperature is not None else self.default_temperature,
+            "max_tokens": max_tokens or self.default_max_tokens,
+            "stream": False,
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = requests.post(
+                    self.base_url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=120,
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data.get("choices", [{}])[0].get("message", {}) or {}
+
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if e.response is not None else "N/A"
+                print(
+                    f"[SiliconFlowChat] Tool call HTTP error "
+                    f"(attempt {attempt}/{self.max_retries}): status={status_code}"
+                )
+                if status_code == 429:
+                    time.sleep(self.retry_delay * attempt * 2)
+                elif attempt < self.max_retries:
+                    time.sleep(self.retry_delay * attempt)
+                else:
+                    raise
+
+            except requests.exceptions.RequestException as e:
+                print(f"[SiliconFlowChat] Tool call request failed (attempt {attempt}/{self.max_retries}): {e}")
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_delay * attempt)
+                else:
+                    raise
+
+        return {}
+
     def stream_invoke(self, prompt: str, **kwargs):
         """流式文本输入 → 逐 token 输出 iterator"""
         messages = [{"role": "user", "content": prompt}]

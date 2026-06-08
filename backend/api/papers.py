@@ -12,10 +12,11 @@ from system.paper_index.parser import PaperIndexParser
 from system.paper_index.store import PaperIndexStore
 from system.discovery.source_adapters import ArxivAdapter
 from system.document.docling_parser import DoclingParser, ParsedDocument
-from system.storage import get_object_storage
+from system.storage import get_object_storage, get_storage_layout
 from system.wiki.wiki_builder import WikiBuilder, sanitize_wiki_text
 from system.wiki.paper_pipeline import run_paper_pipeline
 from system.wiki.ingestion_jobs import IngestionJobStore
+from system.wiki.maintenance.runner import WikiMaintenanceRunner
 from system.wiki.raw_source_vault import RawSourceVault
 from system.wiki.wiki_store import WikiStore
 
@@ -23,8 +24,9 @@ from system.wiki.wiki_store import WikiStore
 router = APIRouter()
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = REPO_ROOT / "data"
-UPLOAD_DIR = DATA_DIR / "papers"
+STORAGE_LAYOUT = get_storage_layout()
+SOURCES_DIR = STORAGE_LAYOUT.sources_dir
+UPLOAD_DIR = STORAGE_LAYOUT.source_dir("papers", "uploads")
 
 
 class IndexLocalPayload(BaseModel):
@@ -44,9 +46,6 @@ def _resolve_data_pdf(path_value: str) -> Path:
     raw = Path(path_value)
     path = raw if raw.is_absolute() else REPO_ROOT / raw
     resolved = path.resolve()
-    data_root = DATA_DIR.resolve()
-    if data_root != resolved and data_root not in resolved.parents:
-        raise HTTPException(status_code=400, detail="Only PDF files under data/ can be indexed.")
     if not resolved.exists() or resolved.suffix.lower() != ".pdf":
         raise HTTPException(status_code=404, detail="PDF file not found.")
     return resolved
@@ -157,7 +156,11 @@ def _index_pdf(
             "venue": arxiv_item.venue,
             "arxiv_id": arxiv_item.raw_metadata.get("arxiv_id", ""),
         })
-    pdf_storage_uri = get_object_storage().upload_file(pdf_path, content_type="application/pdf")
+    pdf_storage_uri = get_object_storage().upload_file(
+        pdf_path,
+        key=STORAGE_LAYOUT.paper_original_key(pdf_path.name),
+        content_type="application/pdf",
+    )
     paper_id = store.upsert_paper(
         title=parsed["title"],
         source_url=source_url,
@@ -553,9 +556,9 @@ def list_papers(store: PaperIndexStore = Depends(get_paper_index)):
 
 @router.get("/files")
 def list_local_pdfs():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SOURCES_DIR.mkdir(parents=True, exist_ok=True)
     files = []
-    for path in sorted(DATA_DIR.rglob("*.pdf")):
+    for path in sorted(SOURCES_DIR.rglob("*.pdf")):
         files.append({
             "name": path.name,
             "path": str(path.relative_to(REPO_ROOT)),
@@ -668,6 +671,7 @@ def _run_ingestion_job(
             wiki_store=WikiStore(db_path=db_path),
         )
         jobs.update_job(job_id, status="running", stage="indexing", progress=0.92)
+        maintenance_result = _run_post_ingestion_maintenance(db_path)
         jobs.update_job(
             job_id,
             status="done",
@@ -675,11 +679,30 @@ def _run_ingestion_job(
             progress=1.0,
             source_packet_id=str(result.get("source_packet_id") or ""),
             paper_card_id=str(result.get("paper_card_id") or result.get("wiki_card_id") or ""),
-            result={"ok": True, **result},
+            result={"ok": True, **result, "maintenance": maintenance_result},
         )
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc)
         jobs.update_job(job_id, status="failed", stage="failed", progress=1.0, error=str(detail))
+
+
+def _run_post_ingestion_maintenance(db_path: str) -> dict:
+    try:
+        result = WikiMaintenanceRunner(db_path=db_path).run_once(
+            check_storage=False,
+            create_repair_tasks=True,
+            process_deterministic_repairs=True,
+            generate_indices=True,
+            upload_indices=True,
+        )
+        return {
+            "ok": result.get("ok", False),
+            "run_id": result.get("run_id", ""),
+            "repair_task_count": result.get("repair_task_count", 0),
+            "index_artifact_count": (result.get("indices") or {}).get("artifact_count", 0),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @router.post("/ingest")

@@ -1,6 +1,10 @@
 <template>
   <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides">
     <div class="app-shell">
+      <div class="ambient-light-layer" aria-hidden="true">
+        <div class="ambient-blob ambient-blob-a"></div>
+        <div class="ambient-blob ambient-blob-b"></div>
+      </div>
       <div class="desktop-shell">
         <aside class="app-sidebar">
           <div class="sidebar-top">
@@ -113,52 +117,52 @@ const navItems = [
 
 const themeOverrides: GlobalThemeOverrides = {
   common: {
-    primaryColor: '#38bdf8',
-    primaryColorHover: '#67e8f9',
-    primaryColorPressed: '#0284c7',
+    primaryColor: '#9bb8ad',
+    primaryColorHover: '#d4e3d8',
+    primaryColorPressed: '#8fa99e',
     successColor: '#22c55e',
     warningColor: '#f59e0b',
     errorColor: '#f43f5e',
-    infoColor: '#7dd3fc',
+    infoColor: '#adcabe',
     borderRadius: '10px',
     borderRadiusSmall: '8px',
     fontFamily: '"Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif',
     fontWeightStrong: '650'
   },
   Card: {
-    color: '#0b1220',
-    colorModal: '#0b1220',
-    borderColor: 'rgba(125, 211, 252, 0.16)',
+    color: '#15130f',
+    colorModal: '#15130f',
+    borderColor: 'rgba(195, 214, 202, 0.16)',
     borderRadius: '14px'
   },
   Input: {
-    color: '#07111f',
-    colorFocus: '#07111f',
-    colorDisabled: '#0f172a',
-    textColor: '#e5f4ff',
+    color: '#11100d',
+    colorFocus: '#11100d',
+    colorDisabled: '#12100d',
+    textColor: '#f8fafc',
     placeholderColor: '#64748b',
-    border: '1px solid rgba(125, 211, 252, 0.14)',
-    borderHover: '1px solid rgba(125, 211, 252, 0.34)',
-    borderFocus: '1px solid rgba(125, 211, 252, 0.7)',
-    boxShadowFocus: '0 0 0 3px rgba(56, 189, 248, 0.16)',
-    caretColor: '#7dd3fc'
+    border: '1px solid rgba(195, 214, 202, 0.14)',
+    borderHover: '1px solid rgba(195, 214, 202, 0.34)',
+    borderFocus: '1px solid rgba(195, 214, 202, 0.7)',
+    boxShadowFocus: '0 0 0 3px rgba(155, 184, 173, 0.16)',
+    caretColor: '#d4e3d8'
   },
   Select: {
     peers: {
       InternalSelection: {
-        color: '#07111f',
-        textColor: '#e5f4ff',
-        border: '1px solid rgba(125, 211, 252, 0.14)',
-        borderHover: '1px solid rgba(125, 211, 252, 0.34)',
-        borderFocus: '1px solid rgba(125, 211, 252, 0.7)'
+        color: '#11100d',
+        textColor: '#f8fafc',
+        border: '1px solid rgba(195, 214, 202, 0.14)',
+        borderHover: '1px solid rgba(195, 214, 202, 0.34)',
+        borderFocus: '1px solid rgba(195, 214, 202, 0.7)'
       }
     }
   },
   Tabs: {
     tabTextColorBar: '#94a3b8',
     tabTextColorActiveBar: '#f8fafc',
-    tabTextColorHoverBar: '#cffafe',
-    barColor: '#38bdf8'
+    tabTextColorHoverBar: '#d4e3d8',
+    barColor: '#9bb8ad'
   },
   Button: {
     borderRadiusSmall: '8px',
@@ -169,7 +173,7 @@ const themeOverrides: GlobalThemeOverrides = {
     borderRadius: '8px'
   },
   Modal: {
-    color: '#0b1220',
+    color: '#15130f',
     borderRadius: '14px'
   }
 }

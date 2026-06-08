@@ -1,8 +1,8 @@
 """Object storage abstraction for durable source artifacts.
 
 Local files are still kept as a developer cache, but callers can store and read
-`oss://...` URIs directly. This keeps the ingestion/indexing path from depending
-on generated Markdown under data/wiki.
+`oss://...` URIs directly. Durable user artifacts are organized under
+sources/, wiki/, and queries/ beneath STORAGE_ROOT_PREFIX.
 """
 
 from __future__ import annotations

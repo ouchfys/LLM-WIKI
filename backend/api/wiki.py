@@ -13,7 +13,16 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from backend.deps import get_chunk_index, get_session_store, get_wiki_chat, get_wiki_store
+from backend.deps import (
+    get_chunk_index,
+    get_maintenance_llm,
+    get_session_store,
+    get_summary_llm,
+    get_web_fetch,
+    get_web_search,
+    get_wiki_chat,
+    get_wiki_store,
+)
 from backend.api.papers import (
     REPO_ROOT as PAPER_REPO_ROOT,
     UPLOAD_DIR as PAPER_UPLOAD_DIR,
@@ -24,17 +33,28 @@ from backend.api.papers import (
 from system.discovery.xiaohongshu_extractor import XiaohongshuExtractor
 from system.document.docling_parser import DoclingParser
 from system.document.source_files import download_images
-from system.storage import get_object_storage
+from system.storage import get_object_storage, get_storage_layout
 from system.wiki.raw_source_vault import RawSourceVault
 from system.wiki.wiki_builder import WikiBuilder, heuristic_compile_raw_markdown, pending_compiled_content, sanitize_wiki_text
 from system.wiki.wiki_chat import WikiChatService
 from system.wiki.paper_pipeline.distiller import parse_json_object
 from system.wiki.ingestion_jobs import IngestionJobStore
+from system.wiki.maintenance.candidate_processor import MaintenanceCandidateProcessor
+from system.wiki.maintenance.index_generator import WikiIndexGenerator
+from system.wiki.maintenance.query_insight import QueryInsightDistiller
+from system.wiki.maintenance.repair_agent import WikiRepairAgent
+from system.wiki.maintenance.repair_processor import DeterministicRepairProcessor
+from system.wiki.maintenance.runner import WikiMaintenanceRunner
+from system.wiki.maintenance.store import WikiMaintenanceStore
+from system.wiki.maintenance.validator import WikiValidator
+from system.wiki.maintenance.web_update_agent import WebUpdateAgent
+from system.wiki.maintenance.web_source_ingestion import WebSourceIngestionProcessor
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore, normalize_alias
 from system.wiki.wiki_store import WikiStore
 
 REPO_ROOT = _Path(__file__).resolve().parents[2]
-RAW_IMAGE_DIR = REPO_ROOT / "data" / "raw_sources" / "images"
+STORAGE_LAYOUT = get_storage_layout()
+RAW_IMAGE_DIR = STORAGE_LAYOUT.source_dir("images")
 EVALUATION_RUNS_DIR = REPO_ROOT / "test" / "evaluation" / "runs"
 
 router = APIRouter()
@@ -61,6 +81,68 @@ class XhsImportPayload(BaseModel):
 
 class SessionCreatePayload(BaseModel):
     title: str = "新会话"
+
+
+class MaintenanceValidatePayload(BaseModel):
+    check_storage: bool = False
+    create_repair_tasks: bool = True
+
+
+class MaintenanceRunPayload(BaseModel):
+    check_storage: bool = False
+    create_repair_tasks: bool = True
+    process_deterministic_repairs: bool = True
+    process_llm_repairs: bool = False
+    distill_query_insights: bool = False
+    process_candidates: bool = False
+    process_candidates_with_llm: bool = False
+    process_web_sources: bool = False
+    generate_indices: bool = True
+    upload_indices: bool = True
+
+
+class QueryInsightDistillPayload(BaseModel):
+    limit: int = 10
+    use_llm: bool = True
+
+
+class SelectionInsightCapturePayload(BaseModel):
+    session_id: str = ""
+    message_id: str = ""
+    selected_text: str
+    question: str = ""
+    answer: str = ""
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    resources: list[dict[str, Any]] = Field(default_factory=list)
+    tool_plan: dict[str, Any] = Field(default_factory=dict)
+    trace: dict[str, Any] = Field(default_factory=dict)
+    auto_merge: bool = True
+    use_llm: bool = True
+
+
+class RepairAgentProcessPayload(BaseModel):
+    limit: int = 10
+    use_llm: bool = True
+    upload: bool = True
+
+
+class WebUpdateDiscoverPayload(BaseModel):
+    topic: str
+    limit: int = 5
+    fetch_top: int = 2
+    use_llm: bool = True
+    upload: bool = True
+
+
+class CandidateProcessPayload(BaseModel):
+    limit: int = 10
+    auto_merge: bool = True
+    use_llm: bool = False
+
+
+class WebSourceProcessPayload(BaseModel):
+    limit: int = 10
+    auto_merge: bool = True
 
 
 def _page_type(source_type: str) -> str:
@@ -1307,6 +1389,439 @@ def list_merge_audit(
             "limit": bounded_limit,
         },
     }
+
+
+def _persist_validation_report(
+    report: dict[str, Any],
+    store: WikiMaintenanceStore,
+) -> tuple[str, list[str]]:
+    artifact_uri = ""
+    try:
+        path = STORAGE_LAYOUT.query_artifact_path(
+            "validation_reports",
+            str(report.get("run_id") or "validation"),
+            ".json",
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(report, ensure_ascii=False, indent=2)
+        path.write_text(payload, encoding="utf-8")
+        artifact_uri = get_object_storage().upload_text(
+            get_object_storage().key_for_local_path(path),
+            payload,
+            content_type="application/json; charset=utf-8",
+        )
+    except Exception as exc:
+        report.setdefault("warnings", []).append({
+            "severity": "warning",
+            "error_type": "artifact_write_failed",
+            "entity_type": "maintenance",
+            "entity_id": str(report.get("run_id") or ""),
+            "message": f"failed to persist validation artifact: {exc}",
+            "repair_target": "none",
+        })
+    run_id = store.add_validation_run(report=report, artifact_uri=artifact_uri)
+    return run_id, []
+
+
+@router.post("/maintenance/validate")
+def run_wiki_validation(
+    payload: MaintenanceValidatePayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    maintenance_store = WikiMaintenanceStore(db_path=store.db_path)
+    report = WikiValidator(db_path=store.db_path).validate_all(check_storage=payload.check_storage)
+    run_id, _ = _persist_validation_report(report, maintenance_store)
+    repair_task_ids: list[str] = []
+    if payload.create_repair_tasks:
+        repair_task_ids = maintenance_store.create_repair_tasks_from_report(report)
+    return {
+        "ok": report.get("ok", False),
+        "run_id": run_id,
+        "repair_task_ids": repair_task_ids,
+        "repair_task_count": len(repair_task_ids),
+        "report": report,
+    }
+
+
+@router.get("/maintenance/validation-runs")
+def list_wiki_validation_runs(
+    limit: int = 50,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    bounded_limit = max(1, min(limit, 200))
+    items = WikiMaintenanceStore(db_path=store.db_path).list_validation_runs(limit=bounded_limit)
+    return {"items": items, "count": len(items)}
+
+
+@router.get("/maintenance/validation-runs/{run_id}")
+def get_wiki_validation_run(
+    run_id: str,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    item = WikiMaintenanceStore(db_path=store.db_path).get_validation_run(run_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Validation run not found")
+    return item
+
+
+@router.get("/maintenance/repair-tasks")
+def list_wiki_repair_tasks(
+    status: str = "",
+    limit: int = 100,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    bounded_limit = max(1, min(limit, 500))
+    items = WikiMaintenanceStore(db_path=store.db_path).list_repair_tasks(
+        status=status.strip(),
+        limit=bounded_limit,
+    )
+    return {"items": items, "count": len(items), "status": status.strip()}
+
+
+@router.post("/maintenance/repair-tasks/process")
+def process_wiki_repair_tasks(
+    limit: int = 50,
+    upload_indices: bool = True,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    return DeterministicRepairProcessor(db_path=store.db_path).process_pending(
+        limit=max(1, min(limit, 200)),
+        upload_indices=upload_indices,
+    )
+
+
+@router.post("/maintenance/repair-agent/process")
+def process_wiki_repair_agent_tasks(
+    payload: RepairAgentProcessPayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    llm = get_maintenance_llm() if payload.use_llm else None
+    return WikiRepairAgent(db_path=store.db_path, llm=llm).process_pending(
+        limit=max(1, min(payload.limit, 50)),
+        upload=payload.upload,
+    )
+
+
+@router.get("/maintenance/candidates")
+def list_wiki_maintenance_candidates(
+    status: str = "",
+    source_type: str = "",
+    limit: int = 100,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    bounded_limit = max(1, min(limit, 500))
+    items = WikiMaintenanceStore(db_path=store.db_path).list_candidates(
+        status=status.strip(),
+        source_type=source_type.strip(),
+        limit=bounded_limit,
+    )
+    return {
+        "items": items,
+        "count": len(items),
+        "status": status.strip(),
+        "source_type": source_type.strip(),
+    }
+
+
+@router.post("/maintenance/candidates/process")
+def process_wiki_maintenance_candidates(
+    payload: CandidateProcessPayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    llm = get_maintenance_llm() if payload.use_llm else None
+    return MaintenanceCandidateProcessor(db_path=store.db_path, llm=llm).process_pending(
+        limit=max(1, min(payload.limit, 100)),
+        auto_merge=payload.auto_merge,
+    )
+
+
+@router.post("/maintenance/candidates/review-merge")
+def review_merge_wiki_maintenance_candidates(
+    payload: CandidateProcessPayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    llm = get_maintenance_llm() if payload.use_llm else None
+    return MaintenanceCandidateProcessor(db_path=store.db_path, llm=llm).process_pending(
+        limit=max(1, min(payload.limit, 100)),
+        auto_merge=payload.auto_merge,
+    )
+
+
+@router.get("/maintenance/candidates/{candidate_id}")
+def get_wiki_maintenance_candidate(
+    candidate_id: str,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    item = WikiMaintenanceStore(db_path=store.db_path).get_candidate(candidate_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Maintenance candidate not found")
+    return item
+
+
+@router.get("/maintenance/query-insights")
+def list_wiki_query_insights(
+    status: str = "",
+    limit: int = 100,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    bounded_limit = max(1, min(limit, 500))
+    items = WikiMaintenanceStore(db_path=store.db_path).list_query_insights(
+        status=status.strip(),
+        limit=bounded_limit,
+    )
+    return {"items": items, "count": len(items), "status": status.strip()}
+
+
+def _write_selected_query_artifact(
+    payload: SelectionInsightCapturePayload,
+    selected_text: str,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    seed = f"{payload.session_id}\n{payload.message_id}\n{selected_text}"
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+    title_seed = payload.question or selected_text
+    slug = STORAGE_LAYOUT.slug(title_seed, limit=48) or "selected-insight"
+    query_id = f"{slug}-{digest}"
+    rel_path = _Path("selected") / now.date().isoformat() / f"{query_id}.md"
+    path = STORAGE_LAYOUT.queries_dir / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    citation_items = [
+        {
+            "card_id": str(item.get("card_id") or ""),
+            "title": str(item.get("title") or ""),
+            "page_type": str(item.get("page_type") or ""),
+            "summary": str(item.get("summary") or ""),
+            "markdown_path": str(item.get("markdown_path") or ""),
+        }
+        for item in (payload.citations or [])
+        if isinstance(item, dict)
+    ]
+    artifact = {
+        "query_id": query_id,
+        "source_type": "user_selection",
+        "session_id": payload.session_id,
+        "message_id": payload.message_id,
+        "question": payload.question,
+        "selected_text": selected_text,
+        "answer_excerpt": selected_text[:600],
+        "citations": citation_items,
+        "resources": payload.resources,
+        "tool_plan": payload.tool_plan,
+        "trace_summary": {
+            "tool_observations": [
+                {
+                    "tool": obs.get("tool", ""),
+                    "query": obs.get("query", ""),
+                    "status": obs.get("status", ""),
+                    "summary": obs.get("summary", ""),
+                    "item_count": len(obs.get("items") or []),
+                }
+                for obs in ((payload.trace or {}).get("tool_observations") or [])
+                if isinstance(obs, dict)
+            ],
+        },
+    }
+    lines = [
+        "---",
+        f"id: {query_id}",
+        "type: selected_query_insight",
+        "source_type: user_selection",
+        f"session_id: {payload.session_id}",
+        f"message_id: {payload.message_id}",
+        f"created: {now.isoformat(timespec='seconds')}",
+        "status: archived",
+        "---",
+        "",
+        "# Selected Wiki Insight",
+        "",
+        "## Question",
+        "",
+        payload.question.strip() or "User selected a reusable answer fragment.",
+        "",
+        "## Selected Text",
+        "",
+        selected_text,
+        "",
+        "## Citations",
+        "",
+    ]
+    if citation_items:
+        for item in citation_items:
+            lines.append(f"- {item.get('title', '')} (`{item.get('card_id', '')}`)")
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
+        "## Tool Plan",
+        "",
+        "```json",
+        json.dumps(payload.tool_plan or {}, ensure_ascii=False, indent=2),
+        "```",
+        "",
+    ])
+    markdown = "\n".join(lines)
+    path.write_text(markdown, encoding="utf-8")
+    storage = get_object_storage()
+    artifact_uri = storage.upload_text(
+        storage.key_for_local_path(path),
+        markdown,
+        content_type="text/markdown; charset=utf-8",
+    )
+    artifact["artifact_uri"] = artifact_uri
+    artifact["artifact_path"] = path.relative_to(REPO_ROOT).as_posix()
+    return artifact
+
+
+@router.post("/maintenance/query-insights/capture-selection")
+def capture_selected_wiki_insight(
+    payload: SelectionInsightCapturePayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    selected_text = sanitize_wiki_text(payload.selected_text).strip()
+    if len(selected_text) < 20:
+        raise HTTPException(status_code=400, detail="selected_text is too short.")
+
+    maintenance_store = WikiMaintenanceStore(db_path=store.db_path)
+    artifact = _write_selected_query_artifact(payload, selected_text)
+    insight_id = maintenance_store.add_query_insight(
+        session_id=payload.session_id,
+        message_id=payload.message_id,
+        question=payload.question or "User selected a reusable answer fragment.",
+        answer_excerpt=selected_text[:600],
+        insight=artifact,
+        status="archived",
+    )
+    artifact["insight_id"] = insight_id
+    maintenance_store.update_query_insight(insight_id, insight=artifact)
+
+    item = maintenance_store.get_query_insight(insight_id)
+    if not item:
+        raise HTTPException(status_code=500, detail="Failed to create query insight.")
+
+    distiller = QueryInsightDistiller(
+        db_path=store.db_path,
+        llm=get_summary_llm() if payload.use_llm else None,
+    )
+    distill_result = distiller.distill_one(item)
+    updated = maintenance_store.get_query_insight(insight_id) or {}
+    candidate_id = str(updated.get("candidate_id") or "")
+
+    candidate_result: dict[str, Any] = {}
+    if candidate_id:
+        candidate = maintenance_store.get_candidate(candidate_id)
+        if candidate:
+            candidate_result = MaintenanceCandidateProcessor(
+                db_path=store.db_path,
+                llm=get_maintenance_llm() if payload.use_llm else None,
+            ).process_one(candidate, auto_merge=payload.auto_merge)
+
+    validation = WikiValidator(db_path=store.db_path).validate_all(check_storage=False)
+    indices = WikiIndexGenerator(db_path=store.db_path).generate_all(upload=True)
+    result_card_id = str((candidate_result.get("merge") or {}).get("result_card_id") or "")
+    return {
+        "ok": True,
+        "insight_id": insight_id,
+        "artifact_uri": artifact.get("artifact_uri", ""),
+        "distill": distill_result,
+        "candidate_id": candidate_id,
+        "result_card_id": result_card_id,
+        "candidate": candidate_result,
+        "validation": {
+            "ok": validation.get("ok", False),
+            "summary": validation.get("summary", {}),
+            "run_id": validation.get("run_id", ""),
+        },
+        "indices": {
+            "ok": indices.get("ok", False),
+            "card_count": indices.get("card_count", 0),
+            "artifact_count": indices.get("artifact_count", 0),
+        },
+    }
+
+
+@router.post("/maintenance/query-insights/distill")
+def distill_wiki_query_insights(
+    payload: QueryInsightDistillPayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    llm = get_summary_llm() if payload.use_llm else None
+    result = QueryInsightDistiller(db_path=store.db_path, llm=llm).distill_pending(
+        limit=max(1, min(payload.limit, 50))
+    )
+    return result
+
+
+@router.post("/maintenance/web-update/discover")
+def discover_wiki_web_updates(
+    payload: WebUpdateDiscoverPayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    llm = get_maintenance_llm() if payload.use_llm else None
+    return WebUpdateAgent(
+        db_path=store.db_path,
+        llm=llm,
+        web_search=get_web_search(),
+        web_fetch=get_web_fetch(),
+    ).discover(
+        topic=payload.topic,
+        limit=max(1, min(payload.limit, 10)),
+        fetch_top=max(0, min(payload.fetch_top, 5)),
+        upload=payload.upload,
+    )
+
+
+@router.post("/maintenance/web-sources/process")
+def process_wiki_web_source_jobs(
+    payload: WebSourceProcessPayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    return WebSourceIngestionProcessor(db_path=store.db_path).process_queued(
+        limit=max(1, min(payload.limit, 100)),
+        auto_merge=payload.auto_merge,
+    )
+
+
+@router.post("/maintenance/generate-indices")
+def generate_wiki_indices(
+    upload: bool = True,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    result = WikiIndexGenerator(db_path=store.db_path).generate_all(upload=upload)
+    return result
+
+
+@router.post("/maintenance/run-once")
+def run_wiki_maintenance_once(
+    payload: MaintenanceRunPayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    planner_llm = None
+    if payload.create_repair_tasks:
+        report = WikiValidator(db_path=store.db_path).validate_all(check_storage=payload.check_storage)
+        if report.get("errors") or report.get("warnings"):
+            from backend.deps import get_maintenance_fast_llm
+            planner_llm = get_maintenance_fast_llm()
+    repair_llm = get_maintenance_llm() if payload.process_llm_repairs else None
+    query_insight_llm = get_summary_llm() if payload.distill_query_insights else None
+    candidate_llm = get_maintenance_llm() if payload.process_candidates_with_llm else None
+    return WikiMaintenanceRunner(
+        db_path=store.db_path,
+        planner_llm=planner_llm,
+        repair_llm=repair_llm,
+        query_insight_llm=query_insight_llm,
+        candidate_llm=candidate_llm,
+    ).run_once(
+        check_storage=payload.check_storage,
+        create_repair_tasks=payload.create_repair_tasks,
+        process_deterministic_repairs=payload.process_deterministic_repairs,
+        process_llm_repairs=payload.process_llm_repairs,
+        distill_query_insights=payload.distill_query_insights,
+        process_candidates=payload.process_candidates,
+        process_web_sources=payload.process_web_sources,
+        generate_indices=payload.generate_indices,
+        upload_indices=payload.upload_indices,
+    )
 
 
 @router.get("/evaluations")

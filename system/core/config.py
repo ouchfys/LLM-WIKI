@@ -82,7 +82,7 @@ SILICONFLOW_CHAT_MODEL = os.environ.get(
 # 轻量模型: 意图路由 / 偏好抽取 / 简单分类
 SILICONFLOW_FAST_MODEL = os.environ.get(
     "SILICONFLOW_FAST_MODEL",
-    "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen3.5-9B",
 )
 
 # Wiki / paper / source summarization model. Kept separate from the fast router
@@ -100,6 +100,16 @@ SILICONFLOW_REVIEW_MODEL = os.environ.get(
 SILICONFLOW_MERGE_MODEL = os.environ.get(
     "SILICONFLOW_MERGE_MODEL",
     "Qwen/Qwen3.6-27B",
+)
+
+SILICONFLOW_MAINTENANCE_MODEL = os.environ.get(
+    "SILICONFLOW_MAINTENANCE_MODEL",
+    SILICONFLOW_REVIEW_MODEL,
+)
+
+SILICONFLOW_MAINTENANCE_FAST_MODEL = os.environ.get(
+    "SILICONFLOW_MAINTENANCE_FAST_MODEL",
+    SILICONFLOW_FAST_MODEL,
 )
 
 # ========== Docling 远程解析服务配置 ==========
@@ -140,6 +150,8 @@ def get_model_runtime_summary():
         "summary_model": SILICONFLOW_SUMMARY_MODEL,
         "review_model": SILICONFLOW_REVIEW_MODEL,
         "merge_model": SILICONFLOW_MERGE_MODEL,
+        "maintenance_model": SILICONFLOW_MAINTENANCE_MODEL,
+        "maintenance_fast_model": SILICONFLOW_MAINTENANCE_FAST_MODEL,
         "docling_mode": DOCLING_MODE,
         "docling_base_url": DOCLING_BASE_URL if DOCLING_MODE == "remote" else "n/a",
         "web_search_mode": WEB_SEARCH_MODE,

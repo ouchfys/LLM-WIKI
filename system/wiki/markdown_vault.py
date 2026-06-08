@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from system.storage import get_object_storage
+from system.storage import get_object_storage, get_storage_layout
 
 
 PAGE_TYPE_DIRS = {
@@ -28,8 +28,8 @@ PAGE_TYPE_DIRS = {
 
 class MarkdownVault:
     def __init__(self, vault_dir: Optional[str] = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        self.vault_dir = Path(vault_dir) if vault_dir else repo_root / "data" / "generated" / "wiki"
+        self.repo_root = Path(__file__).resolve().parents[2]
+        self.vault_dir = Path(vault_dir) if vault_dir else get_storage_layout().wiki_dir
 
     @property
     def vault_name(self) -> str:
@@ -64,8 +64,7 @@ class MarkdownVault:
         path = Path(markdown_path)
         if path.is_absolute():
             return path
-        repo_root = self.vault_dir.parent.parent
-        return repo_root / path
+        return self.repo_root / path
 
     def write_card(
         self,
@@ -98,7 +97,10 @@ class MarkdownVault:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown, encoding="utf-8")
         storage.upload_text(storage.key_for_local_path(path), markdown)
-        return str(path.relative_to(self.vault_dir.parent.parent))
+        try:
+            return path.relative_to(self.repo_root).as_posix()
+        except ValueError:
+            return str(path)
 
     def delete_card(self, markdown_path: str) -> None:
         if not markdown_path:
@@ -111,7 +113,7 @@ class MarkdownVault:
             return
         path = Path(markdown_path)
         if not path.is_absolute():
-            path = self.vault_dir.parent.parent / path
+            path = self.repo_root / path
         try:
             if path.exists() and self.vault_dir in path.resolve().parents:
                 path.unlink()
@@ -129,80 +131,76 @@ class MarkdownVault:
         source_urls: List[str],
         related_topics: List[str],
     ) -> str:
+        """Render the canonical Markdown schema used by the wiki reindexer."""
         now = datetime.now(timezone.utc).date().isoformat()
+        content_json = content_json or {}
+        aliases = self._as_string_list(content_json.get("aliases"))
+        source_packet_id = str(content_json.get("source_packet_id") or "")
+        if not source_packet_id:
+            for source in content_json.get("sources") or []:
+                if isinstance(source, dict) and source.get("source_packet_id"):
+                    source_packet_id = str(source.get("source_packet_id") or "")
+                    break
+        if not source_packet_id:
+            source_packet_ids = self._as_string_list(content_json.get("source_packet_ids"))
+            source_packet_id = source_packet_ids[0] if source_packet_ids else ""
+        review_status = str(content_json.get("review_status") or "")
+        status = self._status_for(review_status, source_level)
         tags = self._tags_for(page_type, related_topics)
+
         frontmatter = [
             "---",
             f"id: {self._yaml_scalar(card_id)}",
             f"title: {self._yaml_scalar(title)}",
             f"type: {self._yaml_scalar(page_type)}",
-            "status: draft",
+            f"status: {self._yaml_scalar(status)}",
             f"created: {self._yaml_scalar(now)}",
             f"updated: {self._yaml_scalar(now)}",
             f"source_level: {self._yaml_scalar(source_level)}",
-            "tags:",
+            "aliases:",
         ]
-        for tag in tags:
-            frontmatter.append(f"  - {self._yaml_scalar(tag)}")
-        frontmatter.extend([
-            "sources:",
-        ])
+        frontmatter.extend([f"  - {self._yaml_scalar(alias)}" for alias in aliases] or ["  []"])
+        frontmatter.append("tags:")
+        frontmatter.extend([f"  - {self._yaml_scalar(tag)}" for tag in tags] or ["  []"])
+        frontmatter.append("sources:")
         if source_urls:
             for url in source_urls:
                 frontmatter.append(f"  - url: {self._yaml_scalar(url)}")
                 frontmatter.append(f"    level: {self._yaml_scalar(source_level)}")
+                if source_packet_id:
+                    frontmatter.append(f"    source_packet_id: {self._yaml_scalar(source_packet_id)}")
         else:
             frontmatter.append("  []")
-
         frontmatter.append("related:")
-        if related_topics:
-            for topic in related_topics:
-                frontmatter.append(f"  - {self._yaml_scalar(topic)}")
-        else:
-            frontmatter.append("  []")
+        frontmatter.extend([f"  - {self._yaml_scalar(topic)}" for topic in related_topics] or ["  []"])
         frontmatter.extend(["---", ""])
 
         body = [f"# {title}", ""]
         if summary:
-            body.extend(["> [!summary] 一句话摘要", ">", f"> {summary.strip()}", ""])
-
-        body.extend([
-            "## 为什么值得记录",
-            "",
-            "- [ ] 这条内容和我的目标有什么关系？",
-            "- [ ] 面试或项目展示时可以怎么讲？",
-            "- [ ] 后续需要补哪篇论文或哪个概念？",
-            "",
-        ])
-
+            body.extend(["## Summary", "", summary.strip(), ""])
         body.extend(self._render_content_sections(page_type, content_json))
-
         if source_urls:
-            body.extend(["## 来源", ""])
+            body.extend(["## Evidence", ""])
             for url in source_urls:
                 label = source_level or "source"
                 body.append(f"- [{label}] {url}")
             body.append("")
-
         if related_topics:
-            body.extend(["## 关联页面", ""])
+            body.extend(["## Links", ""])
             for topic in related_topics:
                 body.append(f"- [[{topic}]]")
             body.append("")
-
         body.extend([
-            "## 我的笔记",
+            "## Notes",
             "",
             "- ",
             "",
-            "## 下次复习",
+            "## Review Status",
             "",
-            "- [ ] 需要复习",
-            "- [ ] 可以转成面试问答",
-            "- [ ] 值得进入精读",
+            f"- status: {status}",
+            f"- reviewer: {review_status or 'unreviewed'}",
             "",
         ])
-
         return "\n".join(frontmatter + body).rstrip() + "\n"
 
     def _ensure_local_vault(self) -> None:
@@ -263,7 +261,7 @@ class MarkdownVault:
         if existing_path and not existing_path.startswith(("oss://", "local://")):
             path = Path(existing_path)
             if not path.is_absolute():
-                path = self.vault_dir.parent.parent / path
+                path = self.repo_root / path
             return path
 
         dirname = PAGE_TYPE_DIRS.get(page_type, "sources")
@@ -272,65 +270,75 @@ class MarkdownVault:
 
     @staticmethod
     def _render_content_sections(page_type: str, content: Dict[str, Any]) -> List[str]:
+        """Render stable, parser-friendly Markdown body sections."""
         lines: List[str] = []
         if not content:
             return lines
 
         preferred = {
-            "ConceptPage": [
-                ("explanation", "核心概念"),
-                ("examples", "例子"),
-                ("related_concepts", "相关概念"),
-            ],
             "PaperPage": [
-                ("problem", "问题 / 背景"),
-                ("key_idea", "核心思路"),
-                ("authors", "作者"),
-                ("year", "年份"),
-                ("venue", "会议 / 来源"),
-                ("key_contributions", "核心贡献"),
-                ("methods", "方法"),
-                ("method", "方法"),
-                ("results", "结果 / 摘要"),
-                ("key_takeaways", "关键要点"),
-                ("interview_notes", "面试 / 项目表达"),
-                ("notes", "原始记录"),
+                ("problem", "Problem"),
+                ("key_idea", "Key Ideas"),
+                ("method", "Method"),
+                ("methods", "Method"),
+                ("results", "Results"),
+                ("findings", "Findings"),
+                ("limitations", "Limitations"),
+                ("key_takeaways", "Key Takeaways"),
+                ("interview_notes", "Interview Notes"),
+                ("notes", "Notes"),
+            ],
+            "ConceptPage": [
+                ("definition", "Definition"),
+                ("mechanism", "Mechanism"),
+                ("method", "Method"),
+                ("findings", "Findings"),
+                ("limitations", "Limitations"),
+                ("key_takeaways", "Key Ideas"),
+                ("explanation", "Explanation"),
+                ("examples", "Examples"),
+                ("related_concepts", "Related Concepts"),
             ],
             "MethodPage": [
-                ("category", "方法类别"),
-                ("description", "方法说明"),
-                ("when_to_use", "适用场景"),
-                ("steps", "步骤"),
-                ("comparison_to_alternatives", "和替代方案对比"),
+                ("definition", "Definition"),
+                ("mechanism", "Mechanism"),
+                ("method", "Method"),
+                ("findings", "Findings"),
+                ("limitations", "Limitations"),
+                ("key_takeaways", "Key Ideas"),
+                ("category", "Category"),
+                ("description", "Description"),
+                ("when_to_use", "When To Use"),
+                ("steps", "Steps"),
+                ("comparison_to_alternatives", "Comparison To Alternatives"),
             ],
             "ComparePage": [
-                ("item_a", "对象 A"),
-                ("item_b", "对象 B"),
-                ("dimensions", "对比维度"),
+                ("item_a", "Item A"),
+                ("item_b", "Item B"),
+                ("dimensions", "Dimensions"),
             ],
             "InterviewQA": [
-                ("question", "问题"),
-                ("ideal_answer", "面试回答版本"),
-                ("key_points", "关键点"),
-                ("common_mistakes", "常见错误"),
+                ("question", "Question"),
+                ("ideal_answer", "Ideal Answer"),
+                ("key_points", "Key Points"),
+                ("common_mistakes", "Common Mistakes"),
             ],
             "MistakeNote": [
-                ("mistake", "错误"),
-                ("correction", "修正"),
-                ("lesson", "教训"),
-                ("context", "上下文"),
+                ("mistake", "Mistake"),
+                ("correction", "Correction"),
+                ("lesson", "Lesson"),
+                ("context", "Context"),
             ],
         }
 
-        keys = preferred.get(page_type, [])
         seen = set()
-        for key, label in keys:
+        for key, label in preferred.get(page_type, []):
             if key in content:
                 lines.extend(MarkdownVault._render_value(label, content.get(key)))
                 seen.add(key)
         for key, value in content.items():
-            if key not in seen and not key.startswith("_"):
-                lines.extend(MarkdownVault._render_value(key.replace("_", " "), value))
+            if key not in seen and not key.startswith("_") and key not in {"aliases", "sources", "source_packet_id", "source_packet_ids", "raw_source_path", "pdf_storage_uri", "review_status"}:
+                lines.extend(MarkdownVault._render_value(key.replace("_", " ").title(), value))
         return lines
 
     @staticmethod
@@ -364,6 +372,24 @@ class MarkdownVault:
     def _yaml_scalar(value: Any) -> str:
         text = str(value or "").replace('"', '\\"')
         return f'"{text}"'
+
+    @staticmethod
+    def _as_string_list(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    @staticmethod
+    def _status_for(review_status: str, source_level: str) -> str:
+        review = (review_status or "").strip().lower()
+        if review in {"approved", "verified"}:
+            return "verified"
+        if review in {"reviewed"}:
+            return "reviewed"
+        level = (source_level or "").strip().lower()
+        if level in {"primary", "verified"}:
+            return "reviewed"
+        return "draft"
 
     @staticmethod
     def _tags_for(page_type: str, related_topics: List[str]) -> List[str]:

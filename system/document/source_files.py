@@ -1,8 +1,8 @@
 """
 Source Files — download and manage source files for ingestion.
 
-Handles downloading Xiaohongshu images to local storage for later OCR.
-Keeps files under data/raw_sources/ for inspection and reuse.
+Handles downloading Xiaohongshu images to source storage for later OCR.
+Keeps files under sources/ as a local developer cache and uploads to OSS.
 """
 
 from __future__ import annotations
@@ -14,11 +14,9 @@ from typing import List, Optional
 
 import requests
 
-from system.storage import get_object_storage
+from system.storage import get_object_storage, get_storage_layout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = REPO_ROOT / "data"
-RAW_SOURCES_DIR = DATA_DIR / "raw_sources"
 
 MAX_IMAGES = 12
 DOWNLOAD_TIMEOUT = 30
@@ -46,7 +44,7 @@ def download_images(
     if not urls:
         return []
 
-    dest_dir = RAW_SOURCES_DIR / "xiaohongshu" / note_id
+    dest_dir = get_storage_layout().source_asset_dir("xiaohongshu", note_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     downloaded: List[str] = []

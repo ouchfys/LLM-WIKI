@@ -6,14 +6,14 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from system.storage import get_object_storage
+from system.storage import get_object_storage, get_storage_layout
 
 
 class RawSourceVault:
     def __init__(self, base_dir: Optional[str] = None):
         repo_root = Path(__file__).resolve().parents[2]
         self.repo_root = repo_root
-        self.base_dir = Path(base_dir) if base_dir else repo_root / "data" / "raw_sources" / "markdown"
+        self.base_dir = Path(base_dir) if base_dir else get_storage_layout().sources_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def write_source(
@@ -66,7 +66,7 @@ class RawSourceVault:
         storage_uri = storage.upload_text(storage.key_for_local_path(path), markdown)
         if storage.enabled:
             return storage_uri
-        return str(path.relative_to(self.repo_root))
+        return path.relative_to(self.repo_root).as_posix()
 
     @staticmethod
     def _escape(value: Any) -> str:

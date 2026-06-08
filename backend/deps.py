@@ -10,9 +10,12 @@ from system.wiki.wiki_store import WikiStore
 from system.wiki.wiki_chat import WikiChatService
 from system.wiki.chunk_index import WikiChunkIndex
 from system.search.resource_recommender import LearningResourceRecommender
+from system.search.web_fetch import WebFetchTool
 from system.search.web_search import WebSearchTool
 from system.core.config import (
     SILICONFLOW_FAST_MODEL,
+    SILICONFLOW_MAINTENANCE_FAST_MODEL,
+    SILICONFLOW_MAINTENANCE_MODEL,
     SILICONFLOW_MERGE_MODEL,
     SILICONFLOW_REVIEW_MODEL,
     SILICONFLOW_SUMMARY_MODEL,
@@ -118,6 +121,30 @@ def get_merge_llm():
 
 
 @lru_cache(maxsize=1)
+def get_maintenance_llm():
+    """Stronger maintenance model for semantic repair and web-update judgment."""
+    if SiliconFlowChat is None:
+        return None
+    try:
+        return SiliconFlowChat(model=SILICONFLOW_MAINTENANCE_MODEL, temperature=0.0, max_tokens=3200)
+    except Exception as exc:
+        print(f"[deps] Maintenance LLM unavailable: {exc}")
+        return get_review_llm()
+
+
+@lru_cache(maxsize=1)
+def get_maintenance_fast_llm():
+    """Cheap maintenance model for planning and controlled-vocabulary routing."""
+    if SiliconFlowChat is None:
+        return None
+    try:
+        return SiliconFlowChat(model=SILICONFLOW_MAINTENANCE_FAST_MODEL, temperature=0.0, max_tokens=1800)
+    except Exception as exc:
+        print(f"[deps] Maintenance fast LLM unavailable: {exc}")
+        return get_fast_llm()
+
+
+@lru_cache(maxsize=1)
 def get_chunk_index() -> WikiChunkIndex:
     return WikiChunkIndex(db_path=get_session_store().db_path)
 
@@ -129,6 +156,11 @@ def get_web_search() -> WebSearchTool:
         timeout_seconds=WEB_SEARCH_TIMEOUT_SECONDS,
         max_results=WEB_SEARCH_MAX_RESULTS,
     )
+
+
+@lru_cache(maxsize=1)
+def get_web_fetch() -> WebFetchTool:
+    return WebFetchTool(timeout_seconds=max(WEB_SEARCH_TIMEOUT_SECONDS, 8))
 
 
 @lru_cache(maxsize=1)
@@ -161,5 +193,6 @@ def get_wiki_chat() -> WikiChatService:
         llm=get_chat_llm(),
         chunk_index=get_chunk_index(),
         web_search=get_web_search(),
+        web_fetch=get_web_fetch(),
         resource_recommender=get_resource_recommender(),
     )

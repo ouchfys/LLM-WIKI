@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from system.wiki.paper_pipeline.distiller import parse_json_object
 from system.wiki.paper_pipeline.models import DistilledCandidate, MergePlan, MergeResult, ReviewReport, SourcePacket
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
+from system.wiki.markdown_reindexer import MarkdownWikiReindexer
+from system.wiki.markdown_vault import MarkdownVault
 from system.wiki.wiki_builder import sanitize_wiki_text
 from system.wiki.wiki_store import WikiStore
 
@@ -160,6 +163,8 @@ class PaperMergeAgent:
     def __init__(self, pipeline_store: PaperWikiPipelineStore, wiki_store: WikiStore, llm=None):
         self.pipeline_store = pipeline_store
         self.wiki_store = wiki_store
+        self.markdown_vault = MarkdownVault()
+        self.markdown_reindexer = MarkdownWikiReindexer(db_path=wiki_store.db_path)
         self.llm = llm
         self.llm_calls = 0
 
@@ -302,14 +307,20 @@ class PaperMergeAgent:
             "review_status": report.status if report else "missing",
         })
         existing = self.wiki_store.find_duplicate(candidate.title, "PaperPage", packet.source_urls)
-        card_id = self.wiki_store.create_card(
+        card_id = existing["id"] if existing else str(uuid.uuid4())
+        summary = _merge_summary(existing.get("summary", ""), candidate.summary) if existing else candidate.summary
+        source_urls = _unique_list((existing.get("source_urls") if existing else []) + packet.source_urls)
+        related_topics = _unique_list((existing.get("related_topics") if existing else []) + candidate.related_topics)
+        card_id = self._write_canonical_card(
+            card_id=card_id,
             title=candidate.title,
             page_type="PaperPage",
             content_json=content,
-            summary=candidate.summary[:360],
+            summary=summary[:360],
             source_level="primary",
-            source_urls=packet.source_urls,
-            related_topics=candidate.related_topics,
+            source_urls=source_urls,
+            related_topics=related_topics,
+            existing_card=existing,
         )
         self.pipeline_store.add_aliases(card_id, [candidate.title] + candidate.aliases)
         self.pipeline_store.add_card_source(
@@ -333,13 +344,14 @@ class PaperMergeAgent:
         plan: MergePlan | None = None,
     ) -> str:
         content = self._knowledge_content(packet, candidate, existing={}, plan=plan)
-        card_id = self.wiki_store.create_card(
+        card_id = self._write_canonical_card(
+            card_id=str(uuid.uuid4()),
             title=candidate.title,
             page_type=candidate.page_type,
             content_json=content,
             summary=candidate.summary[:280],
             source_level=candidate.source_level or "primary",
-            source_urls=[],
+            source_urls=packet.source_urls[:1],
             related_topics=candidate.related_topics,
         )
         aliases = [candidate.title] + candidate.aliases + ((plan.aliases_to_add if plan else []) or [])
@@ -359,18 +371,50 @@ class PaperMergeAgent:
         content = self._knowledge_content(packet, candidate, existing=existing.get("content_json") or {}, plan=plan)
         summary = _merge_summary(existing.get("summary", ""), candidate.summary)
         related_topics = _unique_list((existing.get("related_topics") or []) + candidate.related_topics)
-        source_urls = existing.get("source_urls") or []
-        self.wiki_store.update_card(
-            card_id,
+        source_urls = _unique_list((existing.get("source_urls") or []) + packet.source_urls[:1])
+        card_id = self._write_canonical_card(
+            card_id=card_id,
+            title=existing.get("title") or candidate.title,
+            page_type=existing.get("page_type") or candidate.page_type,
             summary=summary[:360],
             content_json=content,
-            source_urls_json=source_urls,
-            related_topics_json=related_topics,
+            source_level=existing.get("source_level") or candidate.source_level or "primary",
+            source_urls=source_urls,
+            related_topics=related_topics,
+            existing_card=existing,
         )
         aliases = [candidate.title] + candidate.aliases + ((plan.aliases_to_add if plan else []) or [])
         self.pipeline_store.add_aliases(card_id, aliases)
         self._add_sources(card_id, paper_card_id, packet, candidate)
         return card_id
+
+    def _write_canonical_card(
+        self,
+        *,
+        card_id: str,
+        title: str,
+        page_type: str,
+        content_json: dict[str, Any],
+        summary: str,
+        source_level: str,
+        source_urls: list[str],
+        related_topics: list[str],
+        existing_card: dict[str, Any] | None = None,
+    ) -> str:
+        """Write Markdown as the authority layer, then rebuild SQLite caches."""
+        markdown_path = self.markdown_vault.write_card(
+            card_id=card_id,
+            title=title,
+            page_type=page_type,
+            summary=summary,
+            content_json=content_json,
+            source_level=source_level,
+            source_urls=source_urls,
+            related_topics=related_topics,
+            existing_path=(existing_card or {}).get("markdown_path", ""),
+        )
+        indexed = self.markdown_reindexer.reindex_reference(markdown_path)
+        return str(indexed.get("card_id") or card_id)
 
     def _knowledge_content(
         self,
@@ -396,6 +440,7 @@ class PaperMergeAgent:
         content["aliases"] = _unique_list(_as_list(content.get("aliases")) + [candidate.title] + candidate.aliases)
         if plan:
             content["aliases"] = _unique_list(_as_list(content.get("aliases")) + plan.aliases_to_add)
+        content["source_packet_id"] = packet.source_id
         content["source_packet_ids"] = _unique_list(_as_list(content.get("source_packet_ids")) + [packet.source_id])
         content.setdefault("evidence_updates", [])
         updates = _as_list(content.get("evidence_updates"))
@@ -560,7 +605,17 @@ class PaperMergeAgent:
             "review_rejections": result.review_rejections,
             "merge_audit": result.merge_audit,
         }
-        self.wiki_store.update_card(paper_card_id, content_json=content)
+        self._write_canonical_card(
+            card_id=paper_card_id,
+            title=card.get("title", ""),
+            page_type=card.get("page_type", "PaperPage"),
+            summary=card.get("summary", ""),
+            content_json=content,
+            source_level=card.get("source_level", "primary"),
+            source_urls=card.get("source_urls", []),
+            related_topics=card.get("related_topics", []),
+            existing_card=card,
+        )
 
 
 def _first_evidence(candidate: DistilledCandidate) -> str:
@@ -652,4 +707,4 @@ def _merge_summary(existing: str, incoming: str) -> str:
         return incoming
     if not incoming or incoming in existing:
         return existing
-    return f"{existing}\n\n补充：{incoming}"
+    return f"{existing}\n\nAdditional:\n{incoming}"

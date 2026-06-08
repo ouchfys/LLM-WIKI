@@ -1,227 +1,248 @@
 <template>
   <section class="vault-page">
-    <header class="vault-header">
-      <div class="vault-title-block">
-        <p class="eyebrow">KNOWLEDGE VAULT</p>
-        <h1>论文知识库</h1>
+    <div class="vault-stage">
+      <div class="mobile-library-picker">
+        <label for="vault-library-select">资料库</label>
+        <select id="vault-library-select" :value="selectedGroupKey" @change="selectGroup(($event.target as HTMLSelectElement).value)">
+          <option v-for="group in libraryGroups" :key="group.key" :value="group.key">
+            {{ group.label }} ({{ group.items.length }})
+          </option>
+        </select>
       </div>
 
-      <div class="vault-status">
-        <div><span>Cards</span><strong>{{ allCards.length }}</strong></div>
-        <div><span>Keywords</span><strong>{{ aliasItems.length }}</strong></div>
-        <div><span>Active</span><strong>{{ selectedCard ? typeLabel(selectedCard.page_type) : '-' }}</strong></div>
-      </div>
-
-      <div class="graph-visual" aria-hidden="true">
-        <span class="graph-node n1"></span>
-        <span class="graph-node n2"></span>
-        <span class="graph-node n3"></span>
-        <span class="graph-node n4"></span>
-        <span class="graph-line l1"></span>
-        <span class="graph-line l2"></span>
-        <span class="graph-line l3"></span>
-      </div>
-    </header>
-
-    <div class="vault-toolbar">
-      <div class="toolbar-tabs" aria-label="Knowledge navigation">
-        <button type="button" class="active">阅读器</button>
-        <button type="button" @click="openGraphSearch">关联检索</button>
-        <button type="button" @click="openDashboard">推荐队列</button>
-      </div>
-      <n-input
-        v-model:value="query"
-        class="vault-search"
-        clearable
-        placeholder="搜索论文、概念、方法或关键词"
-        @keyup.enter="loadCards"
-      />
-      <button type="button" class="refresh-button" @click="loadCards">刷新</button>
-    </div>
-
-    <div class="vault-layout">
-      <aside class="vault-sidebar">
-        <div class="panel-title">
-          <span>Library</span>
-          <small>{{ allCards.length }} nodes</small>
-        </div>
-        <div class="library-tree">
-          <section v-for="group in libraryGroups" :key="group.key" class="library-group">
-            <button
-              type="button"
-              class="library-head"
-              :class="{ active: selectedGroupKey === group.key }"
-              @click="selectGroup(group.key)"
-            >
-              <span>{{ group.label }}</span>
-              <strong>{{ group.items.length }}</strong>
-            </button>
-            <div v-if="selectedGroupKey === group.key" class="library-items">
-              <button
-                v-for="card in group.items"
-                :key="card.id"
-                type="button"
-                class="card-row"
-                :class="{ active: selectedCard?.id === card.id }"
-                @click="selectCard(card)"
-              >
-                <span>{{ card.title }}</span>
-                <small>{{ cardSubtitle(card) }}</small>
-              </button>
-              <p v-if="!group.items.length" class="empty-note">这个分类还没有内容。</p>
+      <div class="vault-layout">
+        <aside class="vault-library" aria-label="资料库">
+          <div class="column-head">
+            <div>
+              <span>资料库</span>
+              <strong>{{ currentGroup?.label || '资料库' }}</strong>
             </div>
-          </section>
-        </div>
-      </aside>
-
-      <main class="vault-reader">
-        <article v-if="selectedCard" class="wiki-document" @click="handleDocumentClick">
-          <div class="reader-topline">
-            <span>{{ groupLabelForCard(selectedCard) }}</span>
-            <span>{{ typeLabel(selectedCard.page_type) }}</span>
+            <small>{{ allCards.length }} 条</small>
           </div>
 
-          <div class="reader-title-row">
-            <div>
+          <input
+            v-model="query"
+            class="library-search"
+            type="search"
+            placeholder="搜索论文、概念、方法或关键词"
+            @keyup.enter="loadCards"
+          />
+
+          <div class="library-tree">
+            <section v-for="group in libraryGroups" :key="group.key" class="library-group">
+              <button
+                type="button"
+                class="library-group-head"
+                :class="{ active: selectedGroupKey === group.key }"
+                @click="selectGroup(group.key)"
+              >
+                <span>{{ group.label }}</span>
+                <strong>{{ group.items.length }}</strong>
+              </button>
+              <Transition name="library-collapse">
+                <div v-if="selectedGroupKey === group.key" class="library-collapse">
+                  <TransitionGroup name="library-row-stagger" tag="div" class="library-items">
+                    <button
+                      v-for="(card, index) in group.items"
+                      :key="card.id"
+                      type="button"
+                      class="library-row"
+                      :class="{ active: selectedCard?.id === card.id }"
+                      :style="{ '--row-index': index }"
+                      @click="selectCard(card)"
+                    >
+                      <span>{{ card.title }}</span>
+                      <small>{{ cardSubtitle(card) }}</small>
+                    </button>
+                    <p v-if="!group.items.length" key="__empty" class="empty-note">这个分类还没有内容。</p>
+                  </TransitionGroup>
+                </div>
+              </Transition>
+            </section>
+          </div>
+
+          <div class="library-stats" aria-label="资料库统计">
+            <span>{{ allCards.length }} 卡片</span>
+            <span>{{ aliasItems.length }} 关键词</span>
+            <span>{{ selectedCard ? typeLabel(selectedCard.page_type) : '-' }}</span>
+          </div>
+        </aside>
+
+        <main class="vault-reader" aria-label="Reader">
+          <article v-if="selectedCard" class="wiki-document" @click="handleDocumentClick">
+            <header class="reader-head">
+              <div class="reader-meta-line">
+                <span>{{ groupLabelForCard(selectedCard) }}</span>
+                <span>{{ typeLabel(selectedCard.page_type) }}</span>
+              </div>
               <h1>{{ selectedCard.title }}</h1>
-              <div class="wiki-tags">
-                <span :class="['level-tag', selectedCard.source_level || 'neutral']">
+              <div class="reader-control-row">
+                <span :class="['source-level-chip', selectedCard.source_level || 'neutral']">
                   {{ sourceLevelLabel(selectedCard.source_level) }}
                 </span>
-                <span v-for="topic in selectedCard.related_topics || []" :key="topic">{{ topic }}</span>
+                <span v-for="topic in selectedCard.related_topics || []" :key="topic" class="reader-tag">{{ topic }}</span>
               </div>
-            </div>
-            <div class="reader-actions">
-              <button type="button" @click.stop="askAbout(selectedCard)">问 Jarvis</button>
-              <button type="button" @click.stop="openRaw(selectedCard)">原始资料</button>
-              <button type="button" class="danger" @click.stop="deleteCard(selectedCard)">删除</button>
-            </div>
+              <div class="reader-actions">
+                <button type="button" class="primary-action" @click.stop="askAbout(selectedCard)">基于此页提问</button>
+                <button type="button" @click.stop="openRaw(selectedCard)">原始资料</button>
+                <button type="button" class="danger" @click.stop="deleteCard(selectedCard)">删除</button>
+              </div>
+            </header>
+
+            <section v-if="importImpact" class="paper-pipeline">
+              <div class="pipeline-head">
+                <div>
+                  <span>导入流水线</span>
+                  <h2>导入影响</h2>
+                </div>
+                <small>{{ impactSummary }}</small>
+              </div>
+              <p class="pipeline-meta">
+                创建 {{ uniqueImpact.created.length }}
+                · 更新 {{ uniqueImpact.updated.length }}
+                · 关联 {{ uniqueImpact.linked.length }}
+                · 退回 {{ uniqueImpact.rejected.length }}
+              </p>
+              <ul v-if="impactRows.length" class="impact-list">
+                <li v-for="row in impactRows" :key="row.key">
+                  <b>{{ row.kind }}</b>
+                  <button v-if="row.cardId" type="button" @click.stop="selectCardById(row.cardId)">
+                    {{ row.title }}
+                  </button>
+                  <span v-else>{{ row.title }}</span>
+                </li>
+              </ul>
+            </section>
+
+            <section v-if="showSummarySection" class="wiki-section">
+              <h2>摘要</h2>
+              <div v-html="linkifiedText(selectedSummary)"></div>
+            </section>
+
+            <section v-for="section in compiledSections" :key="section.key" class="wiki-section">
+              <h2>{{ section.title }}</h2>
+              <div v-html="section.html"></div>
+            </section>
+
+            <section v-if="imagePreviewSources.length" class="wiki-section">
+              <h2>图片</h2>
+              <div class="image-strip">
+                <a v-for="url in imagePreviewSources" :key="url" :href="normalUrl(url)" target="_blank" rel="noreferrer">
+                  <img :src="normalUrl(url)" :alt="selectedCard.title" />
+                </a>
+              </div>
+            </section>
+
+            <section class="reader-detail-section">
+              <h2>详情</h2>
+              <div class="detail-stack">
+                <section class="trace-card">
+                  <div class="trace-head">
+                    <strong>关联卡片</strong>
+                    <small>{{ relatedCards.length || linkedKnowledge.length }}</small>
+                  </div>
+                  <div v-if="relatedCards.length" class="trace-list">
+                    <button v-for="item in relatedCards" :key="item.key" type="button" class="trace-row" @click.stop="selectCardById(item.cardId)">
+                      <span>{{ item.title }}</span>
+                      <small>{{ relationLabel(item.meta) }}</small>
+                    </button>
+                  </div>
+                  <div v-else-if="linkedKnowledge.length" class="trace-list">
+                    <button v-for="item in linkedKnowledge" :key="item.id" type="button" class="trace-row" @click.stop="selectCardById(item.id)">
+                      <span>{{ item.title }}</span>
+                      <small>{{ typeLabel(item.pageType) }} · {{ relationLabel(item.relationType) }}</small>
+                    </button>
+                  </div>
+                  <p v-else class="empty-note">暂无关联卡片。</p>
+                </section>
+
+                <section class="trace-card">
+                  <div class="trace-head">
+                    <strong>来源追踪</strong>
+                    <small>{{ selectedSourceCount }}</small>
+                  </div>
+                  <dl class="source-facts">
+                    <div><dt>类型</dt><dd>{{ typeLabel(selectedCard.page_type) }}</dd></div>
+                    <div><dt>层级</dt><dd>{{ sourceLevelLabel(selectedCard.source_level) }}</dd></div>
+                    <div><dt>Markdown</dt><dd class="source-path" :title="selectedCard.markdown_path || firstSourceLabel || '尚未记录'">{{ selectedCard.markdown_path || firstSourceLabel || '尚未记录' }}</dd></div>
+                  </dl>
+                  <ul v-if="showSourceTrace && selectedCard.source_urls?.length" class="source-link-list">
+                    <li v-for="url in selectedCard.source_urls" :key="url">
+                      <a :href="normalUrl(url)" target="_blank" rel="noreferrer">{{ readableUrl(url) }}</a>
+                    </li>
+                  </ul>
+                  <ul v-else-if="showSourceTrace && sourceEvidence.length" class="source-link-list">
+                    <li v-for="item in sourceEvidence" :key="item.id">
+                      <strong>{{ item.source_card_title || item.section_id || '证据' }}</strong>
+                      <p>{{ item.claim_text || item.evidence_text }}</p>
+                    </li>
+                  </ul>
+                </section>
+              </div>
+            </section>
+          </article>
+
+          <div v-else class="reader-empty">
+            <span>知识库</span>
+            <h1>选择一张卡片开始阅读</h1>
+            <p>论文、概念卡和方法卡会在这里形成可跳转的阅读视图。</p>
           </div>
+        </main>
 
-          <section v-if="importImpact" class="impact-module">
-            <div class="impact-head">
-              <div>
-                <p class="module-label">PAPER PIPELINE</p>
-                <h2>导入影响</h2>
-              </div>
-              <span>{{ impactSummary }}</span>
+        <aside v-if="selectedCard" class="vault-trace" aria-label="关联与来源追踪">
+          <section class="trace-card">
+            <div class="trace-head">
+              <strong>关联卡片</strong>
+              <small>{{ relatedCards.length || linkedKnowledge.length }}</small>
             </div>
-            <div class="impact-stats">
-              <div><strong>{{ uniqueImpact.created.length }}</strong><span>Created</span></div>
-              <div><strong>{{ uniqueImpact.updated.length }}</strong><span>Updated</span></div>
-              <div><strong>{{ uniqueImpact.linked.length }}</strong><span>Linked</span></div>
-              <div><strong>{{ uniqueImpact.rejected.length }}</strong><span>Rejected</span></div>
+            <div v-if="relatedCards.length" class="trace-list">
+              <button v-for="item in relatedCards" :key="item.key" type="button" class="trace-row" @click.stop="selectCardById(item.cardId)">
+                <span>{{ item.title }}</span>
+                <small>{{ relationLabel(item.meta) }}</small>
+              </button>
             </div>
-            <ul v-if="impactRows.length" class="impact-list">
-              <li v-for="row in impactRows" :key="row.key">
-                <b>{{ row.kind }}</b>
-                <button v-if="row.cardId" type="button" @click.stop="selectCardById(row.cardId)">
-                  {{ row.title }}
-                </button>
-                <span v-else>{{ row.title }}</span>
-              </li>
-            </ul>
-          </section>
-
-          <section v-if="selectedSummary && !hasProblemSection" class="wiki-section summary-section">
-            <h2>摘要</h2>
-            <div v-html="linkifiedText(selectedSummary)"></div>
-          </section>
-
-          <section
-            v-for="section in compiledSections"
-            :key="section.key"
-            class="wiki-section"
-          >
-            <h2>{{ section.title }}</h2>
-            <div v-html="section.html"></div>
-          </section>
-
-          <section v-if="linkedKnowledge.length" class="wiki-section linked-knowledge-section">
-            <h2>Linked Knowledge</h2>
-            <div class="knowledge-link-grid">
-              <button
-                v-for="item in linkedKnowledge"
-                :key="item.id"
-                type="button"
-                class="knowledge-link-card"
-                @click.stop="selectCardById(item.id)"
-              >
+            <div v-else-if="linkedKnowledge.length" class="trace-list">
+              <button v-for="item in linkedKnowledge" :key="item.id" type="button" class="trace-row" @click.stop="selectCardById(item.id)">
                 <span>{{ item.title }}</span>
                 <small>{{ typeLabel(item.pageType) }} · {{ relationLabel(item.relationType) }}</small>
               </button>
             </div>
+            <p v-else class="empty-note">暂无关联卡片。</p>
           </section>
 
-          <section v-if="imagePreviewSources.length" class="wiki-section">
-            <h2>图片</h2>
-            <div class="image-strip">
-              <a v-for="url in imagePreviewSources" :key="url" :href="normalUrl(url)" target="_blank" rel="noreferrer">
-                <img :src="normalUrl(url)" :alt="selectedCard.title" />
-              </a>
+          <section class="trace-card">
+            <div class="trace-head">
+              <strong>来源追踪</strong>
+              <small>{{ selectedSourceCount }}</small>
             </div>
-          </section>
-
-          <section v-if="sourceEvidence.length" class="wiki-section evidence-section">
-            <h2>Source evidence</h2>
-            <ul>
-              <li v-for="item in sourceEvidence" :key="item.id">
-                <strong>{{ item.source_card_title || item.section_id || 'Evidence' }}</strong>
-                <p>{{ item.claim_text || item.evidence_text }}</p>
-              </li>
-            </ul>
-          </section>
-
-          <section v-if="selectedCard.source_urls?.length" class="wiki-section">
-            <h2>来源</h2>
-            <ul>
+            <dl class="source-facts">
+              <div><dt>类型</dt><dd>{{ typeLabel(selectedCard.page_type) }}</dd></div>
+              <div><dt>层级</dt><dd>{{ sourceLevelLabel(selectedCard.source_level) }}</dd></div>
+              <div><dt>来源数</dt><dd>{{ selectedSourceCount }}</dd></div>
+              <div><dt>Markdown</dt><dd class="source-path" :title="selectedCard.markdown_path || firstSourceLabel || '尚未记录'">{{ selectedCard.markdown_path || firstSourceLabel || '尚未记录' }}</dd></div>
+            </dl>
+            <ul v-if="showSourceTrace && selectedCard.source_urls?.length" class="source-link-list">
               <li v-for="url in selectedCard.source_urls" :key="url">
                 <a :href="normalUrl(url)" target="_blank" rel="noreferrer">{{ readableUrl(url) }}</a>
               </li>
             </ul>
+            <ul v-else-if="showSourceTrace && sourceEvidence.length" class="source-link-list">
+              <li v-for="item in sourceEvidence" :key="item.id">
+                <strong>{{ item.source_card_title || item.section_id || '证据' }}</strong>
+                <p>{{ item.claim_text || item.evidence_text }}</p>
+              </li>
+            </ul>
+            <p v-else class="empty-note">暂无来源证据。</p>
           </section>
-        </article>
-
-        <div v-else class="reader-empty">
-          <h2>选择一张卡片开始阅读</h2>
-          <p>论文、概念卡和方法卡会在这里形成可跳转的阅读视图。</p>
-        </div>
-      </main>
-
-      <aside class="vault-aside">
-        <section class="side-panel">
-          <div class="panel-title">
-            <span>Related</span>
-            <small>{{ relatedCards.length }}</small>
-          </div>
-          <ul v-if="relatedCards.length" class="related-list">
-            <li v-for="item in relatedCards" :key="item.key">
-              <button type="button" @click="selectCardById(item.cardId)">{{ item.title }}</button>
-              <span>{{ item.meta }}</span>
-            </li>
-          </ul>
-          <n-empty v-else description="暂无关联卡片" size="small" />
-        </section>
-
-        <section class="side-panel">
-          <div class="panel-title">
-            <span>Source</span>
-            <small>trace</small>
-          </div>
-          <dl v-if="selectedCard" class="meta-list">
-            <div><dt>类型</dt><dd>{{ typeLabel(selectedCard.page_type) }}</dd></div>
-            <div><dt>层级</dt><dd>{{ sourceLevelLabel(selectedCard.source_level) }}</dd></div>
-            <div><dt>Markdown</dt><dd>{{ selectedCard.markdown_path || '-' }}</dd></div>
-          </dl>
-        </section>
-      </aside>
+        </aside>
+      </div>
     </div>
 
     <n-modal v-model:show="rawModalVisible" preset="card" style="width: 960px; max-width: 95vw;" :bordered="false">
       <template #header>
         <div class="modal-head">
           <span>{{ rawModalTitle }}</span>
-          <n-tag size="small">Markdown Source</n-tag>
+          <n-tag size="small">Markdown 原文</n-tag>
         </div>
       </template>
       <pre class="raw-viewer"><code>{{ rawMarkdown }}</code></pre>
@@ -232,7 +253,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { NEmpty, NInput, NModal, NTag } from 'naive-ui'
+import { NModal, NTag } from 'naive-ui'
 import { api, type WikiCard } from '../api'
 
 type LibraryGroup = { key: string; label: string; items: WikiCard[] }
@@ -254,11 +275,11 @@ const cardLinks = ref<any | null>(null)
 
 const libraryGroups = computed<LibraryGroup[]>(() => {
   const groups: LibraryGroup[] = [
-    { key: 'papers', label: 'Papers', items: [] },
-    { key: 'concepts', label: 'Concepts', items: [] },
-    { key: 'methods', label: 'Methods', items: [] },
-    { key: 'interviews', label: 'Interviews', items: [] },
-    { key: 'sources', label: 'Sources', items: [] }
+    { key: 'papers', label: '论文', items: [] },
+    { key: 'concepts', label: '概念', items: [] },
+    { key: 'methods', label: '方法', items: [] },
+    { key: 'interviews', label: '面经', items: [] },
+    { key: 'sources', label: '资料', items: [] }
   ]
   for (const card of allCards.value) {
     groups.find((group) => group.key === cardGroup(card))?.items.push(card)
@@ -268,6 +289,10 @@ const libraryGroups = computed<LibraryGroup[]>(() => {
 
 const selectedSummary = computed(() => selectedCard.value ? cleanText(selectedCard.value.summary) : '')
 const hasProblemSection = computed(() => hasContent(selectedCard.value?.content_json?.problem))
+const selectedSourceType = computed(() => String(selectedCard.value?.content_json?.source_type || '').toLowerCase())
+const showSummarySection = computed(() =>
+  Boolean(selectedSummary.value && !hasProblemSection.value && selectedSourceType.value !== 'user_selection')
+)
 const importImpact = computed(() => {
   const value = selectedCard.value?.content_json?.import_impact
   return typeof value === 'object' && value !== null ? value as any : null
@@ -281,13 +306,13 @@ const uniqueImpact = computed(() => ({
 }))
 
 const impactSummary = computed(() =>
-  `Created ${uniqueImpact.value.created.length} / Updated ${uniqueImpact.value.updated.length} / Linked ${uniqueImpact.value.linked.length}`
+  `新建 ${uniqueImpact.value.created.length} / 更新 ${uniqueImpact.value.updated.length} / 关联 ${uniqueImpact.value.linked.length}`
 )
 
 const impactRows = computed(() => [
-  ...uniqueImpact.value.created.map((item: any) => ({ key: `created:${item.id}`, kind: 'created', title: item.title, cardId: item.id })),
-  ...uniqueImpact.value.updated.map((item: any) => ({ key: `updated:${item.id}`, kind: 'updated', title: item.title, cardId: item.id })),
-  ...uniqueImpact.value.linked.map((item: any) => ({ key: `linked:${item.to || item.id}`, kind: 'linked', title: item.title, cardId: item.to || item.id }))
+  ...uniqueImpact.value.created.map((item: any) => ({ key: `created:${item.id}`, kind: '新建', title: item.title, cardId: item.id })),
+  ...uniqueImpact.value.updated.map((item: any) => ({ key: `updated:${item.id}`, kind: '更新', title: item.title, cardId: item.id })),
+  ...uniqueImpact.value.linked.map((item: any) => ({ key: `linked:${item.to || item.id}`, kind: '关联', title: item.title, cardId: item.to || item.id }))
 ].slice(0, 12))
 
 const compiledSections = computed(() => {
@@ -306,7 +331,7 @@ const linkedKnowledge = computed<LinkedKnowledgeRow[]>(() => {
   return arrayOfObjects(content.linked_knowledge)
     .map((item) => ({
       id: String(item.id || item.to || item.card_id || ''),
-      title: cleanText(String(item.title || item.alias || 'Linked card')),
+      title: cleanText(String(item.title || item.alias || '关联卡片')),
       pageType: String(item.page_type || item.pageType || ''),
       relationType: String(item.relation_type || item.relationType || 'related')
     }))
@@ -324,6 +349,21 @@ const imagePreviewSources = computed(() => {
 })
 
 const sourceEvidence = computed(() => (cardLinks.value?.sources || []).slice(0, 8))
+const showSourceTrace = computed(() => {
+  return selectedSourceType.value !== 'user_selection'
+})
+const firstSourceLabel = computed(() => {
+  const source = selectedCard.value?.source_urls?.[0]
+  return source ? readableUrl(source) : ''
+})
+const selectedSourceCount = computed(() => {
+  const sourceUrls = selectedCard.value?.source_urls?.length || 0
+  const sourceLinks = cardLinks.value?.sources?.length || 0
+  return Math.max(sourceUrls, sourceLinks)
+})
+const currentGroup = computed(() =>
+  libraryGroups.value.find((group) => group.key === selectedGroupKey.value) || libraryGroups.value.find((group) => group.items.length)
+)
 
 const relatedCards = computed<RelatedRow[]>(() => {
   const rows: RelatedRow[] = []
@@ -392,6 +432,10 @@ async function loadSelectedDetails(cardId: string) {
 }
 
 function selectGroup(groupKey: string) {
+  if (selectedGroupKey.value === groupKey) {
+    selectedGroupKey.value = ''
+    return
+  }
   selectedGroupKey.value = groupKey
   const group = libraryGroups.value.find((item) => item.key === groupKey)
   if (group?.items[0]) selectCard(group.items[0])
@@ -414,16 +458,6 @@ async function deleteCard(card: WikiCard) {
 
 function askAbout(card: WikiCard) {
   router.push({ path: '/', query: { ask: `基于 Wiki 页面《${card.title}》，整理一版适合面试展示的解释。` } })
-}
-
-function openGraphSearch() {
-  if (!selectedCard.value?.related_topics?.[0]) return
-  query.value = selectedCard.value.related_topics[0]
-  loadCards()
-}
-
-function openDashboard() {
-  router.push('/daily')
 }
 
 function handleDocumentClick(event: MouseEvent) {
@@ -457,18 +491,28 @@ function linkifiedText(text: string) {
   if (!source) return ''
   const aliases = aliasItems.value
     .filter((item) => item.card_id !== selectedCard.value?.id && item.alias && item.alias.trim().length >= 3)
-    .sort((a, b) => b.alias.length - a.alias.length)
-  const matches: Array<{ start: number; end: number; alias: AliasItem }> = []
+  const candidates: Array<{ start: number; end: number; alias: AliasItem; score: number }> = []
   const lower = source.toLowerCase()
   for (const alias of aliases) {
     const needle = alias.alias.toLowerCase()
     let index = lower.indexOf(needle)
     while (index !== -1) {
       const end = index + needle.length
-      if (!matches.some((match) => rangesOverlap(index, end, match.start, match.end))) {
-        matches.push({ start: index, end, alias })
+      if (isAliasBoundary(source, index, end)) {
+        candidates.push({
+          start: index,
+          end,
+          alias,
+          score: aliasLinkScore(alias, source.slice(index, end))
+        })
       }
       index = lower.indexOf(needle, index + needle.length)
+    }
+  }
+  const matches: Array<{ start: number; end: number; alias: AliasItem }> = []
+  for (const candidate of candidates.sort(compareAliasCandidates)) {
+    if (!matches.some((match) => rangesOverlap(candidate.start, candidate.end, match.start, match.end))) {
+      matches.push({ start: candidate.start, end: candidate.end, alias: candidate.alias })
     }
   }
   if (!matches.length) return paragraphsToHtml(source)
@@ -495,6 +539,47 @@ function paragraphsToHtmlFromEscaped(escaped: string) {
 
 function rangesOverlap(aStart: number, aEnd: number, bStart: number, bEnd: number) {
   return aStart < bEnd && bStart < aEnd
+}
+
+function compareAliasCandidates(
+  a: { start: number; end: number; alias: AliasItem; score: number },
+  b: { start: number; end: number; alias: AliasItem; score: number }
+) {
+  if (b.score !== a.score) return b.score - a.score
+  const lengthDiff = (b.end - b.start) - (a.end - a.start)
+  if (lengthDiff !== 0) return lengthDiff
+  return a.start - b.start
+}
+
+function aliasLinkScore(alias: AliasItem, matchedText: string) {
+  const aliasText = normalizeLinkText(alias.alias)
+  const titleText = normalizeLinkText(alias.title)
+  const matched = normalizeLinkText(matchedText)
+  const exactTitleScore = titleText && titleText === matched ? 2000 : 0
+  const exactAliasScore = aliasText && aliasText === matched ? 1000 : 0
+  return exactTitleScore + exactAliasScore + pageTypeLinkRank(alias.page_type) + matchedText.length * 10
+}
+
+function pageTypeLinkRank(pageType: string) {
+  if (pageType === 'ConceptPage') return 90
+  if (pageType === 'MethodPage') return 80
+  if (pageType === 'InterviewQA') return 50
+  if (pageType === 'PaperPage') return 20
+  return 40
+}
+
+function normalizeLinkText(value: string) {
+  return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
+function isAliasBoundary(source: string, start: number, end: number) {
+  const before = start > 0 ? source[start - 1] : ''
+  const after = end < source.length ? source[end] : ''
+  return !isAsciiWord(before) && !isAsciiWord(after)
+}
+
+function isAsciiWord(char: string) {
+  return /^[a-zA-Z0-9_]$/.test(char)
 }
 
 function cardGroup(card: WikiCard) {
@@ -530,43 +615,44 @@ function typeLabel(value: string) {
 }
 
 function sourceLevelLabel(value: string) {
-  return ({ primary: 'primary', secondary: 'secondary', tertiary: 'tertiary' } as Record<string, string>)[value] || 'wiki'
+  return ({ primary: '一手来源', secondary: '二手整理', tertiary: '三手线索' } as Record<string, string>)[value] || 'Wiki'
 }
 
 function relationLabel(value: string) {
   return ({
-    topic_related: 'topic related',
-    mentions: 'mentions',
-    introduces: 'introduces',
-    uses: 'uses'
-  } as Record<string, string>)[value] || value || 'related'
+    topic_related: '主题相关',
+    mentions: '提及',
+    introduces: '引入',
+    uses: '使用'
+  } as Record<string, string>)[value] || value || '相关'
 }
 
 function sectionTitle(key: string) {
+  if (selectedSourceType.value === 'user_selection' && key === 'notes') return '内容'
   const labels: Record<string, string> = {
-    problem: 'Problem',
-    key_idea: 'Key idea',
-    method: 'Method',
-    methods: 'Method',
-    mechanism: 'Mechanism',
-    results: 'Results',
-    findings: 'Findings',
-    limitations: 'Limitations',
-    key_takeaways: 'Key takeaways',
-    interview_notes: 'Interview notes',
-    notes: 'Notes',
-    definition: 'Definition',
-    question_context: 'Question context',
-    core_points: 'Core points',
-    interview_questions: 'Interview questions',
-    answer_frame: 'Answer frame',
-    learning_value: 'Learning value',
+    problem: '问题',
+    key_idea: '核心观点',
+    method: '方法',
+    methods: '方法',
+    mechanism: '机制',
+    results: '结果',
+    findings: '发现',
+    limitations: '局限',
+    key_takeaways: '要点',
+    interview_notes: '面试笔记',
+    notes: '笔记',
+    definition: '定义',
+    question_context: '问题语境',
+    core_points: '核心要点',
+    interview_questions: '面试问题',
+    answer_frame: '回答框架',
+    learning_value: '学习价值',
     content: '内容',
-    ocr_excerpt: 'OCR excerpt',
-    image_notes: 'Image notes',
-    source_url: 'Source URL'
+    ocr_excerpt: 'OCR 摘录',
+    image_notes: '图片笔记',
+    source_url: '来源链接'
   }
-  return labels[key] || key.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())
+  return labels[key] || key.replace(/_/g, ' ')
 }
 
 function shouldRenderContentField(key: string, value: unknown) {
@@ -594,6 +680,12 @@ function shouldRenderContentField(key: string, value: unknown) {
     'distill_review',
     'source_kind',
     'source_type',
+    'source_query_id',
+    'artifact_uri',
+    'maintenance_candidate_id',
+    'maintenance_candidate_type',
+    'evidence',
+    'question',
     'title',
     'import_impact',
     'linked_knowledge',
@@ -694,521 +786,429 @@ function uniqueById(items: any[], key = 'id') {
   return output
 }
 
-onMounted(loadCards)
+onMounted(() => {
+  loadCards()
+})
 </script>
 
 <style scoped>
 .vault-page {
+  --ink-bg-deep: #080706;
+  --ink-bg: #0b0908;
+  --ink-panel: #12100d;
+  --ink-control: #15130f;
+  --ink-text: #f8fafc;
+  --ink-text-soft: #cbd5e1;
+  --ink-text-muted: #94a3b8;
+  --desk-accent: #9bb8ad;
+  --desk-accent-bright: #d4e3d8;
+  --line-quiet: rgba(195, 214, 202, 0.1);
+  --line-hover: rgba(195, 214, 202, 0.24);
+  --line-active: rgba(195, 214, 202, 0.32);
+  --reader-serif: "Source Serif 4", "Noto Serif SC", "Songti SC", Georgia, serif;
+  position: relative;
+  z-index: 1;
   min-height: calc(100dvh - 84px);
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 12px;
-  color: var(--text);
-}
-
-.vault-header,
-.vault-toolbar,
-.vault-sidebar,
-.vault-reader,
-.side-panel {
-  border: 1px solid rgba(125, 211, 252, 0.13);
-  background:
-    linear-gradient(180deg, rgba(8, 18, 32, 0.92), rgba(5, 10, 19, 0.96)),
-    #07111f;
-  box-shadow: 0 18px 48px rgba(2, 6, 23, 0.28);
-}
-
-.vault-header {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 180px;
-  align-items: center;
-  gap: 18px;
-  min-height: 132px;
-  overflow: hidden;
-  position: relative;
-  padding: 20px 22px;
-  border-radius: 18px;
-}
-
-.vault-header::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background:
-    linear-gradient(90deg, transparent, rgba(125, 211, 252, 0.16), transparent),
-    linear-gradient(rgba(125, 211, 252, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(125, 211, 252, 0.03) 1px, transparent 1px);
-  background-size: 220px 100%, 28px 28px, 28px 28px;
-  animation: vault-scan 7s linear infinite;
-  opacity: 0.7;
-}
-
-.vault-title-block,
-.vault-status,
-.graph-visual {
-  position: relative;
-}
-
-.vault-title-block h1 {
-  margin: 0;
-  color: #f8fafc;
-  font-size: clamp(26px, 2.5vw, 38px);
-  line-height: 1.12;
-  letter-spacing: 0;
-}
-
-.vault-status {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(92px, 1fr));
-  gap: 8px;
-}
-
-.vault-status div {
-  min-width: 92px;
-  padding: 10px 12px;
-  border: 1px solid rgba(125, 211, 252, 0.12);
-  border-radius: 10px;
-  background: rgba(2, 6, 23, 0.38);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-}
-
-.vault-status span {
-  display: block;
-  color: #8aa4bd;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.vault-status strong {
-  display: block;
-  margin-top: 5px;
-  color: #ecfeff;
-  font-size: 20px;
-  font-variant-numeric: tabular-nums;
-}
-
-.graph-visual {
-  height: 88px;
-  border: 1px solid rgba(125, 211, 252, 0.12);
-  border-radius: 14px;
-  background: rgba(2, 6, 23, 0.24);
-}
-
-.graph-node {
-  position: absolute;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: #67e8f9;
-  box-shadow: 0 0 0 5px rgba(103, 232, 249, 0.08);
-  animation: node-pulse 2.4s ease-in-out infinite;
-}
-
-.graph-node.n1 { left: 22px; top: 18px; }
-.graph-node.n2 { left: 80px; top: 34px; animation-delay: 0.25s; }
-.graph-node.n3 { right: 32px; top: 22px; animation-delay: 0.5s; }
-.graph-node.n4 { right: 64px; bottom: 18px; animation-delay: 0.75s; }
-
-.graph-line {
-  position: absolute;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(103, 232, 249, 0.7), transparent);
-  transform-origin: left center;
-  opacity: 0.6;
-}
-
-.graph-line.l1 { left: 30px; top: 25px; width: 62px; transform: rotate(15deg); }
-.graph-line.l2 { left: 88px; top: 39px; width: 66px; transform: rotate(-10deg); }
-.graph-line.l3 { left: 95px; top: 58px; width: 56px; transform: rotate(22deg); }
-
-.vault-toolbar {
-  display: grid;
-  grid-template-columns: auto minmax(240px, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  min-height: 58px;
-  padding: 10px 12px;
-  border-radius: 14px;
-}
-
-.toolbar-tabs {
-  display: flex;
-  gap: 5px;
-  padding: 4px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
-  border-radius: 10px;
-  background: rgba(2, 6, 23, 0.24);
-}
-
-.toolbar-tabs button,
-.refresh-button,
-.reader-actions button,
-.library-head,
-.card-row,
-.related-list button,
-.impact-list button {
-  transition: border-color 180ms ease, background 180ms ease, color 180ms ease, transform 180ms ease;
-}
-
-.toolbar-tabs button,
-.refresh-button {
-  min-height: 32px;
-  border: 1px solid transparent;
-  border-radius: 8px;
+  padding-top: 48px;
+  padding-bottom: 48px;
   background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
+  color: var(--ink-text);
 }
 
-.toolbar-tabs button {
-  padding: 0 11px;
-}
-
-.toolbar-tabs button:hover,
-.toolbar-tabs button.active,
-.refresh-button:hover {
-  border-color: rgba(125, 211, 252, 0.22);
-  background: rgba(56, 189, 248, 0.1);
-  color: #ecfeff;
-}
-
-.toolbar-tabs button:active,
-.refresh-button:active,
-.reader-actions button:active,
-.card-row:active,
-.library-head:active {
-  transform: translateY(1px) scale(0.99);
-}
-
-.refresh-button {
-  padding: 0 14px;
-}
-
-.vault-search {
-  justify-self: stretch;
+.vault-stage {
+  position: relative;
+  z-index: 1;
+  max-width: 1440px;
+  min-height: calc(100dvh - 120px);
+  margin: 0 auto;
+  padding: 18px;
+  border: 1px solid var(--line-quiet);
+  border-radius: 20px;
+  background: transparent;
 }
 
 .vault-layout {
-  min-height: 0;
+  position: relative;
+  z-index: 1;
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) 300px;
-  gap: 14px;
+  grid-template-columns: 260px minmax(0, 1fr) 320px;
+  gap: 24px;
+  align-items: start;
 }
 
-.vault-sidebar,
-.side-panel {
-  padding: 15px;
-  border-radius: 14px;
+.vault-library,
+.vault-reader,
+.vault-trace,
+.trace-card,
+.paper-pipeline,
+.reader-empty,
+.mobile-library-picker {
+  border: 1px solid var(--line-quiet);
+  background: #0b0908;
+  color: var(--ink-text);
 }
 
-.side-panel + .side-panel {
-  margin-top: 12px;
+.vault-library,
+.vault-reader,
+.vault-trace {
+  border-radius: 16px;
 }
 
-.panel-title {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 10px;
-  margin-bottom: 11px;
-}
-
-.panel-title span {
-  color: #f8fafc;
-  font-size: 14px;
-  font-weight: 750;
-}
-
-.panel-title small {
-  color: #7dd3fc;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-}
-
-.library-tree,
-.library-items {
-  display: grid;
-  gap: 6px;
-}
-
-.library-head,
-.card-row {
-  width: 100%;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--text-soft);
-  text-align: left;
-  cursor: pointer;
-}
-
-.library-head {
-  display: flex;
-  justify-content: space-between;
-  padding: 9px 10px;
-  border-radius: 9px;
-  font-weight: 700;
-}
-
-.library-head strong {
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
-}
-
-.library-head:hover,
-.library-head.active,
-.card-row:hover,
-.card-row.active {
-  border-color: rgba(125, 211, 252, 0.22);
-  background: rgba(56, 189, 248, 0.1);
-  color: #fff;
-}
-
-.library-items {
-  max-height: min(48vh, 440px);
-  overflow: auto;
-  padding-left: 10px;
-}
-
-.card-row {
-  display: grid;
-  gap: 4px;
-  padding: 9px 10px;
-  border-radius: 9px;
-}
-
-.card-row span,
-.card-row small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.card-row span {
-  font-size: 13px;
-  line-height: 1.42;
-}
-
-.card-row small {
-  color: var(--text-muted);
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.empty-note {
-  margin: 8px 4px;
-  color: var(--text-muted);
-  font-size: 12px;
+.vault-library {
+  min-height: calc(100dvh - 156px);
+  padding: 20px 16px;
 }
 
 .vault-reader {
   min-width: 0;
-  overflow: auto;
-  padding: 24px 28px 40px;
-  border-radius: 16px;
+  padding: 32px 40px;
 }
 
-.wiki-document {
-  max-width: 940px;
+.vault-trace {
+  display: grid;
+  gap: 14px;
+  padding: 24px 20px;
 }
 
-.reader-topline {
+.column-head,
+.trace-head,
+.pipeline-head,
+.reader-control-row,
+.reader-actions,
+.library-stats {
   display: flex;
-  gap: 8px;
-  margin: 0 0 12px;
-  color: var(--text-muted);
-  font-size: 12px;
+  align-items: center;
+  gap: 10px;
 }
 
-.reader-topline span + span::before {
+.column-head,
+.trace-head,
+.pipeline-head {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.column-head span,
+.trace-head small,
+.pipeline-head span,
+.library-stats,
+.reader-meta-line,
+.source-facts dt,
+.source-level-chip,
+.reader-tag {
+  color: var(--ink-text-muted);
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.column-head strong,
+.trace-head strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-text);
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.column-head small {
+  color: var(--desk-accent-bright);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.library-search,
+.mobile-library-picker select {
+  width: 100%;
+  height: 32px;
+  margin-top: 14px;
+  padding: 0 11px;
+  border: 1px solid var(--line-quiet);
+  border-radius: 8px;
+  outline: none;
+  background: #15130f;
+  color: var(--ink-text);
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+
+.library-search:focus,
+.mobile-library-picker select:focus {
+  border-color: var(--line-active);
+}
+
+.library-tree {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.library-group-head,
+.library-row,
+.trace-row,
+.reader-actions button,
+.impact-list button {
+  border: 1px solid var(--line-quiet);
+  border-radius: 8px;
+  background: #15130f;
+  color: var(--ink-text-soft);
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  cursor: pointer;
+  transition: border-color 180ms ease, color 180ms ease, background-color 180ms ease, transform 180ms ease;
+}
+
+.library-group-head:hover,
+.library-row:hover,
+.trace-row:hover,
+.reader-actions button:hover,
+.impact-list button:hover {
+  border-color: var(--line-hover);
+  color: var(--ink-text);
+  transform: translateY(-0.5px);
+}
+
+.library-group-head.active,
+.library-row.active,
+.trace-row.active {
+  border-color: var(--line-active);
+  background: #1d1913;
+  color: var(--ink-text);
+}
+
+.library-group-head {
+  width: 100%;
+  height: 32px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 11px;
+  text-align: left;
+}
+
+.library-group-head span,
+.library-group-head strong {
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.library-items {
+  display: grid;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.library-row,
+.trace-row {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  text-align: left;
+}
+
+.library-row span,
+.trace-row span {
+  overflow: hidden;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+}
+
+.library-row small,
+.trace-row small {
+  overflow: hidden;
+  color: var(--ink-text-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-stats {
+  flex-wrap: wrap;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-quiet);
+}
+
+.library-stats span {
+  padding: 3px 0;
+}
+
+.reader-head {
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--line-quiet);
+}
+
+.reader-meta-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.reader-meta-line span + span::before {
   content: "/";
   margin-right: 8px;
-  color: rgba(148, 163, 184, 0.5);
-}
-
-.reader-title-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-  align-items: start;
+  color: rgba(195, 214, 202, 0.26);
 }
 
 .wiki-document h1 {
-  max-width: 100%;
-  margin: 0 0 12px;
-  color: #fff;
-  font-size: clamp(24px, 1.7vw, 32px);
-  line-height: 1.18;
+  max-width: 780px;
+  margin: 0;
+  color: var(--ink-text);
+  font-family: var(--reader-serif);
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.3;
   letter-spacing: 0;
   overflow-wrap: anywhere;
   text-wrap: pretty;
 }
 
-.reader-actions {
-  display: flex;
+.reader-control-row {
   flex-wrap: wrap;
-  justify-content: flex-start;
-  gap: 8px;
+  margin-top: 16px;
+}
+
+.source-level-chip,
+.reader-tag {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 11px;
+  border: 1px solid var(--line-quiet);
+  border-radius: 8px;
+  background: #15130f;
+}
+
+.source-level-chip.primary {
+  color: #d4e3d8;
+  border-color: rgba(155, 184, 173, 0.22);
+  background: #1d1913;
+}
+
+.source-level-chip.secondary {
+  color: #fde68a;
+  border-color: rgba(245, 158, 11, 0.18);
+  background: #1d1913;
+}
+
+.reader-actions {
+  flex-wrap: wrap;
+  margin-top: 18px;
 }
 
 .reader-actions button {
-  min-height: 32px;
-  padding: 0 10px;
-  border: 1px solid rgba(125, 211, 252, 0.2);
-  border-radius: 8px;
-  background: rgba(56, 189, 248, 0.08);
-  color: #cffafe;
-  cursor: pointer;
+  height: 32px;
+  padding: 0 12px;
 }
 
-.reader-actions button:hover {
-  background: rgba(56, 189, 248, 0.16);
+.reader-actions .primary-action {
+  border-color: rgba(195, 214, 202, 0.24);
+  background: #9bb8ad;
+  color: #080706;
+  font-weight: 700;
+}
+
+.reader-actions .primary-action:hover {
+  background: #d4e3d8;
+  color: #080706;
 }
 
 .reader-actions .danger {
-  border-color: rgba(244, 63, 94, 0.24);
-  color: #fecdd3;
+  border-color: rgba(244, 63, 94, 0.22);
+  color: #fecaca;
 }
 
-.wiki-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-  margin-bottom: 20px;
-}
-
-.wiki-tags span {
-  padding: 4px 8px;
-  border: 1px solid rgba(148, 163, 184, 0.1);
-  border-radius: 7px;
-  background: rgba(148, 163, 184, 0.1);
-  color: #cbd5e1;
-  font-size: 12px;
-}
-
-.level-tag.primary {
-  border-color: rgba(34, 197, 94, 0.2);
-  background: rgba(34, 197, 94, 0.12);
-  color: #bbf7d0;
-}
-
-.level-tag.secondary {
-  border-color: rgba(245, 158, 11, 0.18);
-  background: rgba(245, 158, 11, 0.12);
-  color: #fde68a;
-}
-
-.impact-module {
-  margin: 22px 0 26px;
-  padding: 15px;
-  border: 1px solid rgba(125, 211, 252, 0.18);
+.paper-pipeline {
+  margin-top: 24px;
+  padding: 16px;
   border-radius: 12px;
-  background:
-    linear-gradient(135deg, rgba(8, 47, 73, 0.36), rgba(15, 23, 42, 0.56)),
-    rgba(15, 23, 42, 0.52);
 }
 
-.impact-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 12px;
-}
-
-.module-label {
-  margin: 0 0 5px;
-  color: #67e8f9;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.12em;
-}
-
-.impact-head h2 {
+.pipeline-head h2,
+.wiki-section h2,
+.reader-detail-section h2,
+.trace-card h2 {
   margin: 0;
-  font-size: 17px;
+  color: var(--ink-text);
+  font-family: var(--reader-serif);
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.35;
 }
 
-.impact-head span {
-  color: var(--text-muted);
+.pipeline-head small {
+  color: var(--ink-text-muted);
   font-size: 12px;
   white-space: nowrap;
 }
 
-.impact-stats {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
+.pipeline-meta {
+  margin: 14px 0 0;
+  color: var(--ink-text-muted);
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
-.impact-stats div {
-  display: grid;
-  gap: 2px;
-  padding: 9px;
-  border: 1px solid rgba(148, 163, 184, 0.08);
-  border-radius: 8px;
-  background: rgba(2, 6, 23, 0.28);
-}
-
-.impact-stats strong {
-  color: #fff;
-  font-size: 20px;
-  font-variant-numeric: tabular-nums;
-}
-
-.impact-stats span,
 .impact-list {
-  color: var(--text-soft);
+  color: var(--ink-text-muted);
   font-size: 12px;
 }
 
 .impact-list {
   display: grid;
   gap: 7px;
-  margin: 12px 0 0;
-  padding-left: 16px;
+  margin: 14px 0 0;
+  padding-left: 18px;
 }
 
-.impact-list b {
-  margin-right: 8px;
-  color: #67e8f9;
-}
-
-.impact-list button,
-.related-list button {
-  padding: 0;
-  border: 0;
+.impact-list button {
+  padding: 0 4px;
+  border-color: transparent;
   background: transparent;
-  color: #cffafe;
-  text-align: left;
-  cursor: pointer;
+  color: var(--desk-accent-bright);
 }
 
-.wiki-section {
-  margin-top: 24px;
+.wiki-section,
+.reader-detail-section {
+  margin-top: 28px;
 }
 
-.wiki-section h2 {
-  margin: 0 0 10px;
+.wiki-section h2,
+.reader-detail-section h2 {
+  margin-bottom: 12px;
   padding-bottom: 8px;
-  border-bottom: 1px solid rgba(125, 211, 252, 0.14);
-  color: #f8fafc;
+  border-bottom: 1px solid var(--line-quiet);
+}
+
+.wiki-section h3,
+.wiki-section :deep(h3) {
+  color: var(--ink-text);
+  font-family: var(--reader-serif);
   font-size: 18px;
-  line-height: 1.25;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .wiki-section :deep(p),
 .wiki-section :deep(li) {
-  max-width: 78ch;
-  color: #c9d7e8;
-  font-size: 15px;
-  line-height: 1.78;
+  max-width: 75ch;
+  color: var(--ink-text-soft);
+  font-family: var(--reader-serif);
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1.7;
 }
 
 .wiki-section :deep(p) {
-  margin: 0 0 10px;
+  margin: 0 0 12px;
 }
 
 .wiki-section :deep(ul) {
@@ -1217,90 +1217,42 @@ onMounted(loadCards)
 }
 
 .wiki-section :deep(li + li) {
-  margin-top: 7px;
+  margin-top: 8px;
 }
 
 .wiki-section :deep(strong) {
-  color: #fff;
-  font-weight: 700;
+  color: var(--ink-text);
+  font-weight: 600;
 }
 
 .wiki-section :deep(.keyword-link) {
   display: inline;
   margin: 0 1px;
   padding: 1px 5px;
-  border: 1px solid rgba(125, 211, 252, 0.24);
-  border-radius: 5px;
-  background: rgba(56, 189, 248, 0.13);
-  color: #e0f2fe;
+  border: 1px solid rgba(195, 214, 202, 0.2);
+  border-radius: 6px;
+  background: #1d1913;
+  color: var(--desk-accent-bright);
   font: inherit;
   cursor: pointer;
 }
 
-.wiki-section :deep(.keyword-link:hover) {
-  background: rgba(56, 189, 248, 0.24);
-  color: #fff;
-}
-
-.wiki-section a {
-  color: #7dd3fc;
-  text-decoration: none;
-}
-
-.knowledge-link-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
-  max-width: 860px;
-}
-
-.knowledge-link-card {
-  display: grid;
-  gap: 6px;
-  min-height: 70px;
-  padding: 12px 14px;
-  border: 1px solid rgba(125, 211, 252, 0.16);
-  border-radius: 8px;
-  background:
-    linear-gradient(135deg, rgba(14, 165, 233, 0.12), rgba(15, 23, 42, 0.62)),
-    rgba(15, 23, 42, 0.72);
-  color: #e6f7ff;
-  text-align: left;
-  cursor: pointer;
-}
-
-.knowledge-link-card:hover {
-  border-color: rgba(125, 211, 252, 0.42);
-  background:
-    linear-gradient(135deg, rgba(14, 165, 233, 0.22), rgba(15, 23, 42, 0.72)),
-    rgba(15, 23, 42, 0.82);
-}
-
-.knowledge-link-card span {
-  font-size: 14px;
-  font-weight: 800;
-  line-height: 1.35;
-}
-
-.knowledge-link-card small {
-  color: #8fb3c9;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
+.wiki-section a,
+.source-link-list a {
+  color: var(--desk-accent-bright);
 }
 
 .image-strip {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 12px;
-  max-width: 760px;
 }
 
 .image-strip a {
   display: block;
   overflow: hidden;
   border-radius: 10px;
-  background: rgba(148, 163, 184, 0.12);
+  background: #15130f;
   aspect-ratio: 4 / 3;
 }
 
@@ -1311,60 +1263,122 @@ onMounted(loadCards)
   display: block;
 }
 
-.evidence-section p {
-  margin-top: 4px;
+.reader-detail-section {
+  display: none;
 }
 
-.related-list {
+.detail-stack,
+.vault-trace {
+  min-width: 0;
+}
+
+.trace-card {
+  padding: 16px;
+  border-radius: 12px;
+}
+
+.trace-list {
   display: grid;
-  gap: 12px;
-  margin: 0;
-  padding-left: 18px;
+  gap: 8px;
+  margin-top: 12px;
 }
 
-.related-list span {
-  display: block;
-  margin-top: 4px;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.meta-list {
+.source-facts {
   display: grid;
-  gap: 12px;
+  gap: 10px;
+  margin: 14px 0 0;
+}
+
+.source-facts div {
+  min-width: 0;
+}
+
+.source-facts dt,
+.source-facts dd {
   margin: 0;
 }
 
-.meta-list dt {
-  color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-}
-
-.meta-list dd {
-  margin: 2px 0 0;
-  color: var(--text-soft);
-  font-size: 12px;
+.source-facts dd {
+  margin-top: 3px;
+  color: var(--ink-text-soft);
+  font-size: 13px;
   line-height: 1.45;
-  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.source-facts dd.source-path {
+  overflow: hidden;
+  max-width: 100%;
+  color: var(--ink-text-muted);
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.source-link-list {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding-left: 18px;
+  color: var(--ink-text-soft);
+  font-size: 13px;
+  line-height: 1.62;
+}
+
+.source-link-list p {
+  margin: 4px 0 0;
+  color: var(--ink-text-soft);
+}
+
+.empty-note {
+  margin: 10px 0 0;
+  color: var(--ink-text-muted);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .reader-empty {
+  min-height: 420px;
   display: grid;
   place-content: center;
-  min-height: 420px;
-  text-align: center;
+  padding: 32px 40px;
+  border-radius: 16px;
 }
 
-.reader-empty h2 {
-  margin: 0 0 8px;
-  color: #fff;
+.reader-empty span {
+  color: var(--ink-text-muted);
+  font-size: 13px;
+}
+
+.reader-empty h1 {
+  margin: 8px 0 0;
+  font-family: var(--reader-serif);
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.3;
 }
 
 .reader-empty p {
-  margin: 0;
-  color: var(--text-muted);
+  max-width: 44ch;
+  margin: 12px 0 0;
+  color: var(--ink-text-muted);
+  line-height: 1.7;
+}
+
+.mobile-library-picker {
+  display: none;
+  margin-bottom: 14px;
+  padding: 14px;
+  border-radius: 12px;
+}
+
+.mobile-library-picker label {
+  display: block;
+  color: var(--ink-text-muted);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .modal-head {
@@ -1377,55 +1391,132 @@ onMounted(loadCards)
   max-height: 70vh;
   overflow: auto;
   white-space: pre-wrap;
-  color: #dbeafe;
+  color: var(--desk-accent-bright);
 }
 
-@keyframes vault-scan {
-  0% { background-position: -220px 0, 0 0, 0 0; }
-  100% { background-position: 520px 0, 28px 28px, 28px 28px; }
-}
-
-@keyframes node-pulse {
-  0%, 100% { transform: scale(1); opacity: 0.78; }
-  50% { transform: scale(1.45); opacity: 1; }
-}
-
-@media (max-width: 1280px) {
+@media (min-width: 1024px) and (max-width: 1279px) {
   .vault-layout {
-    grid-template-columns: 260px minmax(0, 1fr);
+    grid-template-columns: 220px minmax(0, 1fr) 280px;
+    gap: 20px;
   }
 
-  .vault-aside {
-    display: none;
+  .vault-library {
+    padding: 20px 16px;
+  }
+
+  .vault-reader {
+    padding: 32px 40px;
+  }
+
+  .vault-trace {
+    padding: 24px 20px;
   }
 }
 
-@media (max-width: 940px) {
-  .vault-header,
-  .vault-toolbar,
-  .vault-layout,
-  .reader-title-row {
+@media (max-width: 1023px) {
+  .vault-stage {
+    padding: 14px;
+  }
+
+  .mobile-library-picker {
+    display: block;
+  }
+
+  .vault-layout {
     grid-template-columns: 1fr;
+    gap: 16px;
   }
 
-  .vault-status {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .graph-visual {
+  .vault-library,
+  .vault-trace {
     display: none;
   }
 
+  .vault-reader {
+    padding: 28px 24px;
+  }
+
+  .reader-detail-section {
+    display: block;
+  }
+
+  .detail-stack {
+    display: grid;
+    gap: 14px;
+  }
+}
+
+@media (max-width: 720px) {
+  .vault-stage {
+    padding: 10px;
+    border-radius: 16px;
+  }
+
+  .vault-reader {
+    padding: 22px 18px;
+  }
+
+  .wiki-document h1,
+  .reader-empty h1 {
+    font-size: 25px;
+  }
+
+  .pipeline-head,
   .reader-actions {
-    justify-content: flex-start;
+    align-items: flex-start;
+  }
+}
+
+.library-collapse {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 240ms ease-out;
+}
+
+.library-collapse > .library-items {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.library-collapse-enter-from,
+.library-collapse-leave-to {
+  grid-template-rows: 0fr;
+}
+
+.library-collapse-enter-to,
+.library-collapse-leave-from {
+  grid-template-rows: 1fr;
+}
+
+.library-row-stagger-enter-active {
+  transition: opacity 240ms ease-out, transform 240ms ease-out;
+  transition-delay: calc(var(--row-index, 0) * 24ms);
+}
+
+.library-row-stagger-enter-from {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.library-row-stagger-enter-to {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .library-group-head,
+  .library-row,
+  .trace-row,
+  .reader-actions button,
+  .impact-list button {
+    transition-duration: 1ms;
   }
 
-  .wiki-document h1 {
-    font-size: 28px;
-  }
-
-  .impact-stats {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .library-collapse,
+  .library-row-stagger-enter-active {
+    transition: none;
   }
 }
 </style>
+
+
