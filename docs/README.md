@@ -1,23 +1,31 @@
 # 文档索引
 
-该目录用于存放系统设计、专项任务说明、评测结果与面试材料。
+项目文档只保留一套当前主叙事：Wiki-native 科研知识编译系统。README 和主方案严格区分已实现能力与目标能力。
 
-## 设计文档
+## 当前主方案
 
-- [私有化贾维斯系统设计文档](design/PERSONAL_RESEARCH_AGENT_PLAN.md)
-- [记忆、画像与会话方案](design/MEMORY_SESSION_PLAN.md)
-- [月度推荐阅读任务说明](design/MONTHLY_READING_RECOMMENDER_TASK.md)
-- [Docling 统一摄入任务说明](design/DOCLING_UNIFIED_INGESTION_TASK.md)
-- [Karpathy 风格 Web Wiki 方案](design/KARPATHY_STYLE_WEB_WIKI_PLAN.md)
-- [DeepSeek 改码任务说明](design/DEEPSEEK_IMPLEMENTATION_BRIEF.md)
+- [Wiki-native 科研知识编译系统优化方案](design/EVIDENCE_FIRST_RESEARCH_WIKI_PLAN.md)
 
-其中 `PERSONAL_RESEARCH_AGENT_PLAN.md` 为当前主设计文档，其他文档作为专题设计或执行说明。
+该文档包含当前实现审计、CodeWiki/DeepWiki/GBrain/WeKnora/Docling 对比、Wiki 编译与查询架构、生命周期评测和秋招展示方案。
+
+## 运行手册
+
+- [Evidence-first 论文编译运行手册](runbooks/paper_pipeline_markdown_first_runbook.md)
+- [Wiki Maintenance 运行手册](runbooks/WIKI_MAINTENANCE_AGENT_RUNBOOK.md)
+
+## 审核
+
+- [2026-08-13 项目全面审核](audits/PROJECT_AUDIT_2026-08-13.md)
 
 ## 评测
 
-- [评测结果](evaluation/EVAL_RESULTS.md)
-- 更细的评测输出仍保留在 `logs/` 目录下
+- [当前评测入口](../test/evaluation/README.md)
+- [Evidence Verifier / Table QA 240 条 Silver Benchmark](audits/EVIDENCE_WIKI_SILVER_BENCHMARK_2026-08-13.md)
+- [Wiki Chat 30 题基线](../test/evaluation/runs/current30_full_answer_check/summary.md)
 
-## 面试材料
+## 文档规则
 
-- [GraphRAG 面试准备](interview/INTERVIEW_PREP.md)
+- 只有根目录 README 和主方案可以定义项目定位。
+- 专项文档必须注明“当前实现”或“目标设计”。
+- 已删除或不存在的模块不得出现在面试材料和架构图中。
+- 路线图能力在代码和评测落地前不得写成已完成功能。

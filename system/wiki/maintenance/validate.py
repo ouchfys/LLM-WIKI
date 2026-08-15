@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 
 from system.storage import get_object_storage, get_storage_layout
 from system.wiki.maintenance.store import WikiMaintenanceStore

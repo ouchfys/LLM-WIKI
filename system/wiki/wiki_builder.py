@@ -53,7 +53,7 @@ Return JSON: {{"page_type": "..."}}
 """
 
 BUILD_FROM_RAW_MARKDOWN_PROMPT = """\
-You are the compiler for a private technical Wiki named Jarvis Notes.
+You are the compiler for an evidence-first technical Wiki named LLM-WIKI.
 Your job is to turn noisy raw source Markdown into one durable review page.
 
 Output language:
@@ -239,7 +239,7 @@ Only return JSON, no other text.
     ) -> Optional[Dict[str, Any]]:
         """Compile raw Markdown into a durable Wiki page.
 
-        This is the minimal Karpathy-style path: raw source text is converted
+        This is the compatibility path: raw source text is converted
         into a readable page before it becomes part of the user's Wiki.
         """
         if page_type not in CARD_TYPES:

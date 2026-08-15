@@ -46,6 +46,7 @@ class MarkdownWikiReindexer:
         })
 
         now = _now_iso()
+        created_at = _normalize_created(card.created) or now
         dedupe_key = self.wiki_store.make_dedupe_key(
             title=card.title,
             page_type=card.page_type,
@@ -97,7 +98,7 @@ class MarkdownWikiReindexer:
                         card.source_level,
                         json.dumps(source_urls, ensure_ascii=False),
                         json.dumps(related, ensure_ascii=False),
-                        now,
+                        created_at,
                         now,
                     ),
                 )
@@ -192,6 +193,20 @@ class MarkdownWikiReindexer:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_created(value: str) -> str:
+    """Accept a frontmatter date (YYYY-MM-DD) or full ISO timestamp.
+
+    Returns an ISO-8601 string suitable for the created_at column, or "" when
+    the value is missing/unparseable so the caller can fall back to now.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return f"{text}T00:00:00+00:00"
+    return text
 
 
 def _unique(values: list[str]) -> list[str]:

@@ -23,6 +23,7 @@ import requests
 from requests import RequestException, Timeout
 
 from system.core.config import DOCLING_MODE, DOCLING_BASE_URL, DOCLING_TIMEOUT_SECONDS
+from system.document.docling_evidence import normalize_docling_document, parse_json_payload
 
 
 @dataclass
@@ -32,6 +33,8 @@ class ParsedDocument:
     markdown: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     pages_or_items: List[Dict[str, Any]] = field(default_factory=list)
+    document_json: Dict[str, Any] = field(default_factory=dict)
+    tables: List[Dict[str, Any]] = field(default_factory=list)
     parser: str = ""
 
 
@@ -101,7 +104,7 @@ class DoclingParser:
 
         payload = {
             "from_formats": from_format,
-            "to_formats": ["md", "text"],
+            "to_formats": ["md", "text", "json"],
             "do_ocr": "true",
         }
 
@@ -131,6 +134,25 @@ class DoclingParser:
                 f"Docling remote request failed for {file_path.name}: {exc}"
             ) from exc
 
+        # Older docling-serve versions do not advertise JSON export.  Retrying
+        # keeps ingestion available, while metadata records that evidence is
+        # degraded instead of pretending page/bbox provenance exists.
+        json_export_unavailable = False
+        if resp.status_code in {400, 422}:
+            json_export_unavailable = True
+            legacy_payload = dict(payload)
+            legacy_payload["to_formats"] = ["md", "text"]
+            try:
+                with open(file_path, "rb") as f:
+                    resp = requests.post(
+                        f"{self.base_url}/v1/convert/file",
+                        files={"files": (file_path.name, f, "application/octet-stream")},
+                        data=legacy_payload,
+                        timeout=self.timeout,
+                    )
+            except (Timeout, RequestException) as exc:
+                raise RuntimeError(f"Docling remote fallback request failed for {file_path.name}: {exc}") from exc
+
         if resp.status_code != 200:
             print(
                 f"[DoclingParser] Remote parse non-200 for {file_path.name}: "
@@ -156,6 +178,16 @@ class DoclingParser:
 
         md_content = (doc.get("md_content") or "").strip()
         text_content = (doc.get("text_content") or "").strip()
+        document_json = parse_json_payload(
+            doc.get("json_content")
+            or doc.get("document_json")
+            or doc.get("json")
+            or result.get("json_content")
+        )
+        elements, tables = normalize_docling_document(
+            document_json,
+            source_key=str(file_path.resolve()),
+        )
         # text_content from Docling serve is HTML; strip tags for plain text
         plain_text = _html_to_text(text_content) if text_content else ""
 
@@ -172,8 +204,12 @@ class DoclingParser:
                 "base_url": self.base_url,
                 "processing_time_s": round(elapsed, 2),
                 "conversion_errors": errors,
+                "json_export_available": bool(document_json),
+                "json_export_degraded": json_export_unavailable,
             },
-            pages_or_items=self._chunk_markdown_to_items(md_content, str(file_path)),
+            pages_or_items=self._elements_to_items(elements, str(file_path)) or self._chunk_markdown_to_items(md_content, str(file_path)),
+            document_json=document_json,
+            tables=tables,
             parser="docling-remote",
         )
 
@@ -212,7 +248,22 @@ class DoclingParser:
         if not text:
             text = _html_to_text(markdown)
 
-        pages = []
+        document_json: Dict[str, Any] = {}
+        for exporter in ("export_to_dict", "model_dump"):
+            if hasattr(doc, exporter):
+                try:
+                    exported = getattr(doc, exporter)()
+                    if isinstance(exported, dict):
+                        document_json = exported
+                        break
+                except Exception:
+                    pass
+        elements, tables = normalize_docling_document(
+            document_json,
+            source_key=str(file_path.resolve()),
+        )
+
+        pages = self._elements_to_items(elements, str(file_path))
         if hasattr(doc, "pages"):
             try:
                 for pi, page in enumerate(doc.pages, start=1):
@@ -234,6 +285,8 @@ class DoclingParser:
             markdown=markdown,
             metadata={"parser": "docling-local", "source_path": str(file_path), "docling_mode": "local"},
             pages_or_items=pages,
+            document_json=document_json,
+            tables=tables,
             parser="docling-local",
         )
 
@@ -302,6 +355,29 @@ class DoclingParser:
                 "block_type": "text",
                 "text": para[:3000],
                 "metadata": {"source": source_path},
+            })
+        return items
+
+    @staticmethod
+    def _elements_to_items(elements: List[Dict[str, Any]], source_path: str) -> List[Dict[str, Any]]:
+        items = []
+        for element in elements:
+            text = str(element.get("text") or element.get("caption") or "").strip()
+            if not text:
+                continue
+            heading_path = element.get("heading_path") if isinstance(element.get("heading_path"), list) else []
+            items.append({
+                "page": int(element.get("page") or 0),
+                "section": str(heading_path[-1] if heading_path else ""),
+                "block_type": str(element.get("element_type") or "text"),
+                "text": text,
+                "metadata": {
+                    "source": source_path,
+                    "evidence_id": str(element.get("element_id") or ""),
+                    "bbox": element.get("bbox") or {},
+                    "heading_path": heading_path,
+                    "docling_ref": str(element.get("docling_ref") or ""),
+                },
             })
         return items
 

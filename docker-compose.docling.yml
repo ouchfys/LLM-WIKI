@@ -7,4 +7,6 @@ services:
       - "5001:5001"
     environment:
       DOCLING_SERVE_ENABLE_UI: "1"
-      DOCLING_SERVE_MAX_SYNC_WAIT: "360"
+      # Long technical reports (for example the 75-page GPT-3 paper) exceed
+      # the upstream 360-second synchronous cap on CPU-only parsing.
+      DOCLING_SERVE_MAX_SYNC_WAIT: "900"

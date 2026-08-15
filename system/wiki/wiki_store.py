@@ -84,6 +84,7 @@ class WikiStore:
             """)
             self._ensure_column(conn, "wiki_pages", "markdown_path", "TEXT DEFAULT ''")
             self._ensure_column(conn, "wiki_pages", "dedupe_key", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "wiki_pages", "current_revision_id", "TEXT DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_wiki_pages_dedupe_key ON wiki_pages(dedupe_key)")
             self._init_fts(conn)
             conn.commit()
@@ -247,6 +248,7 @@ class WikiStore:
             source_urls=next_source_urls,
             related_topics=next_related,
             existing_path=current.get("markdown_path", ""),
+            created=current.get("created_at", ""),
         )
         updates["markdown_path"] = markdown_path
 
@@ -370,6 +372,57 @@ class WikiStore:
     def get_recent_cards(self, limit: int = 10) -> List[Dict[str, Any]]:
         return self.list_cards(limit=limit)
 
+    def list_aliases_for_resolution(self) -> List[Dict[str, str]]:
+        """Return persisted aliases used by the deterministic Wiki resolver.
+
+        Older or minimal databases may not have the paper-pipeline alias table;
+        treating that as an empty alias set keeps WikiStore independently usable.
+        """
+        with closing(self._connect()) as conn:
+            try:
+                rows = conn.execute(
+                    """SELECT card_id, alias, normalized_alias
+                       FROM wiki_aliases
+                       ORDER BY length(alias) DESC, lower(alias)"""
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
+
+    def list_linked_pages(self, card_id: str, limit: int = 12) -> List[Dict[str, str]]:
+        """Return a bounded, bidirectional view of persisted Wiki links."""
+        with closing(self._connect()) as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT l.to_card_id AS card_id, p.title, p.page_type,
+                           l.relation_type, 'outgoing' AS direction
+                    FROM wiki_card_links l
+                    JOIN wiki_pages p ON p.id = l.to_card_id
+                    WHERE l.from_card_id = ?
+                    UNION ALL
+                    SELECT l.from_card_id AS card_id, p.title, p.page_type,
+                           l.relation_type, 'incoming' AS direction
+                    FROM wiki_card_links l
+                    JOIN wiki_pages p ON p.id = l.from_card_id
+                    WHERE l.to_card_id = ?
+                    LIMIT ?
+                    """,
+                    (card_id, card_id, max(1, min(int(limit), 50))),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        result: List[Dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for row in rows:
+            item = dict(row)
+            key = (item["card_id"], item["relation_type"], item["direction"])
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
     def count_by_type(self) -> Dict[str, int]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
@@ -417,4 +470,5 @@ class WikiStore:
             "related_topics": self._load_json(row["related_topics_json"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "current_revision_id": row["current_revision_id"] if "current_revision_id" in row.keys() else "",
         }

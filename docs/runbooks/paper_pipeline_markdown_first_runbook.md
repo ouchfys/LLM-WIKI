@@ -1,226 +1,113 @@
-# Paper Pipeline Merge Planner and Markdown-First Runbook
+# Evidence-first Paper Compiler Runbook
 
-## Purpose
-
-This runbook describes the next implementation steps for the paper ingestion pipeline. The current four-stage pipeline is valuable and should be preserved:
+## 数据流
 
 ```text
-extract -> distill -> review -> merge -> wiki graph -> retrieval/evaluation
+PDF
+ -> Docling Markdown/Text/JSON
+ -> source_documents + typed elements + table cells
+ -> distill candidates with evidence IDs
+ -> deterministic checks + semantic entailment verifier
+ -> resolve target Wiki page
+ -> compile add/strengthen/challenge/supersede claims
+ -> render Markdown proposal + unified diff
+ -> verify affected claims
+ -> persist AWAITING_APPROVAL checkpoint
+ -> human reviews the conflict object, both conclusions/sources, and diff
+ -> approve / reject / edit-and-reverify
+ -> commit approved revision + canonical Markdown
+ -> rebuild SQLite/chunk navigation cache
+ -> Wiki Resolver / Table Resolver / read-only DuckDB
 ```
 
-The immediate issue is not the pipeline shape. The immediate issue is that the merge planner LLM is not currently wired correctly, so the merge stage is mostly using deterministic fallback logic. After that is fixed, the longer-term architecture should move the wiki authority layer from SQLite-first to Markdown-first.
+## 启动 Docling
 
-## Current State
+```powershell
+docker compose -f .\docker-compose.docling.yml up -d
+Invoke-RestMethod http://127.0.0.1:5001/health
+```
 
-The project already has the core ingredients of a serious LLM-maintained research wiki:
+CPU-only 的长论文可能超过 360 秒。compose 已设置 `DOCLING_SERVE_MAX_SYNC_WAIT=900`；客户端运行环境也应设置 `DOCLING_TIMEOUT_SECONDS=900`。
 
-- Docling-based PDF extraction with fallback parsing.
-- Source packets and raw source preservation.
-- LLM distillation into paper, concept, and method candidates.
-- Reviewer reports and schema/evidence checks.
-- Merge planning, aliases, card links, source evidence, chunks, and benchmark traces.
-- OSS-backed durable storage for source/wiki/query artifacts.
-- Frontend surfaces for capture, knowledge vault, wiki chat, and evaluation.
+## 安全重建论文语料
 
-However, the current canonical write path is still DB-first:
+先 dry-run：
+
+```powershell
+python scripts/reset_paper_corpus_results.py
+```
+
+确认 originals 数量与删除范围后执行：
+
+```powershell
+python scripts/reset_paper_corpus_results.py --execute
+python scripts/ingest_paper_corpus.py --continue-on-error --no-maintenance
+```
+
+reset 脚本会备份数据库与本地派生目录，只删除可重建结果，不删除 `sources/papers/originals`。
+
+## Table QA API
 
 ```text
-candidate -> wiki_pages/content_json -> render Markdown -> index chunks
+GET  /api/wiki/evidence/sources/{source_packet_id}/tables
+POST /api/wiki/evidence/table-query
 ```
 
-The Markdown files exist and are useful, but they are generated from SQLite card fields. They are not yet the canonical source of truth.
+Table QA 返回 answer、执行 SQL、命中 tables、rows 和 citations。citation 至少包含 source title、table ID、caption、page、row/column 与 cell ID。
 
-## P0: Fix Merge Planner LLM Wiring
-
-### Problem
-
-`backend/deps.py` currently defines `get_merge_llm()` but returns nothing when `SiliconFlowChat` is available. The merge model initialization code is also placed after a return path inside `get_maintenance_fast_llm()`, making it unreachable.
-
-This means the paper merge stage usually receives `merge_llm=None`, so `PaperMergeAgent` falls back to deterministic merge planning. This matches observed ingestion logs where `merge_llm_calls` stays at `0.0`.
-
-### Required Change
-
-Update `get_merge_llm()` so it constructs and returns the configured merge model:
-
-```python
-@lru_cache(maxsize=1)
-def get_merge_llm():
-    """Dedicated deterministic merge-planning model for paper cards."""
-    if SiliconFlowChat is None:
-        return None
-    try:
-        return SiliconFlowChat(
-            model=SILICONFLOW_MERGE_MODEL,
-            temperature=0.0,
-            max_tokens=3600,
-        )
-    except Exception as exc:
-        print(f"[deps] Merge LLM unavailable: {exc}")
-        return None
-```
-
-Then remove the unreachable merge-model block from `get_maintenance_fast_llm()`.
-
-### Acceptance Criteria
-
-- `get_merge_llm()` returns a `SiliconFlowChat` instance when the API client is available and credentials/config are valid.
-- `get_maintenance_fast_llm()` only handles the maintenance fast model.
-- A paper ingestion run with a non-trivial duplicate/update case can produce `merge_llm_calls > 0.0` when deterministic confidence is below the high-confidence fallback threshold.
-- If the merge LLM is unavailable, the pipeline still falls back safely to deterministic planning and logs the failure.
-
-## P1: Verify the Four-Stage Pipeline Honestly
-
-After P0, run or replay one paper ingestion and inspect the result.
-
-### What to Check
-
-- Extract stage produced a source packet and raw source artifact.
-- Distill stage produced meaningful candidates.
-- Review stage recorded reviewer reports.
-- Merge stage used the LLM planner when appropriate.
-- New or updated cards have source evidence links.
-- `WikiChunkIndex.reindex_card()` ran for changed cards.
-- The frontend Knowledge Vault can open the resulting card and show import impact.
-
-### Expected Claim After P1
-
-Use this wording in demos and interviews:
-
-> The project has a four-stage paper ingestion pipeline. Extraction and distillation are already active; review and merge combine deterministic guardrails with LLM planning where available. The merge planner wiring was fixed so the LLM merge path can be exercised instead of silently falling back to deterministic behavior.
-
-Avoid claiming that every merge decision is always LLM-driven. The deterministic fallback is intentional and useful.
-
-## P2: Define the Markdown Wiki Schema
-
-Before changing the merge target, define the Markdown contract. The schema should be simple enough for an LLM to maintain and strict enough for a parser to reindex.
-
-### Frontmatter
-
-Recommended fields:
-
-```yaml
----
-id: <stable-card-id>
-title: <human-readable-title>
-type: PaperPage | ConceptPage | MethodPage | ComparePage | InterviewQA | MistakeNote | StudyPlan | SourceNote
-status: draft | reviewed | verified
-created: YYYY-MM-DD
-updated: YYYY-MM-DD
-source_level: primary | secondary | inferred | user_selection
-aliases:
-  - <alias>
-tags:
-  - <tag>
-sources:
-  - url: <source-url-or-storage-uri>
-    level: primary | secondary | inferred
-    source_packet_id: <optional-source-packet-id>
-related:
-  - <card-id-or-wikilink>
----
-```
-
-### Body Sections
-
-Recommended common sections:
+## Revision API
 
 ```text
-# Title
-
-## Summary
-
-## Key Ideas
-
-## Evidence
-
-## Links
-
-## Notes
-
-## Review Status
+GET  /api/wiki/{card_id}/revisions
+GET  /api/wiki/{card_id}/claims
+POST /api/wiki/{card_id}/revisions/{revision_id}/rollback
 ```
 
-Page-type-specific sections can be added later, but the parser should only require a small common core at first.
+只有 committed revision 可以 rollback。原始 PDF、Docling JSON 和 evidence projection 不由 Wiki revision 修改。
 
-### Acceptance Criteria
-
-- Existing `MarkdownVault.render_card()` can render the new schema.
-- A future parser can recover card identity, type, summary, aliases, sources, and related links from Markdown alone.
-- The schema avoids embedding large opaque JSON blobs as the main content body.
-
-## P3: Build Markdown Parser and SQLite Reindexer
-
-The next layer is a deterministic reindexer that treats Markdown as canonical input and SQLite as a cache.
-
-### Target Flow
+## Agent 状态、审批与 Trace API
 
 ```text
-wiki/*.md -> parse frontmatter/body -> upsert wiki_pages/wiki_aliases/wiki_card_links/wiki_card_sources/wiki_chunks
+GET  /api/agent-runs
+GET  /api/agent-runs/{run_id}
+GET  /api/agent-runs/{run_id}/events
+GET  /api/agent-runs/{run_id}/events/stream
+GET  /api/agent-runs/approvals?status=pending
+GET  /api/agent-runs/approvals/{approval_id}
+POST /api/agent-runs/approvals/{approval_id}/approve
+POST /api/agent-runs/approvals/{approval_id}/reject
+POST /api/agent-runs/approvals/{approval_id}/edit
+POST /api/agent-runs/approvals/{approval_id}/retry
+POST /api/agent-runs/{run_id}/resume
+GET  /api/agent-runs/evidence/{element_id}
 ```
 
-### Required Components
+默认论文入库使用 `approval_mode=risk`：全新页面、普通新增和证据加强在 Verifier/evidence 闭合时自动提交；只有 Merge 阶段确认同一 entity、同一 aspect、重叠 scope 下存在高置信 challenge/supersede，或者缺少 verified claim、Verifier 非干净时，才停在 `AWAITING_APPROVAL`。普通的 `update_existing` 不触发审批。`manual` 仍可用于要求逐项审批的严格场景，`auto` 仅用于受控批量重建。进入等待态前，系统只保存冻结 revision、diff、Verifier 结果和 checkpoint，不写待审的正式 Markdown。前端 `/reviews` 用于处理知识冲突、覆盖旧知识和异常证据，而不是要求用户通读每篇论文；编辑 proposal 会创建新 revision 并重新运行 Verifier。
 
-- A Markdown parser that reads frontmatter and body sections.
-- A card upsert path that can preserve stable IDs from Markdown.
-- Alias extraction from frontmatter.
-- Link extraction from `related:` and `[[wikilinks]]`.
-- Source extraction from frontmatter and evidence sections.
-- Chunk indexing from Markdown body text.
-- Validation errors for missing IDs, duplicate IDs, broken source references, and malformed frontmatter.
+批准采用乐观并发控制：proposal 的 parent revision 与当前 Wiki revision 不一致时拒绝提交；同一 approval 的并发决策由 SQLite 写锁保证只有一个成功。
 
-### Acceptance Criteria
+## 回归命令
 
-- Deleting and rebuilding SQLite from Markdown produces the same visible Knowledge Vault cards for a sample set.
-- Query indices can be regenerated from the rebuilt SQLite tables.
-- Manual edits to a Markdown card can be reflected in the UI after reindexing.
-
-## P4: Move Merge Target to Markdown Patch
-
-Only after P0-P3 are stable should the merge agent stop writing SQLite card fields directly.
-
-### Future Flow
-
-```text
-candidate -> merge plan -> Markdown patch -> write wiki/*.md -> parse/reindex SQLite -> generate query indices
+```powershell
+python -m pytest -q
+python -m compileall -q backend system scripts
+cd frontend
+npm run build
 ```
 
-### Merge Agent Responsibilities
+入库后还应检查：
 
-- Choose whether to create, update, link, skip duplicate, or require human review.
-- Generate a Markdown patch or complete Markdown replacement for the target card.
-- Preserve source evidence and review history in readable sections.
-- Avoid direct writes to `wiki_pages.content_json` except through the reindexer.
+- 26 个 source packets 是否全部为 `docling-remote`；
+- `source_documents.docling_json` 是否非空；
+- 是否存在 unlinked source、active dangling evidence 或重复 source hash；
+- Wiki Validator 是否为 0 errors / 0 warnings；
+- 真实表格问题能否返回 page/table/cell provenance；
+- 跨论文 DuckDB 查询是否只使用 SELECT/CTE 且外部访问被禁用。
 
-### Deterministic Merger Responsibilities
+## 仍未完成
 
-- Validate the patch target and card ID.
-- Apply the patch or write the new Markdown file.
-- Run Markdown validation.
-- Reindex SQLite.
-- Regenerate query indices.
-- Record merge audit metadata.
-
-### Acceptance Criteria
-
-- A paper ingestion can create or update Markdown cards as the canonical artifact.
-- SQLite state is derived from Markdown after the merge.
-- The frontend still works without major UI changes.
-- Evaluation and wiki chat continue to use SQLite/chunk indices as retrieval caches.
-
-## Recommended Priority
-
-```text
-P0: Fix get_merge_llm() and remove unreachable merge-model code.
-P1: Run one paper ingestion and confirm the merge LLM path can be exercised.
-P2: Define the Markdown frontmatter/body schema.
-P3: Build Markdown -> SQLite reindexing.
-P4: Change merge target from DB content_json to Markdown patch.
-```
-
-## Interview Positioning
-
-Use this framing:
-
-> The current version is a DB-backed LLM Wiki Graph. I chose SQLite first to make web rendering, retrieval, evidence links, aliases, and benchmarks work quickly. The next step is to move the canonical knowledge layer to Markdown patches while keeping SQLite as the index and graph cache. That gives the system both product-grade retrieval and a Karpathy-style human-readable, diffable, LLM-maintained wiki.
-
-This is the most accurate story: the four-agent pipeline is real and worth keeping, but the canonical knowledge layer should evolve from DB-first to Markdown-first.
+- 人工标注的 semantic verifier benchmark；
+- 大规模 table QA golden、单位归一化与表头本体对齐；
+- 前端 revision 历史与 rollback 操作；
+- Markdown/OSS 与 SQLite 不能共享一个 ACID 事务；系统以 frozen revision、幂等 effects、`commit_failed` 和 retry/reconciliation 实现最终一致；
+- CPU Docling 的异步作业和性能优化。

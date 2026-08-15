@@ -57,8 +57,8 @@ class DeterministicRepairProcessor:
                 result = {"ok": False, "reason": "no deterministic handler implemented"}
                 status = "quarantined"
             else:
-                result = {"ok": False, "reason": "not a deterministic task type"}
-                status = "pending"
+                result = {"ok": False, "reason": "no deterministic handler for task type"}
+                status = "quarantined" if attempts >= 2 else "pending"
             self.store.update_repair_task(task_id, status=status, attempts=attempts, result=result)
             return {"id": task_id, "task_type": task_type, "status": status, "result": result}
         except Exception as exc:

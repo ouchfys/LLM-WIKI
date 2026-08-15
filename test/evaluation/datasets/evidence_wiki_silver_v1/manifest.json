@@ -1,0 +1,37 @@
+{
+  "dataset_id": "evidence-wiki-silver-v1",
+  "benchmark_kind": "llm-generated silver benchmark",
+  "human_annotation_count": 0,
+  "created_at": "2026-08-13T12:36:05.530792+00:00",
+  "seed": 20260813,
+  "source_db": "E:\\Agent-learn\\agent项目\\agent项目\\sessions.db",
+  "teacher_model": "deepseek-ai/DeepSeek-V3",
+  "system_under_test": {
+    "verifier": "configured SILICONFLOW_REVIEW_MODEL",
+    "table_qa": "configured SILICONFLOW_CHAT_MODEL"
+  },
+  "splits": {
+    "verifier": {
+      "count": 140,
+      "file": "verifier.jsonl",
+      "sha256": "79ec6c8e7ad3d184359a6e88c3626092a715ef41ae0cc52c0bd716c45ef01e7c",
+      "label_source": "teacher-generated cases independently relabeled by a second model over persisted Docling spans"
+    },
+    "table_qa": {
+      "count": 100,
+      "file": "table_qa.jsonl",
+      "sha256": "e21665f3e71637f9a2c7b145a76da0c6be7b63881c8869da1e5a6bcdcfee7f89",
+      "label_source": "deterministic values and cell IDs from persisted Docling tables"
+    }
+  },
+  "limitations": [
+    "No human annotation or adjudication was used.",
+    "Verifier labels can contain teacher-model errors or ambiguous cases.",
+    "Table cases cover the current 26-paper corpus and are not a universal table-QA benchmark.",
+    "Scores must not be reported as human-gold accuracy."
+  ],
+  "adjudicated_at": "2026-08-13T12:51:52.054871+00:00",
+  "adjudicator_model": "deepseek-ai/DeepSeek-V4-Flash",
+  "verifier_label_policy": "independent adjudicator final label",
+  "teacher_adjudicator_disagreements": 23
+}

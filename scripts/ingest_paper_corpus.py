@@ -12,11 +12,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from backend.deps import get_chunk_index, get_merge_llm, get_review_llm, get_summary_llm
-from system.paper_index.store import PaperIndexStore
+from backend.api.papers import _run_ingestion_job
+from backend.deps import get_session_store
+from system.agent_runtime import AgentRunStore
 from system.wiki.maintenance.runner import WikiMaintenanceRunner
-from system.wiki.paper_pipeline import run_paper_pipeline
-from system.wiki.wiki_store import WikiStore
+from system.wiki.ingestion_jobs import IngestionJobStore
 
 
 DEFAULT_CORPUS = REPO_ROOT / 'sources' / 'papers' / 'originals'
@@ -78,19 +78,16 @@ def main() -> int:
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    paper_store = PaperIndexStore()
-    wiki_store = WikiStore()
+    db_path = get_session_store().db_path
+    jobs = IngestionJobStore(db_path=db_path)
+    runtime = AgentRunStore(db_path=db_path)
     pipeline_store = None
     existing_hashes: set[str] = set()
     if args.skip_existing:
         from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 
-        pipeline_store = PaperWikiPipelineStore(db_path=wiki_store.db_path)
+        pipeline_store = PaperWikiPipelineStore(db_path=db_path)
         existing_hashes = _existing_completed_source_hashes(pipeline_store)
-    chunk_index = get_chunk_index()
-    summary_llm = get_summary_llm()
-    review_llm = get_review_llm()
-    merge_llm = get_merge_llm()
 
     rows = []
     started = time.perf_counter()
@@ -111,22 +108,40 @@ def main() -> int:
                 continue
         print(f'[{index}/{len(pdfs)}] ingesting {pdf.name}', flush=True)
         try:
-            result = run_paper_pipeline(
-                pdf_path=pdf,
-                source_url='',
-                paper_store=paper_store,
-                wiki_store=wiki_store,
-                chunk_index=chunk_index,
-                llm=summary_llm,
-                review_llm=review_llm,
-                merge_llm=merge_llm,
+            job = jobs.create_job(
+                source_type="paper_pdf", source_uri=str(pdf.resolve()), stage="queued",
+                metadata={"filename": pdf.name, "batch_run_id": run_id},
             )
-            row = result.model_dump() if hasattr(result, 'model_dump') else result.dict()
+            run = runtime.create_run(
+                run_type="paper_ingestion", source_uri=str(pdf.resolve()),
+                approval_mode="auto", ingestion_job_id=str(job["id"]),
+                context={
+                    "job_id": job["id"], "pdf_path": str(pdf.resolve()),
+                    "source_url": "", "pipeline": "wiki_compile",
+                    "batch_run_id": run_id,
+                },
+            )
+            jobs.merge_metadata(
+                str(job["id"]), {"agent_run_id": run["id"], "approval_mode": "auto"}
+            )
+            _run_ingestion_job(
+                db_path=db_path, job_id=str(job["id"]), pdf_path=str(pdf.resolve()),
+                source_url="", pipeline="wiki_compile", run_id=str(run["id"]),
+                approval_mode="auto", run_maintenance=False,
+            )
+            finished_run = runtime.get_run(str(run["id"])) or {}
+            finished_job = jobs.get_job(str(job["id"])) or {}
+            pipeline_ok = finished_run.get("current_state") == "COMPLETED"
+            row = dict(finished_run.get("result") or {})
             row.update({
-                'ok': True,
                 'pdf': _display_path(pdf),
+                'agent_run_id': run["id"],
+                'ingestion_job_id': job["id"],
+                'agent_state': finished_run.get("current_state", ""),
+                'job_stage': finished_job.get("stage", ""),
                 'elapsed_seconds': round(time.perf_counter() - item_started, 2),
             })
+            row['ok'] = pipeline_ok
             if args.skip_existing and row.get('source_packet_id') and pipeline_store:
                 existing_hashes = _existing_completed_source_hashes(pipeline_store)
         except Exception as exc:
@@ -142,7 +157,7 @@ def main() -> int:
                 rows.append(row)
                 break
         rows.append(row)
-        print(f"  done ok={row.get('ok')} parser={row.get('parser','')} elapsed={row.get('elapsed_seconds')}s", flush=True)
+        print(f"  done ok={row.get('ok')} state={row.get('agent_state','')} parser={row.get('parser','')} elapsed={row.get('elapsed_seconds')}s", flush=True)
 
     maintenance = {}
     if not args.no_maintenance:

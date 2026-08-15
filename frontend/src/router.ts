@@ -5,6 +5,7 @@ const CapturePage = () => import('./pages/CaptureNote.vue')
 const DailyReadsPage = () => import('./pages/MonthlyReads.vue')
 const KnowledgeVaultPage = () => import('./pages/KnowledgeVault.vue')
 const EvaluationPage = () => import('./pages/EvaluationDashboard.vue')
+const ReviewCenterPage = () => import('./pages/ReviewCenter.vue')
 
 const router = createRouter({
   history: createWebHistory(),
@@ -13,6 +14,7 @@ const router = createRouter({
     { path: '/capture', component: CapturePage },
     { path: '/vault', component: KnowledgeVaultPage },
     { path: '/evaluation', component: EvaluationPage },
+    { path: '/reviews', component: ReviewCenterPage },
     { path: '/daily', component: DailyReadsPage },
     { path: '/monthly-reads', redirect: '/daily' },
     { path: '/wiki', redirect: '/' },

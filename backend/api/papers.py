@@ -1,6 +1,8 @@
+import hashlib
 import re
 import shutil
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -15,10 +17,12 @@ from system.document.docling_parser import DoclingParser, ParsedDocument
 from system.storage import get_object_storage, get_storage_layout
 from system.wiki.wiki_builder import WikiBuilder, sanitize_wiki_text
 from system.wiki.paper_pipeline import run_paper_pipeline
+from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 from system.wiki.ingestion_jobs import IngestionJobStore
 from system.wiki.maintenance.runner import WikiMaintenanceRunner
 from system.wiki.raw_source_vault import RawSourceVault
 from system.wiki.wiki_store import WikiStore
+from system.agent_runtime import AgentRunLease, AgentRunStore, TraceRecorder
 
 
 router = APIRouter()
@@ -27,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 STORAGE_LAYOUT = get_storage_layout()
 SOURCES_DIR = STORAGE_LAYOUT.sources_dir
 UPLOAD_DIR = STORAGE_LAYOUT.source_dir("papers", "uploads")
+WIKI_COMPILE_PIPELINES = {"wiki_compile", "four_agent"}  # legacy value reads persisted runs
 
 
 class IndexLocalPayload(BaseModel):
@@ -40,6 +45,41 @@ def _safe_pdf_name(filename: str) -> str:
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
     return "".join(ch if ch.isalnum() or ch in " ._-()" else "_" for ch in name)[:120]
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _existing_pdf_ingestion(path: Path, db_path: str) -> dict[str, Any] | None:
+    """Return the canonical existing source for byte-identical PDFs."""
+    pipeline = PaperWikiPipelineStore(db_path=db_path)
+    packet = pipeline.find_source_packet_by_hash(_file_sha256(path))
+    if not packet:
+        return None
+    audits = pipeline.list_merge_audit(source_packet_id=packet.source_id, limit=20)
+    card_id = next(
+        (
+            str(item.get("paper_card_id") or item.get("result_card_id") or "")
+            for item in audits
+            if item.get("paper_card_id") or item.get("result_card_id")
+        ),
+        "",
+    )
+    return {
+        "ok": True,
+        "already_exists": True,
+        "deduplicated": True,
+        "source_packet_id": packet.source_id,
+        "paper_card_id": card_id,
+        "title": packet.title,
+        "parser": packet.parser_used,
+        "message": "This PDF is already in the knowledge base.",
+    }
 
 
 def _resolve_data_pdf(path_value: str) -> Path:
@@ -488,7 +528,7 @@ def _titles_compatible(pdf_title: str, metadata_title: str) -> bool:
 
 
 def _compile_paper_wiki_page(title: str, raw_markdown: str, parser_used: str) -> Optional[dict]:
-    """Best-effort Karpathy-style compile step for a paper.
+    """Best-effort compatibility compiler for non-evidence ingestion paths.
 
     Failure must not block ingestion. The raw Markdown remains the durable
     source, while the compiled page is the user-facing Wiki note.
@@ -631,9 +671,11 @@ def _run_pdf_pipeline(
     pipeline: str,
     store: PaperIndexStore,
     wiki_store: WikiStore,
+    approval_mode: str = "auto",
+    stage_callback=None,
 ) -> dict:
     normalized_pipeline = (pipeline or "").strip().lower()
-    if normalized_pipeline == "four_agent":
+    if normalized_pipeline in WIKI_COMPILE_PIPELINES:
         return _model_to_dict(run_paper_pipeline(
             pdf_path=pdf_path,
             source_url=source_url,
@@ -643,10 +685,43 @@ def _run_pdf_pipeline(
             llm=get_summary_llm(),
             review_llm=get_review_llm(),
             merge_llm=get_merge_llm(),
+            approval_mode=approval_mode,
+            stage_callback=stage_callback,
         ))
     if normalized_pipeline in {"paperindex", "fallback", "basic_fallback"}:
         return _index_pdf(pdf_path, source_url, store, wiki_store, use_docling=False, use_llm_compile=False)
     return _index_pdf(pdf_path, source_url, store, wiki_store)
+
+
+def _proposal_risk_reasons(revision: dict[str, Any]) -> list[str]:
+    """Escalate only proposals that can alter existing knowledge or lack clean evidence."""
+    reasons: list[str] = []
+    if str(revision.get("review_status") or "") != "proposed":
+        reasons.append("revision_not_proposed")
+    verification = revision.get("verification") if isinstance(revision.get("verification"), dict) else {}
+    claims = [item for item in verification.get("claims") or [] if isinstance(item, dict)]
+    affected = [item for item in verification.get("affected_claims") or [] if isinstance(item, dict)]
+    checks = [item for item in verification.get("checks") or [] if isinstance(item, dict)]
+    if not claims:
+        reasons.append("no_verified_claims")
+    if any(
+        str(item.get("action") or "") in {"challenge_claim", "supersede_claim"}
+        and bool(
+            item.get("requires_review", True)
+            if "requires_review" in item
+            else (item.get("relation_decision") or {}).get("requires_review", True)
+        )
+        for item in affected
+    ):
+        reasons.append("changes_claim_history")
+    if any(
+        str(item.get("result") or "") not in {"supported", "legacy_unverified"}
+        or str(item.get("semantic_result") or "not_run")
+        not in {"entailed", "supported", "not_run"}
+        for item in checks
+    ):
+        reasons.append("verifier_not_clean")
+    return list(dict.fromkeys(reasons))
 
 
 def _run_ingestion_job(
@@ -656,22 +731,164 @@ def _run_ingestion_job(
     pdf_path: str,
     source_url: str,
     pipeline: str,
+    run_id: str = "",
+    approval_mode: str = "risk",
+    lease_owner: str = "",
+    run_maintenance: bool = True,
 ) -> None:
     jobs = IngestionJobStore(db_path=db_path)
+    runs = AgentRunStore(db_path=db_path)
+    if not run_id:
+        run = runs.create_run(
+            run_type="paper_ingestion", source_uri=pdf_path,
+            approval_mode=approval_mode,
+            ingestion_job_id=job_id,
+            context={"job_id": job_id, "pdf_path": pdf_path, "source_url": source_url, "pipeline": pipeline},
+        )
+        run_id = str(run["id"])
+    lease = AgentRunLease(
+        runs, run_id, owner=lease_owner or f"paper-ingestion-{uuid.uuid4()}"
+    )
+    if not lease.start():
+        return
+    trace = TraceRecorder(runs, run_id)
     normalized_pipeline = (pipeline or "").strip().lower()
     initial_stage = "indexing" if normalized_pipeline in {"paperindex", "fallback", "basic_fallback"} else "docling_extracting"
-    jobs.merge_metadata(job_id, {"runner_version": "async-v2", "runner_pipeline": normalized_pipeline})
+    jobs.merge_metadata(job_id, {"runner_version": "agent-state-v1", "runner_pipeline": normalized_pipeline, "agent_run_id": run_id, "approval_mode": approval_mode})
     jobs.update_job(job_id, status="running", stage=initial_stage, progress=0.12)
     try:
-        result = _run_pdf_pipeline(
-            pdf_path=Path(pdf_path),
-            source_url=source_url,
-            pipeline=pipeline,
-            store=PaperIndexStore(db_path=db_path),
-            wiki_store=WikiStore(db_path=db_path),
+        progress = {"EXTRACTING": 0.12, "DISTILLING": 0.42, "VERIFYING": 0.64, "COMPILING_PROPOSAL": 0.82}
+        def on_stage(state: str, details: dict) -> None:
+            current = runs.get_run(run_id) or {}
+            if current.get("current_state") != state:
+                runs.transition(run_id, state, context_updates=details, reason="paper pipeline stage")
+                trace.event("node.started", name=state.lower(), status="running", data=details)
+            jobs.update_job(job_id, status="running", stage=state.lower(), progress=progress.get(state, 0.5))
+
+        if normalized_pipeline not in WIKI_COMPILE_PIPELINES:
+            on_stage("EXTRACTING", {"pdf_path": pdf_path, "compatibility_pipeline": normalized_pipeline})
+        with trace.bind():
+            result = _run_pdf_pipeline(
+                pdf_path=Path(pdf_path),
+                source_url=source_url,
+                pipeline=pipeline,
+                store=PaperIndexStore(db_path=db_path),
+                wiki_store=WikiStore(db_path=db_path),
+                approval_mode=approval_mode if normalized_pipeline in WIKI_COMPILE_PIPELINES else "auto",
+                stage_callback=on_stage if normalized_pipeline in WIKI_COMPILE_PIPELINES else None,
+            )
+        if normalized_pipeline not in WIKI_COMPILE_PIPELINES:
+            for state in ("DISTILLING", "VERIFYING", "COMPILING_PROPOSAL"):
+                on_stage(state, {"compatibility_pipeline": normalized_pipeline, "detail": "legacy stage boundary"})
+        for key, value in (result.get("timings") or {}).items():
+            if not key.endswith("_seconds"):
+                continue
+            runs.append_event(
+                run_id, event_type="node.completed", node_name=key.removesuffix("_seconds"),
+                status="completed",
+                duration_ms=float(value or 0) * 1000,
+                output_data={"source_packet_id": result.get("source_packet_id", "")},
+            )
+        proposals = [item for item in result.get("proposals") or [] if item.get("revision_id")]
+        if proposals and approval_mode in {"manual", "risk"}:
+            approvals = [
+                runs.create_approval(
+                    run_id=run_id,
+                    revision_id=str(item["revision_id"]),
+                    page_id=str(item.get("card_id") or ""),
+                    title=str(item.get("title") or ""),
+                )
+                for item in proposals
+            ]
+            auto_accepted_ids: list[str] = []
+            manual_approval_ids: list[str] = []
+            proposal_store = PaperWikiPipelineStore(db_path=db_path)
+            if approval_mode == "risk":
+                for approval in approvals:
+                    revision = proposal_store.get_revision(str(approval["revision_id"])) or {}
+                    risk_reasons = _proposal_risk_reasons(revision)
+                    if risk_reasons:
+                        manual_approval_ids.append(str(approval["id"]))
+                        runs.append_event(
+                            run_id, event_type="approval.risk_escalated",
+                            node_name="AWAITING_APPROVAL", status="pending",
+                            input_data={
+                                "approval_id": approval["id"], "reasons": risk_reasons,
+                            },
+                        )
+                    else:
+                        runs.accept_approval(
+                            str(approval["id"]),
+                            reason="auto-accepted by evidence-closed risk policy",
+                        )
+                        auto_accepted_ids.append(str(approval["id"]))
+            runs.transition(
+                run_id, "AWAITING_APPROVAL",
+                context_updates={
+                    "source_packet_id": result.get("source_packet_id", ""),
+                    "paper_card_id": result.get("paper_card_id", ""),
+                    "approval_ids": [item["id"] for item in approvals],
+                    "auto_accepted_approval_ids": auto_accepted_ids,
+                    "manual_approval_ids": manual_approval_ids,
+                    "revision_ids": [item["revision_id"] for item in approvals],
+                    "pipeline_result": result,
+                },
+                result={"ok": True, **result, "approval_ids": [item["id"] for item in approvals]},
+                reason=(
+                    "risk policy escalated exceptional Wiki proposals"
+                    if manual_approval_ids else
+                    "risk policy auto-accepted evidence-closed Wiki proposals"
+                ),
+            )
+            jobs.update_job(
+                job_id, status="waiting", stage="awaiting_approval", progress=0.86,
+                source_packet_id=str(result.get("source_packet_id") or ""),
+                paper_card_id=str(result.get("paper_card_id") or ""),
+                result={
+                    "ok": True, **result,
+                    "approval_ids": [item["id"] for item in approvals],
+                    "auto_accepted_approval_ids": auto_accepted_ids,
+                    "manual_approval_ids": manual_approval_ids,
+                    "agent_run_id": run_id,
+                },
+            )
+            if approval_mode == "risk" and not manual_approval_ids:
+                from backend.api.agent_runs import _finalize_run_if_decided
+
+                _finalize_run_if_decided(
+                    run_id, runtime=runs, pipeline=proposal_store,
+                    wiki=WikiStore(db_path=db_path), lease_owner=lease.owner,
+                )
+            return
+        if approval_mode in {"manual", "risk"} and normalized_pipeline in WIKI_COMPILE_PIPELINES and not proposals:
+            runs.transition(run_id, "REJECTED", result={"ok": False, **result}, reason="no verified proposal was produced")
+            jobs.update_job(
+                job_id, status="rejected", stage="rejected", progress=1.0,
+                source_packet_id=str(result.get("source_packet_id") or ""),
+                result={"ok": False, **result, "agent_run_id": run_id},
+            )
+            return
+        if normalized_pipeline in WIKI_COMPILE_PIPELINES and not bool(result.get("ok")):
+            runs.transition(
+                run_id, "REJECTED", result={"ok": False, **result},
+                reason="verified pipeline produced no committable paper proposal",
+            )
+            jobs.update_job(
+                job_id, status="rejected", stage="rejected", progress=1.0,
+                source_packet_id=str(result.get("source_packet_id") or ""),
+                result={"ok": False, **result, "agent_run_id": run_id},
+            )
+            return
+        runs.transition(
+            run_id, "COMMITTING",
+            context_updates={"source_packet_id": result.get("source_packet_id", "")},
+            reason="automatic approval mode" if normalized_pipeline in WIKI_COMPILE_PIPELINES else "compatibility pipeline completed",
         )
+        runs.transition(run_id, "REINDEXING", reason="Wiki revisions committed")
         jobs.update_job(job_id, status="running", stage="indexing", progress=0.92)
-        maintenance_result = _run_post_ingestion_maintenance(db_path)
+        maintenance_result = (
+            _run_post_ingestion_maintenance(db_path) if run_maintenance else {}
+        )
         jobs.update_job(
             job_id,
             status="done",
@@ -681,9 +898,22 @@ def _run_ingestion_job(
             paper_card_id=str(result.get("paper_card_id") or result.get("wiki_card_id") or ""),
             result={"ok": True, **result, "maintenance": maintenance_result},
         )
+        runs.transition(
+            run_id, "COMPLETED",
+            result={"ok": True, **result, "maintenance": maintenance_result},
+            reason="ingestion and maintenance completed",
+        )
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc)
         jobs.update_job(job_id, status="failed", stage="failed", progress=1.0, error=str(detail))
+        try:
+            current = runs.get_run(run_id) or {}
+            if current.get("current_state") not in {"FAILED", "COMPLETED", "REJECTED"}:
+                runs.transition(run_id, "FAILED", error=str(detail), reason="unhandled ingestion error")
+        except Exception:
+            pass
+    finally:
+        lease.stop()
 
 
 def _run_post_ingestion_maintenance(db_path: str) -> dict:
@@ -710,7 +940,8 @@ def create_ingestion_job(
     file: Optional[UploadFile] = File(None),
     local_path: str = Form(""),
     source_url: str = Form(""),
-    pipeline: str = Form("four_agent"),
+    pipeline: str = Form("wiki_compile"),
+    approval_mode: str = Form("risk"),
     store: PaperIndexStore = Depends(get_paper_index),
 ):
     if file and file.filename:
@@ -727,6 +958,10 @@ def create_ingestion_job(
     else:
         raise HTTPException(status_code=400, detail="Provide a PDF file or local_path.")
 
+    existing = _existing_pdf_ingestion(dest, store.db_path)
+    if existing:
+        return existing
+
     jobs = IngestionJobStore(db_path=store.db_path)
     job = jobs.create_job(
         source_type="paper_pdf",
@@ -734,10 +969,21 @@ def create_ingestion_job(
         stage="queued",
         metadata={
             "source_url": source_url,
-            "pipeline": pipeline or "four_agent",
+            "pipeline": pipeline or "wiki_compile",
             "filename": file.filename if file and file.filename else Path(source_uri).name,
         },
     )
+    run = AgentRunStore(db_path=jobs.db_path).create_run(
+        run_type="paper_ingestion",
+        source_uri=source_uri,
+        approval_mode=approval_mode if approval_mode in {"risk", "manual", "auto"} else "risk",
+        ingestion_job_id=job["id"],
+        context={
+            "job_id": job["id"], "pdf_path": str(dest.resolve()),
+            "source_url": source_url, "pipeline": pipeline or "wiki_compile",
+        },
+    )
+    jobs.merge_metadata(job["id"], {"agent_run_id": run["id"], "approval_mode": run["approval_mode"]})
     threading.Thread(
         target=_run_ingestion_job,
         kwargs={
@@ -745,11 +991,14 @@ def create_ingestion_job(
             "job_id": job["id"],
             "pdf_path": str(dest.resolve()),
             "source_url": source_url,
-            "pipeline": pipeline or "four_agent",
+            "pipeline": pipeline or "wiki_compile",
+            "run_id": run["id"],
+            "approval_mode": run["approval_mode"],
         },
         daemon=True,
     ).start()
-    return {"ok": True, "job_id": job["id"], "job": job}
+    job = jobs.get_job(job["id"]) or job
+    return {"ok": True, "job_id": job["id"], "agent_run_id": run["id"], "job": job, "run": run}
 
 
 @router.get("/ingest/jobs")
@@ -775,7 +1024,7 @@ def get_ingestion_job(
 def upload_and_index(
     file: UploadFile = File(...),
     source_url: str = Form(""),
-    pipeline: str = Form("four_agent"),
+    pipeline: str = Form("wiki_compile"),
     store: PaperIndexStore = Depends(get_paper_index),
     wiki_store: WikiStore = Depends(get_wiki_store),
 ):
@@ -785,6 +1034,16 @@ def upload_and_index(
     dest = UPLOAD_DIR / _safe_pdf_name(file.filename)
     with dest.open("wb") as out:
         shutil.copyfileobj(file.file, out)
+    existing = _existing_pdf_ingestion(dest, store.db_path)
+    if existing:
+        return {
+            **existing,
+            "file": {
+                "name": dest.name,
+                "path": str(dest.relative_to(REPO_ROOT)),
+                "size": dest.stat().st_size,
+            },
+        }
     result = _run_pdf_pipeline(dest.resolve(), source_url, pipeline, store, wiki_store)
     return {
         "ok": True,

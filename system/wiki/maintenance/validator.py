@@ -360,7 +360,7 @@ class WikiValidator:
         try:
             return json.loads(value)
         except (TypeError, json.JSONDecodeError):
-            return None
+            return default
 
     @staticmethod
     def _error(

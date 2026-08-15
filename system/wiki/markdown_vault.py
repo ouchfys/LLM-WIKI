@@ -5,6 +5,7 @@ The SQLite store indexes cards for UI and search, but Markdown files are the
 human-readable source of the personal Wiki.
 """
 
+import json
 import re
 import urllib.parse
 from datetime import datetime, timezone
@@ -23,6 +24,18 @@ PAGE_TYPE_DIRS = {
     "MistakeNote": "mistakes",
     "StudyPlan": "plans",
     "SourceNote": "sources",
+}
+
+# These fields are part of the compiler/runtime audit trail, not the knowledge
+# article a reader should scan. They remain in canonical Markdown as one hidden
+# JSON comment so reindex/replay stays lossless without exposing implementation
+# bookkeeping as user-facing sections.
+SYSTEM_CONTENT_KEYS = {
+    "schema_version", "compile_status", "pipeline", "compiler_model",
+    "source_packet_id", "source_packet_ids", "raw_source_path",
+    "pdf_storage_uri", "parser_used", "review_status", "aliases", "sources",
+    "evidence_updates", "merge_history", "affected_claims", "compiler",
+    "import_impact",
 }
 
 
@@ -77,6 +90,7 @@ class MarkdownVault:
         source_urls: Optional[List[str]] = None,
         related_topics: Optional[List[str]] = None,
         existing_path: str = "",
+        created: str = "",
     ) -> str:
         path = self._resolve_path(card_id, title, page_type, existing_path)
         markdown = self.render_card(
@@ -88,6 +102,7 @@ class MarkdownVault:
             source_level=source_level,
             source_urls=source_urls or [],
             related_topics=related_topics or [],
+            created=created,
         )
         storage = get_object_storage()
         if storage.enabled:
@@ -120,6 +135,32 @@ class MarkdownVault:
         except OSError:
             pass
 
+    def read_reference(self, markdown_path: str) -> str:
+        if not markdown_path:
+            return ""
+        storage = get_object_storage()
+        text = storage.read_text(markdown_path)
+        if text:
+            return text
+        path = self.resolve_markdown_path(markdown_path)
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def write_raw_reference(self, markdown_path: str, markdown: str) -> str:
+        """Write an already-rendered revision without reinterpreting it."""
+        storage = get_object_storage()
+        if markdown_path.startswith(("oss://", "local://")):
+            key = storage.key_from_uri(markdown_path) if hasattr(storage, "key_from_uri") else markdown_path.split("://", 1)[-1]
+            return storage.upload_text(key, markdown)
+        path = self.resolve_markdown_path(markdown_path)
+        self._ensure_local_vault()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(markdown, encoding="utf-8")
+        storage.upload_text(storage.key_for_local_path(path), markdown)
+        try:
+            return path.relative_to(self.repo_root).as_posix()
+        except ValueError:
+            return str(path)
+
     def render_card(
         self,
         card_id: str,
@@ -130,9 +171,11 @@ class MarkdownVault:
         source_level: str,
         source_urls: List[str],
         related_topics: List[str],
+        created: str = "",
     ) -> str:
         """Render the canonical Markdown schema used by the wiki reindexer."""
         now = datetime.now(timezone.utc).date().isoformat()
+        created_date = self._normalize_date(created) or now
         content_json = content_json or {}
         aliases = self._as_string_list(content_json.get("aliases"))
         source_packet_id = str(content_json.get("source_packet_id") or "")
@@ -154,7 +197,7 @@ class MarkdownVault:
             f"title: {self._yaml_scalar(title)}",
             f"type: {self._yaml_scalar(page_type)}",
             f"status: {self._yaml_scalar(status)}",
-            f"created: {self._yaml_scalar(now)}",
+            f"created: {self._yaml_scalar(created_date)}",
             f"updated: {self._yaml_scalar(now)}",
             f"source_level: {self._yaml_scalar(source_level)}",
             "aliases:",
@@ -177,7 +220,12 @@ class MarkdownVault:
 
         body = [f"# {title}", ""]
         if summary:
-            body.extend(["## Summary", "", summary.strip(), ""])
+            # Summaries are prose fields, not nested Markdown documents. A
+            # Docling abstract can begin with ``##`` and would otherwise close
+            # the Summary section during deterministic reindexing.
+            inline_summary = re.sub(r"\s+", " ", summary).strip()
+            inline_summary = re.sub(r"^#{1,6}\s*", "", inline_summary)
+            body.extend(["## Summary", "", inline_summary, ""])
         body.extend(self._render_content_sections(page_type, content_json))
         if source_urls:
             body.extend(["## Evidence", ""])
@@ -238,8 +286,8 @@ class MarkdownVault:
         readme = self.vault_dir / "README.md"
         if not readme.exists():
             readme.write_text(
-                "# 私有化贾维斯 Vault\n\n"
-                "这是私有化贾维斯生成和维护的 Obsidian 知识库。\n\n"
+                "# LLM-WIKI Vault\n\n"
+                "这是 LLM-WIKI 生成和维护的 Markdown 知识库。\n\n"
                 "建议工作流：\n\n"
                 "1. 在 Web 端发现论文、面经、博客和灵感。\n"
                 "2. 存入 Wiki 后自动生成 Markdown 笔记。\n"
@@ -266,7 +314,33 @@ class MarkdownVault:
 
         dirname = PAGE_TYPE_DIRS.get(page_type, "sources")
         slug = self._slugify(title) or card_id
-        return self.vault_dir / dirname / f"{slug}.md"
+        directory = self.vault_dir / dirname
+        candidate = directory / f"{slug}.md"
+        # Distinct cards may slugify to the same filename (e.g. "Self Attention"
+        # vs "Self-Attention"). Their dedupe_keys differ, so this is a genuine
+        # collision: disambiguate with a short card_id suffix rather than letting
+        # the later write clobber the earlier card's Markdown.
+        if self._slug_collides(candidate, card_id):
+            candidate = directory / f"{slug}-{card_id[:8]}.md"
+        return candidate
+
+    def _slug_collides(self, candidate: Path, card_id: str) -> bool:
+        storage = get_object_storage()
+        if storage.enabled:
+            try:
+                existing = storage.read_text(storage.key_for_local_path(candidate))
+            except Exception:
+                return False
+            if not existing:
+                return False
+            return f'id: "{card_id}"' not in existing
+        if not candidate.exists():
+            return False
+        try:
+            existing = candidate.read_text(encoding="utf-8")
+        except OSError:
+            return True
+        return f'id: "{card_id}"' not in existing
 
     @staticmethod
     def _render_content_sections(page_type: str, content: Dict[str, Any]) -> List[str]:
@@ -294,7 +368,7 @@ class MarkdownVault:
                 ("method", "Method"),
                 ("findings", "Findings"),
                 ("limitations", "Limitations"),
-                ("key_takeaways", "Key Ideas"),
+                ("key_takeaways", "Key Takeaways"),
                 ("explanation", "Explanation"),
                 ("examples", "Examples"),
                 ("related_concepts", "Related Concepts"),
@@ -305,7 +379,7 @@ class MarkdownVault:
                 ("method", "Method"),
                 ("findings", "Findings"),
                 ("limitations", "Limitations"),
-                ("key_takeaways", "Key Ideas"),
+                ("key_takeaways", "Key Takeaways"),
                 ("category", "Category"),
                 ("description", "Description"),
                 ("when_to_use", "When To Use"),
@@ -336,9 +410,34 @@ class MarkdownVault:
             if key in content:
                 lines.extend(MarkdownVault._render_value(label, content.get(key)))
                 seen.add(key)
+        claims = content.get("claims")
+        if isinstance(claims, list) and claims:
+            lines.extend(MarkdownVault._render_claims(claims))
+            seen.add("claims")
         for key, value in content.items():
-            if key not in seen and not key.startswith("_") and key not in {"aliases", "sources", "source_packet_id", "source_packet_ids", "raw_source_path", "pdf_storage_uri", "review_status"}:
+            if key not in seen and not key.startswith("_") and key not in SYSTEM_CONTENT_KEYS:
                 lines.extend(MarkdownVault._render_value(key.replace("_", " ").title(), value))
+        system_metadata = {
+            key: value for key, value in content.items()
+            if key in SYSTEM_CONTENT_KEYS and value not in (None, "", [], {})
+        }
+        if system_metadata:
+            payload = json.dumps(system_metadata, ensure_ascii=False, separators=(",", ":")).replace("-->", "--\\u003e")
+            lines.extend([f"<!-- wiki-system {payload} -->", ""])
+        return lines
+
+    @staticmethod
+    def _render_claims(claims: List[Dict[str, Any]]) -> List[str]:
+        lines = ["## Knowledge Claims", ""]
+        for claim in claims:
+            if not isinstance(claim, dict) or not str(claim.get("statement") or "").strip():
+                continue
+            payload = json.dumps(claim, ensure_ascii=False, separators=(",", ":")).replace("-->", "--\\u003e")
+            lines.append(f"<!-- wiki-claim {payload} -->")
+            status = str(claim.get("status") or "unknown")
+            claim_id = str(claim.get("id") or "")
+            lines.append(f"- **[{status}]** {claim.get('statement')}")
+        lines.append("")
         return lines
 
     @staticmethod
@@ -372,6 +471,15 @@ class MarkdownVault:
     def _yaml_scalar(value: Any) -> str:
         text = str(value or "").replace('"', '\\"')
         return f'"{text}"'
+
+    @staticmethod
+    def _normalize_date(value: Any) -> str:
+        """Coerce an ISO datetime/date string to a bare YYYY-MM-DD date."""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        match = re.match(r"(\d{4}-\d{2}-\d{2})", text)
+        return match.group(1) if match else ""
 
     @staticmethod
     def _as_string_list(value: Any) -> List[str]:

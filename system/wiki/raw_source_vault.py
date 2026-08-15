@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from system.storage import get_object_storage, get_storage_layout
 
@@ -30,7 +30,6 @@ class RawSourceVault:
         directory.mkdir(parents=True, exist_ok=True)
         slug = self._slugify(slug_hint or title) or "untitled"
         path = directory / f"{slug}.md"
-
         frontmatter = [
             "---",
             f'title: "{self._escape(title)}"',
@@ -61,6 +60,7 @@ class RawSourceVault:
         frontmatter.extend(["---", ""])
 
         markdown = "\n".join(frontmatter) + body_markdown.rstrip() + "\n"
+        path = self._disambiguate(path, markdown)
         path.write_text(markdown, encoding="utf-8")
         storage = get_object_storage()
         storage_uri = storage.upload_text(storage.key_for_local_path(path), markdown)
@@ -71,6 +71,34 @@ class RawSourceVault:
     @staticmethod
     def _escape(value: Any) -> str:
         return str(value or "").replace('"', '\\"')
+
+    @staticmethod
+    def _disambiguate(path: Path, markdown: str) -> Path:
+        """Avoid clobbering a distinct source that slugified to the same name.
+
+        Two different sources can share a title/slug while being genuinely
+        distinct. Re-writing the identical content is treated as an idempotent
+        update (same path); a collision with different content gets a numeric
+        suffix so the earlier source's Markdown survives.
+        """
+        if not path.exists():
+            return path
+        try:
+            if path.read_text(encoding="utf-8") == markdown:
+                return path
+        except OSError:
+            pass
+        stem, suffix, parent = path.stem, path.suffix, path.parent
+        for index in range(2, 1000):
+            candidate = parent / f"{stem}-{index}{suffix}"
+            if not candidate.exists():
+                return candidate
+            try:
+                if candidate.read_text(encoding="utf-8") == markdown:
+                    return candidate
+            except OSError:
+                continue
+        return parent / f"{stem}-{index}{suffix}"
 
     @staticmethod
     def _slugify(value: str) -> str:

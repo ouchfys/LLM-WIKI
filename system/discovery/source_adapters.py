@@ -244,7 +244,7 @@ class RssFeedAdapter(SourceAdapter):
         if not url:
             return []
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "PrivateJarvis/0.1"})
+            req = urllib.request.Request(url, headers={"User-Agent": "LLM-WIKI/1.0"})
             with urllib.request.urlopen(req, timeout=20) as resp:
                 content = resp.read().decode("utf-8", errors="ignore")
         except Exception as exc:

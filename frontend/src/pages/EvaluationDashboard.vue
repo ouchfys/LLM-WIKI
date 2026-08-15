@@ -288,7 +288,7 @@ async function loadRuns() {
   try {
     const { data } = await api.get('/wiki/evaluations', { params: { limit: 80 } })
     runs.value = data.items || []
-    const preferred = runs.value.find((run) => run.id === 'current30_focus_018_028_v2')
+    const preferred = runs.value.find((run) => run.id === 'current30_full_answer_check')
     const target = selectedRunId.value || preferred?.id || data.latest_run_id || runs.value[0]?.id || ''
     if (target) await selectRun(target)
   } finally {

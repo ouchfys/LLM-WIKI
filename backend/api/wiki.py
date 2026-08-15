@@ -26,6 +26,7 @@ from backend.deps import (
 from backend.api.papers import (
     REPO_ROOT as PAPER_REPO_ROOT,
     UPLOAD_DIR as PAPER_UPLOAD_DIR,
+    _existing_pdf_ingestion,
     _resolve_data_pdf as _resolve_paper_data_pdf,
     _run_ingestion_job as _run_paper_ingestion_job,
     _safe_pdf_name as _safe_paper_pdf_name,
@@ -50,7 +51,10 @@ from system.wiki.maintenance.validator import WikiValidator
 from system.wiki.maintenance.web_update_agent import WebUpdateAgent
 from system.wiki.maintenance.web_source_ingestion import WebSourceIngestionProcessor
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore, normalize_alias
+from system.wiki.markdown_reindexer import MarkdownWikiReindexer
+from system.wiki.revision import WikiRevisionManager
 from system.wiki.wiki_store import WikiStore
+from system.agent_runtime import AgentRunStore, TraceRecorder
 
 REPO_ROOT = _Path(__file__).resolve().parents[2]
 STORAGE_LAYOUT = get_storage_layout()
@@ -72,6 +76,22 @@ class WikiChatPayload(BaseModel):
     message: str
     session_id: str = ""
     stream: bool = False
+
+
+class RevisionRollbackPayload(BaseModel):
+    reason: str = "manual rollback"
+
+
+class ApprovalDecisionPayload(BaseModel):
+    reason: str = ""
+
+
+class TableQueryPayload(BaseModel):
+    question: str
+    card_ids: list[str] = Field(default_factory=list)
+    source_packet_ids: list[str] = Field(default_factory=list)
+    sql: str = ""
+    limit: int = 6
 
 
 class XhsImportPayload(BaseModel):
@@ -633,7 +653,7 @@ def _build_xhs_schema_page(
 
 
 XHS_DISTILL_PROMPT = """\
-You are the Xiaohongshu interview-note distillation agent for Jarvis Notes.
+You are the Xiaohongshu interview-note distillation agent for LLM-WIKI.
 
 Goal:
 - Convert a short social/interview note into a useful InterviewQA knowledge page.
@@ -680,7 +700,7 @@ OCR text from images:
 XHS_REVIEW_PROMPT = """\
 You are the reviewer agent for a Xiaohongshu-to-Wiki card.
 
-Review whether the distilled card is useful, grounded, and safe to merge into Jarvis Notes.
+Review whether the distilled card is useful, grounded, and safe to merge into LLM-WIKI.
 Reject if it invents unsupported facts, is too generic, lacks interview questions, or contains raw JSON/noisy clipboard text.
 
 Return ONLY valid JSON:
@@ -789,7 +809,7 @@ def _normalize_xhs_distilled_content(
     normalized["title"] = title
     normalized["raw_source_path"] = raw_source_path
     normalized["compiler_model"] = compiler_model
-    normalized["pipeline"] = "xhs_four_agent"
+    normalized["pipeline"] = "xhs_compile"
     normalized["extractor_agent"] = "xiaohongshu_public_meta+ocr"
     normalized["distiller_agent"] = compiler_model or "summary_llm"
     normalized["reviewer_agent"] = "xhs_reviewer"
@@ -1889,7 +1909,8 @@ def create_wiki_ingestion_job(
     file: Optional[UploadFile] = File(None),
     local_path: str = Form(""),
     source_url: str = Form(""),
-    pipeline: str = Form("four_agent"),
+    pipeline: str = Form("wiki_compile"),
+    approval_mode: str = Form("risk"),
     store: WikiStore = Depends(get_wiki_store),
 ):
     if file and file.filename:
@@ -1908,6 +1929,10 @@ def create_wiki_ingestion_job(
     else:
         raise HTTPException(status_code=400, detail="Provide a PDF file or local_path.")
 
+    existing = _existing_pdf_ingestion(dest, store.db_path)
+    if existing:
+        return existing
+
     jobs = IngestionJobStore(db_path=store.db_path)
     job = jobs.create_job(
         source_type="paper_pdf",
@@ -1915,10 +1940,26 @@ def create_wiki_ingestion_job(
         stage="queued",
         metadata={
             "source_url": source_url,
-            "pipeline": pipeline or "four_agent",
+            "pipeline": pipeline or "wiki_compile",
             "filename": filename,
         },
     )
+    run = AgentRunStore(db_path=jobs.db_path).create_run(
+        run_type="paper_ingestion",
+        source_uri=source_uri,
+        approval_mode=approval_mode if approval_mode in {"risk", "manual", "auto"} else "risk",
+        ingestion_job_id=job["id"],
+        context={
+            "job_id": job["id"],
+            "pdf_path": str(dest.resolve()),
+            "source_url": source_url,
+            "pipeline": pipeline or "wiki_compile",
+        },
+    )
+    jobs.merge_metadata(job["id"], {
+        "agent_run_id": run["id"],
+        "approval_mode": run["approval_mode"],
+    })
     threading.Thread(
         target=_run_paper_ingestion_job,
         kwargs={
@@ -1926,11 +1967,20 @@ def create_wiki_ingestion_job(
             "job_id": job["id"],
             "pdf_path": str(dest.resolve()),
             "source_url": source_url,
-            "pipeline": pipeline or "four_agent",
+            "pipeline": pipeline or "wiki_compile",
+            "run_id": run["id"],
+            "approval_mode": run["approval_mode"],
         },
         daemon=True,
     ).start()
-    return {"ok": True, "job_id": job["id"], "job": job}
+    job = jobs.get_job(job["id"]) or job
+    return {
+        "ok": True,
+        "job_id": job["id"],
+        "agent_run_id": run["id"],
+        "job": job,
+        "run": run,
+    }
 
 
 @router.get("/ingest/jobs")
@@ -2174,7 +2224,7 @@ def import_xiaohongshu(payload: XhsImportPayload, store: WikiStore = Depends(get
         related_topics = list(dict.fromkeys((distilled_related or []) + fallback_related))
     else:
         content_json = _merge_operational_fields(fallback_content, operational_content)
-        content_json["pipeline"] = "xhs_four_agent"
+        content_json["pipeline"] = "xhs_compile"
         content_json["compile_status"] = "direct_source_fallback"
         content_json["review_status"] = "fallback"
         summary = fallback_summary or _summary(note.content, limit=220) or note.title
@@ -2418,6 +2468,71 @@ def get_storage_object(ref: str):
         raise HTTPException(status_code=404, detail="Storage object not found")
     content_type = mimetypes.guess_type(ref)[0] or "application/octet-stream"
     return Response(content=data, media_type=content_type)
+
+
+@router.get("/evidence/sources/{source_packet_id}/tables")
+def list_source_tables(source_packet_id: str, store: WikiStore = Depends(get_wiki_store)):
+    pipeline_store = PaperWikiPipelineStore(db_path=store.db_path)
+    if not pipeline_store.get_source_packet(source_packet_id):
+        raise HTTPException(status_code=404, detail="Source packet not found")
+    return {"source_packet_id": source_packet_id, "items": pipeline_store.list_source_tables(source_packet_id)}
+
+
+@router.post("/evidence/table-query")
+def query_structured_tables(payload: TableQueryPayload, chat: WikiChatService = Depends(get_wiki_chat)):
+    if not chat.table_qa:
+        raise HTTPException(status_code=503, detail="Table QA is unavailable")
+    try:
+        return chat.table_qa.answer(
+            payload.question,
+            card_ids=payload.card_ids,
+            source_packet_ids=payload.source_packet_ids,
+            sql=payload.sql,
+            limit=max(1, min(payload.limit, 20)),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{card_id}/revisions")
+def list_card_revisions(card_id: str, limit: int = 50, store: WikiStore = Depends(get_wiki_store)):
+    if not store.get_card(card_id):
+        raise HTTPException(status_code=404, detail="Wiki card not found")
+    revisions = PaperWikiPipelineStore(db_path=store.db_path).list_revisions(card_id, limit=limit)
+    return {"card_id": card_id, "items": revisions}
+
+
+@router.get("/{card_id}/claims")
+def list_card_claims(card_id: str, store: WikiStore = Depends(get_wiki_store)):
+    if not store.get_card(card_id):
+        raise HTTPException(status_code=404, detail="Wiki card not found")
+    claims = PaperWikiPipelineStore(db_path=store.db_path).list_page_claims(card_id)
+    return {"card_id": card_id, "items": claims}
+
+
+@router.post("/{card_id}/revisions/{revision_id}/rollback")
+def rollback_card_revision(
+    card_id: str,
+    revision_id: str,
+    payload: RevisionRollbackPayload,
+    store: WikiStore = Depends(get_wiki_store),
+):
+    card = store.get_card(card_id)
+    if not card:
+        raise HTTPException(status_code=404, detail="Wiki card not found")
+    pipeline_store = PaperWikiPipelineStore(db_path=store.db_path)
+    revision = pipeline_store.get_revision(revision_id)
+    if not revision or revision.get("page_id") != card_id:
+        raise HTTPException(status_code=404, detail="Wiki revision not found")
+    manager = WikiRevisionManager(
+        store=pipeline_store,
+        vault=store.vault,
+        reindexer=MarkdownWikiReindexer(db_path=store.db_path),
+    )
+    try:
+        return manager.rollback(revision_id, reason=payload.reason or "manual rollback")
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{card_id}")

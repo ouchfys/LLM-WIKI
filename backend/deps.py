@@ -9,6 +9,8 @@ from system.paper_index.store import PaperIndexStore
 from system.wiki.wiki_store import WikiStore
 from system.wiki.wiki_chat import WikiChatService
 from system.wiki.chunk_index import WikiChunkIndex
+from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
+from system.wiki.table_qa import TableQuestionAnswerer
 from system.search.resource_recommender import LearningResourceRecommender
 from system.search.web_fetch import WebFetchTool
 from system.search.web_search import WebSearchTool
@@ -195,4 +197,8 @@ def get_wiki_chat() -> WikiChatService:
         web_search=get_web_search(),
         web_fetch=get_web_fetch(),
         resource_recommender=get_resource_recommender(),
+        table_qa=TableQuestionAnswerer(
+            PaperWikiPipelineStore(db_path=get_wiki_store().db_path),
+            llm=get_chat_llm(),
+        ),
     )

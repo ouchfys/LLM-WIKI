@@ -6,6 +6,8 @@ from typing import Any
 
 from system.wiki.maintenance.candidates import MaintenanceCandidateStore
 from system.wiki.maintenance.store import WikiMaintenanceStore
+from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
+from system.wiki.wiki_store import WikiStore
 
 
 QUERY_INSIGHT_PROMPT = """\
@@ -56,6 +58,33 @@ __PAYLOAD__
 """
 
 
+SELECTION_ROUTING_PROMPT = """\
+You route a user-selected answer fragment into a personal research wiki.
+Decide whether it should UPDATE an existing wiki page or CREATE a new page.
+
+Return strict JSON only. Do not write markdown.
+
+You are given the user's question, their selected text, and a list of candidate
+existing wiki pages (each with id, title, page_type, summary). Choose update
+only when the selection genuinely belongs to one of the candidate pages; prefer
+create when it is a distinct concept or no candidate fits.
+
+Return this shape:
+{
+  "action": "update" | "create",
+  "target_card_id": "",   // required when action is update; MUST be one of the candidate ids
+  "reason": ""
+}
+
+Rules:
+- target_card_id MUST be copied verbatim from a candidate id. Never invent an id.
+- If unsure, choose create.
+
+Input:
+__PAYLOAD__
+"""
+
+
 class QueryInsightDistiller:
     """Distill archived answered queries into reviewable candidate payloads.
 
@@ -66,6 +95,8 @@ class QueryInsightDistiller:
     def __init__(self, db_path: str | Path | None = None, llm: Any = None):
         self.store = WikiMaintenanceStore(db_path=db_path)
         self.candidates = MaintenanceCandidateStore(db_path=db_path)
+        self.wiki_store = WikiStore(db_path=str(db_path) if db_path else None)
+        self.pipeline_store = PaperWikiPipelineStore(db_path=db_path)
         self.llm = llm
 
     def distill_pending(self, *, limit: int = 10) -> dict[str, Any]:
@@ -179,6 +210,34 @@ class QueryInsightDistiller:
                 "text": selected_text[:1200],
             }
         ]
+
+        # Knowledge reflux: prefer updating an existing Markdown page over
+        # spawning yet another low-signal "selected fragment" card. With an LLM,
+        # let it decide update-vs-create against recalled candidate pages;
+        # otherwise fall back to deterministic title/alias matching.
+        if self.llm:
+            target = self._resolve_target_card_llm(
+                title=title,
+                question=question,
+                selected_text=selected_text,
+                related_topics=related_topics,
+            )
+        else:
+            target = self._resolve_target_card(
+                title=title,
+                question=question,
+                selected_text=selected_text,
+                related_topics=related_topics,
+            )
+        if target:
+            return self._user_selection_update_candidate(
+                target=target,
+                question=question,
+                selected_text=selected_text,
+                evidence=evidence,
+                artifact=artifact,
+            )
+
         return {
             "status": "candidate_ready",
             "candidate_type": "source_note" if len(selected_text) < 180 else "concept_card",
@@ -197,6 +256,202 @@ class QueryInsightDistiller:
             "related_topics": related_topics,
             "reason": "user explicitly selected this answer fragment for wiki feedback",
         }
+
+    def _user_selection_update_candidate(
+        self,
+        *,
+        target: dict[str, Any],
+        question: str,
+        selected_text: str,
+        evidence: list[dict[str, Any]],
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build a card_update candidate targeting an existing wiki page.
+
+        The shape matches what MaintenanceCandidateProcessor._review expects for
+        a card_update: top-level target_card_id, changes(dict), evidence_basis(list).
+        """
+        note_lines = []
+        if question:
+            note_lines.append(f"Q: {question}")
+        note_lines.append(selected_text)
+        appended_note = "\n\n".join(line for line in note_lines if line).strip()
+        return {
+            "status": "candidate_ready",
+            "candidate_type": "card_update",
+            "target_card_id": target["id"],
+            "title": target.get("title", ""),
+            "summary": selected_text[:320] or question[:320],
+            "risk": "low",
+            "review_notes": f"Appended from a user-selected answer (query {artifact.get('query_id', '')}).".strip(),
+            "evidence_basis": [
+                {
+                    "fact": selected_text[:600],
+                    "source": "user_selection",
+                    "query_id": artifact.get("query_id", ""),
+                    "artifact_uri": artifact.get("artifact_uri", ""),
+                }
+            ],
+            "changes": {
+                "content_json": {
+                    "maintenance_notes": [appended_note] if appended_note else [],
+                },
+            },
+            "content_json": {
+                "schema_version": "query-insight-v1",
+                "source_type": "user_selection_update",
+                "question": question,
+                "notes": selected_text,
+                "evidence": evidence,
+                "target_card_id": target["id"],
+                "match_reason": target.get("match_reason", ""),
+                "source_query_id": artifact.get("query_id", ""),
+                "artifact_uri": artifact.get("artifact_uri", ""),
+            },
+            "related_topics": [target.get("title", "")] if target.get("title") else [],
+            "reason": f"user selection maps to existing wiki page via {target.get('match_reason', 'match')}",
+        }
+
+    def _recall_candidate_cards(
+        self,
+        *,
+        title: str,
+        question: str,
+        selected_text: str,
+        related_topics: list[str],
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Recall existing wiki pages that might host this selection."""
+        terms = [t for t in [title, question, selected_text[:120], *related_topics[:5]] if t]
+        cards: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for term in terms:
+            for card in self.wiki_store.search_cards(term, limit=5):
+                cid = str(card.get("id") or "")
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                cards.append({
+                    "id": cid,
+                    "title": str(card.get("title") or ""),
+                    "page_type": str(card.get("page_type") or ""),
+                    "summary": str(card.get("summary") or "")[:300],
+                })
+                if len(cards) >= limit:
+                    return cards
+        return cards
+
+    def _resolve_target_card_llm(
+        self,
+        *,
+        title: str,
+        question: str,
+        selected_text: str,
+        related_topics: list[str],
+    ) -> dict[str, Any] | None:
+        """LLM decides update-vs-create against recalled candidate pages.
+
+        Returns a target dict when the LLM picks a valid candidate to update;
+        returns None to mean "create a new page". Any LLM failure or invalid id
+        falls back to the deterministic resolver so behavior degrades safely.
+        """
+        candidates = self._recall_candidate_cards(
+            title=title,
+            question=question,
+            selected_text=selected_text,
+            related_topics=related_topics,
+        )
+        if not candidates:
+            return None
+
+        payload = {
+            "question": question,
+            "selected_text": selected_text[:1200],
+            "candidate_pages": candidates,
+        }
+        prompt = SELECTION_ROUTING_PROMPT.replace(
+            "__PAYLOAD__", json.dumps(payload, ensure_ascii=False, indent=2)
+        )
+        try:
+            raw = self.llm.invoke(prompt, temperature=0.0, max_tokens=400)
+            decision = json.loads(self._extract_json(raw))
+        except Exception as exc:
+            print(f"[QueryInsightDistiller] selection routing LLM failed: {exc}")
+            return self._resolve_target_card(
+                title=title,
+                question=question,
+                selected_text=selected_text,
+                related_topics=related_topics,
+            )
+
+        if not isinstance(decision, dict) or str(decision.get("action") or "") != "update":
+            return None
+        target_id = str(decision.get("target_card_id") or "")
+        # Whitelist: the LLM may only target a card it was actually shown.
+        allowed = {card["id"]: card for card in candidates}
+        if target_id not in allowed:
+            return None
+        chosen = allowed[target_id]
+        return {
+            "id": chosen["id"],
+            "title": chosen.get("title", ""),
+            "page_type": chosen.get("page_type", ""),
+            "match_reason": f"llm routing: {str(decision.get('reason') or 'update existing page')}"[:200],
+        }
+
+    def _resolve_target_card(
+        self,
+        *,
+        title: str,
+        question: str,
+        selected_text: str,
+        related_topics: list[str],
+    ) -> dict[str, Any] | None:
+        """Find the existing wiki page this selection should update, or None.
+
+        Conservative on purpose: only returns a target on a strong signal. We
+        search the wiki for candidate pages, then accept one only when its title
+        (or a known alias) appears as a whole phrase inside the user's question
+        or selected text. Fuzzy/semantic ranking is deferred to a later
+        LLM-assisted pass so we never silently merge into a loosely-related page.
+        """
+        haystack = f"{question}\n{selected_text}".lower()
+        if not haystack.strip():
+            return None
+
+        # Direct alias hit on the derived title / related terms is the strongest
+        # signal when it lands, so try it first.
+        alias_queries = [q for q in [title, *related_topics[:4]] if q]
+        alias_hit = self.pipeline_store.find_card_by_alias(alias_queries) if alias_queries else None
+        if alias_hit and alias_hit.get("card_id"):
+            card = self.wiki_store.get_card(str(alias_hit["card_id"]))
+            if card:
+                return {
+                    "id": card["id"],
+                    "title": card.get("title", ""),
+                    "page_type": card.get("page_type", ""),
+                    "match_reason": "normalized alias match",
+                }
+
+        # Otherwise, search the wiki and accept a candidate whose title appears
+        # verbatim in what the user actually selected/asked.
+        search_terms = [t for t in [title, question, selected_text[:120], *related_topics[:4]] if t]
+        seen_cards: set[str] = set()
+        for term in search_terms:
+            for card in self.wiki_store.search_cards(term, limit=5):
+                cid = str(card.get("id") or "")
+                if not cid or cid in seen_cards:
+                    continue
+                seen_cards.add(cid)
+                card_title = str(card.get("title") or "").strip()
+                if len(card_title) >= 3 and card_title.lower() in haystack:
+                    return {
+                        "id": cid,
+                        "title": card_title,
+                        "page_type": card.get("page_type", ""),
+                        "match_reason": "title appears in user selection",
+                    }
+        return None
 
     @staticmethod
     def _normalize_candidate(candidate: dict[str, Any], artifact: dict[str, Any]) -> dict[str, Any]:

@@ -9,7 +9,7 @@
         </div>
         <div class="chat-head-copy">
           <strong>{{ displaySessionTitle(currentSessionTitle) }}</strong>
-          <span>{{ messages.length > 1 ? `${messages.length} 条消息` : '私人知识库对话' }}</span>
+        <span>{{ messages.length > 1 ? `${messages.length} 条消息` : 'LLM-WIKI 对话' }}</span>
         </div>
         <div class="chat-head-side">
           <span v-if="activeCardTitle" class="active-context">{{ activeCardTitle }}</span>
@@ -42,66 +42,71 @@
           <div class="message-stack">
             <section class="session-entry">
               <header class="session-entry-meta">
-                <span>{{ message.role === 'assistant' ? 'Jarvis 回答' : '用户提问' }}</span>
-                <small>{{ message.role === 'assistant' ? '研究整理' : '问题记录' }}</small>
+                <span>{{ message.role === 'assistant' ? 'Wiki 回答' : '用户提问' }}</span>
+                <small>{{ message.role === 'assistant' ? 'Wiki Agent' : '问题记录' }}</small>
               </header>
 
-              <div
-                v-if="message.toolEvents?.length || message.toolPlan || message.trace"
-                class="evidence-stack"
+              <section
+                v-if="showProcess(message)"
+                class="agent-process"
+                :class="{ live: isMessageProcessing(message) }"
+                aria-label="检索过程"
               >
-                <div v-if="message.toolEvents?.length" class="tool-trace">
-                  <div
-                    v-for="event in message.toolEvents"
-                    :key="event.tool"
-                    class="tool-step"
-                    :class="event.status"
+                <header class="process-head">
+                  <div>
+                    <span class="process-live-dot"></span>
+                    <strong>{{ isMessageProcessing(message) ? '正在查找证据' : '检索过程' }}</strong>
+                  </div>
+                  <span>{{ processSummary(message) }}</span>
+                </header>
+
+                <ol class="process-timeline">
+                  <li
+                    v-for="(step, index) in processSteps(message)"
+                    :key="step.eventId || `${message.id}-${step.tool}-${index}`"
+                    class="process-step"
+                    :class="step.status"
                   >
-                    <span class="tool-dot"></span>
-                    <div>
-                      <strong>{{ event.label }}</strong>
-                      <small>{{ event.detail || (event.status === 'running' ? '运行中' : '完成') }}</small>
+                    <div class="process-marker">
+                      <span>{{ step.status === 'done' ? '✓' : index + 1 }}</span>
                     </div>
-                  </div>
-                </div>
+                    <div class="process-body">
+                      <header>
+                        <strong>{{ processStepTitle(step.tool) }}</strong>
+                        <span>{{ processStatusLabel(step.status) }}</span>
+                      </header>
+                      <p>{{ processStepDetail(step) }}</p>
 
-                <section v-if="message.toolPlan || message.trace" class="agent-trace-panel">
-                  <div class="trace-head">
-                    <strong>证据链路</strong>
-                    <span>{{ traceSummary(message) }}</span>
-                  </div>
+                      <div v-if="step.items?.length" class="process-results">
+                        <template v-for="(item, itemIndex) in step.items" :key="item.card_id || item.cell_id || item.url || `${step.eventId}-${itemIndex}`">
+                          <button
+                            v-if="item.card_id"
+                            type="button"
+                            class="process-card-result"
+                            @click="openProcessCard(item)"
+                          >
+                            <span>{{ item.page_type || 'WikiPage' }}</span>
+                            <strong>{{ item.title }}</strong>
+                            <small v-if="item.score !== undefined">匹配分 {{ formatScore(item.score) }} · {{ formatMatchReason(item.match_reason) }}</small>
+                            <small v-else>{{ item.summary || '已读取页面正文与关联关系' }}</small>
+                          </button>
 
-                  <div v-if="message.toolPlan?.tools?.length" class="trace-tools">
-                    <div
-                      v-for="tool in message.toolPlan.tools"
-                      :key="`${message.id}-${tool.name}-${tool.query}`"
-                      class="trace-tool-chip"
-                    >
-                      <strong>{{ tool.name }}</strong>
-                      <span>{{ tool.reason || tool.query }}</span>
+                          <div v-else-if="step.tool === 'table_query'" class="process-cell-result">
+                            <span>{{ item.row_label || item.source_title }} × {{ item.column_label || '匹配列' }}</span>
+                            <strong>{{ normalizeCellValue(item.value) }}</strong>
+                            <small>{{ item.page ? `第 ${item.page} 页` : item.table_id }}</small>
+                          </div>
+
+                          <div v-else class="process-generic-result">
+                            <strong>{{ item.title || item.url || '工具结果' }}</strong>
+                            <small>{{ item.snippet || item.summary || '' }}</small>
+                          </div>
+                        </template>
+                      </div>
                     </div>
-                  </div>
-
-                  <div v-if="message.trace?.retrieved_cards?.length" class="trace-card-grid">
-                    <button
-                      v-for="card in message.trace.retrieved_cards"
-                      :key="card.card_id"
-                      type="button"
-                      class="trace-card"
-                      @click="openTraceCard(card)"
-                    >
-                      <span>{{ card.page_type }}</span>
-                      <strong>{{ card.title }}</strong>
-                      <small>{{ card.matched_chunks?.[0] || card.summary }}</small>
-                    </button>
-                  </div>
-
-                  <div v-if="message.trace?.web_results?.length || message.trace?.resources?.length" class="trace-extra">
-                    <span v-if="message.trace?.web_results?.length">网页 {{ message.trace.web_results.length }}</span>
-                    <span v-if="message.trace?.resources?.length">资源 {{ message.trace.resources.length }}</span>
-                  </div>
-                </section>
-              </div>
+                  </li>
+                </ol>
+              </section>
 
               <div class="message-text" v-html="renderMarkdown(message.content)"></div>
 
@@ -238,11 +243,34 @@ type LearningResource = {
   snippet?: string
 }
 
+type ToolEventItem = {
+  card_id?: string
+  title?: string
+  page_type?: string
+  summary?: string
+  markdown_path?: string
+  score?: number
+  match_reason?: string
+  source_title?: string
+  table_id?: string
+  page?: number
+  row_label?: string
+  column_label?: string
+  value?: string
+  cell_id?: string
+  url?: string
+  snippet?: string
+}
+
 type ToolEvent = {
+  eventId?: string
   tool: string
   label: string
   status: 'running' | 'done' | 'error'
   detail?: string
+  query?: string
+  reason?: string
+  items?: ToolEventItem[]
 }
 
 type ToolPlan = {
@@ -266,6 +294,13 @@ type TraceCard = {
 
 type AgentTrace = {
   tool_plan?: ToolPlan
+  tool_observations?: Array<{
+    tool: string
+    query?: string
+    status: 'running' | 'done' | 'error'
+    summary?: string
+    items?: ToolEventItem[]
+  }>
   retrieved_cards?: TraceCard[]
   web_results?: Array<{ title: string; url: string; snippet?: string }>
   resources?: LearningResource[]
@@ -305,7 +340,7 @@ type SseChunk =
   | { type: 'resource_list'; resources?: LearningResource[] }
   | { type: 'tool_plan'; plan?: ToolPlan }
   | { type: 'agent_trace'; trace?: AgentTrace }
-  | { type: 'tool_status'; tool: string; label: string; status: 'running' | 'done' | 'error'; detail?: string }
+  | { type: 'tool_status'; event_id?: string; tool: string; label: string; status: 'running' | 'done' | 'error'; detail?: string; query?: string; reason?: string; items?: ToolEventItem[] }
   | { type: 'token'; text?: string }
   | { type: 'profile'; updates?: Array<{ signal_type: string; value: string }> }
   | { type: 'error'; message?: string }
@@ -523,16 +558,139 @@ function captureButtonText(message: ChatMessage) {
   return selectedInsight.value?.messageId === message.id ? '加入选中内容' : '加入整段'
 }
 
-function traceSummary(message: ChatMessage) {
-  const trace = message.trace
-  const plan = message.toolPlan || trace?.tool_plan
-  const parts = []
-  if (plan?.use_wiki) parts.push('Wiki')
-  if (plan?.use_web) parts.push('网页')
-  if (plan?.use_resources) parts.push('资源')
-  const cardCount = trace?.diagnostics?.wiki_card_count ?? trace?.retrieved_cards?.length ?? 0
-  if (cardCount) parts.push(`${cardCount} 张卡片`)
-  return parts.join(' / ') || '暂无轨迹'
+function isMessageProcessing(message: ChatMessage) {
+  return Boolean(
+    sending.value
+    && message.role === 'assistant'
+    && messages.value[messages.value.length - 1]?.id === message.id
+  )
+}
+
+function processSteps(message: ChatMessage): ToolEvent[] {
+  if (message.toolEvents?.length) return message.toolEvents
+
+  const observations = message.trace?.tool_observations || []
+  if (observations.length) {
+    return observations.map((item, index) => ({
+      eventId: `${item.tool}:${item.query || index}`,
+      tool: item.tool,
+      label: item.tool,
+      status: item.status || 'done',
+      detail: item.summary,
+      query: item.query,
+      items: (item.items || []).slice(0, 4)
+    }))
+  }
+
+  if (isMessageProcessing(message)) {
+    return [{
+      eventId: `planning:${message.id}`,
+      tool: 'planning',
+      label: 'Planning',
+      status: 'running',
+      detail: '正在分析问题并选择可审计的检索工具。',
+      items: []
+    }]
+  }
+
+  return (message.toolPlan?.tools || []).map((tool, index) => ({
+    eventId: `${tool.name}:${tool.query || index}`,
+    tool: tool.name,
+    label: tool.name,
+    status: 'done',
+    detail: tool.reason,
+    query: tool.query,
+    items: []
+  }))
+}
+
+function showProcess(message: ChatMessage) {
+  return message.role === 'assistant' && (isMessageProcessing(message) || processSteps(message).length > 0)
+}
+
+function processSummary(message: ChatMessage) {
+  const steps = processSteps(message)
+  if (isMessageProcessing(message)) {
+    const active = steps.find((step) => step.status === 'running')
+    if (active) return processStepTitle(active.tool)
+    return message.content.trim() ? '正在生成回答' : '正在规划下一步'
+  }
+  const cardCount = message.trace?.diagnostics?.wiki_card_count ?? message.trace?.retrieved_cards?.length ?? 0
+  return `${steps.length} 步${cardCount ? ` · ${cardCount} 张 Wiki 卡片` : ''}`
+}
+
+function processStepTitle(tool: string) {
+  const labels: Record<string, string> = {
+    planning: '规划检索路径',
+    context: '解析对话上下文',
+    wiki_search: '搜索 Wiki',
+    wiki_card: '阅读 Wiki 页面',
+    table_query: '核验表格证据',
+    web_search: '搜索外部资料',
+    web_fetch: '读取网页原文',
+    resource_recommend: '查找延伸资源'
+  }
+  return labels[tool] || tool
+}
+
+function processStatusLabel(status: ToolEvent['status']) {
+  return ({ running: '进行中', done: '已完成', error: '失败' } as Record<string, string>)[status] || status
+}
+
+function extractCount(detail: string | undefined) {
+  const match = String(detail || '').match(/\d+/)
+  return match ? Number(match[0]) : 0
+}
+
+function processStepDetail(step: ToolEvent) {
+  if (step.status === 'running') {
+    const query = step.query ? `“${step.query}”` : '当前问题'
+    const runningCopy: Record<string, string> = {
+      planning: '正在分析问题并选择可审计的检索工具。',
+      context: '正在结合最近对话补全当前问题。',
+      wiki_search: `正在用 ${query} 匹配标题、别名与 Wiki 索引。`,
+      wiki_card: '正在打开高相关页面，读取 Markdown 正文与页面关系。',
+      table_query: '正在定位表格、行列和原始单元格证据。',
+      web_search: `正在搜索 ${query} 的外部信息。`,
+      web_fetch: '正在读取候选网页的正文段落。',
+      resource_recommend: '正在筛选相关学习资料。'
+    }
+    return runningCopy[step.tool] || step.detail || '正在执行工具。'
+  }
+
+  const count = extractCount(step.detail)
+  if (step.tool === 'wiki_search') return `找到 ${count || step.items?.length || 0} 个候选页面，并保留匹配分与命中原因。`
+  if (step.tool === 'wiki_card') return `已读取 ${count || step.items?.length || 0} 张高相关 Wiki 页面。`
+  if (step.tool === 'table_query') return step.detail || '已定位表格单元格及页码。'
+  if (step.tool === 'context') return '已结合最近对话解析追问指代。'
+  return step.detail || (step.status === 'error' ? '工具执行失败。' : '工具执行完成。')
+}
+
+function formatScore(score: number | undefined) {
+  if (score === undefined || Number.isNaN(Number(score))) return '—'
+  return Number(score).toFixed(1)
+}
+
+function formatMatchReason(reason: string | undefined) {
+  if (!reason) return '语义匹配'
+  return reason
+    .replace('page_fts', '页面全文命中')
+    .replace(/term_overlap:(\d+)\/(\d+)/, '关键词重合 $1/$2')
+}
+
+function normalizeCellValue(value: string | undefined) {
+  return String(value || '—').replace(/\s*\.\s*/g, '.').replace(/\s+%/g, '%')
+}
+
+function openProcessCard(item: ToolEventItem) {
+  if (!item.card_id || !item.title) return
+  openTraceCard({
+    card_id: item.card_id,
+    title: item.title,
+    page_type: item.page_type || 'WikiPage',
+    summary: item.summary || '',
+    markdown_path: item.markdown_path || ''
+  })
 }
 
 function handleComposeKeydown(event: KeyboardEvent) {
@@ -588,12 +746,17 @@ function handleStreamChunk(chunk: SseChunk, assistantMessage: ChatMessage) {
 
   if (chunk.type === 'tool_status') {
     const events = assistantMessage.toolEvents || []
-    const index = events.findIndex((item) => item.tool === chunk.tool)
+    const eventId = chunk.event_id || `${chunk.tool}:${chunk.query || ''}`
+    const index = events.findIndex((item) => item.eventId === eventId)
     const nextEvent: ToolEvent = {
+      eventId,
       tool: chunk.tool,
       label: chunk.label,
       status: chunk.status,
-      detail: chunk.detail
+      detail: chunk.detail,
+      query: chunk.query,
+      reason: chunk.reason,
+      items: chunk.items || []
     }
     if (index >= 0) {
       events[index] = nextEvent
@@ -1267,195 +1430,241 @@ onMounted(async () => {
   text-underline-offset: 3px;
 }
 
-.evidence-stack {
+.agent-process {
   display: grid;
-  gap: 10px;
-}
-
-.tool-trace {
-  display: grid;
-  gap: 8px;
-}
-
-.tool-step {
-  display: grid;
-  grid-template-columns: 10px minmax(0, 1fr);
-  gap: 9px;
-  align-items: start;
-  padding: 8px 10px;
-  border: 1px solid rgba(195, 214, 202, 0.14);
-  border-radius: 10px;
-  background: rgba(29, 25, 19, 0.56);
-}
-
-.tool-dot {
-  width: 8px;
-  height: 8px;
-  margin-top: 6px;
-  border-radius: 999px;
-  background: #f59e0b;
-  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.12);
-}
-
-.tool-step.done .tool-dot {
-  background: #10b981;
-  box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.12);
-}
-
-.tool-step.error .tool-dot {
-  background: #ef4444;
-  box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.12);
-}
-
-.tool-step strong,
-.tool-step small {
-  display: block;
-}
-
-.tool-step strong {
-  color: var(--desk-accent-bright);
-  font-size: 12px;
-}
-
-.tool-step small {
-  margin-top: 2px;
-  color: var(--ink-text-muted);
-  font-size: 11px;
-  line-height: 1.45;
-}
-
-.agent-trace-panel {
-  display: grid;
-  gap: 10px;
-  padding: 12px;
+  gap: 13px;
+  padding: 14px 15px 15px;
   border: 1px solid rgba(195, 214, 202, 0.16);
-  border-radius: 12px;
+  border-radius: 13px;
   background:
-    linear-gradient(135deg, rgba(155, 184, 173, 0.1), rgba(29, 25, 19, 0.62)),
-    rgba(29, 25, 19, 0.72);
+    radial-gradient(circle at 0 0, rgba(155, 184, 173, 0.1), transparent 32%),
+    rgba(17, 16, 13, 0.74);
 }
 
-.trace-head {
+.process-head,
+.process-head > div,
+.process-body > header {
   display: flex;
   align-items: center;
+}
+
+.process-head {
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.process-head > div {
+  gap: 9px;
+}
+
+.process-head strong {
+  color: var(--desk-accent-bright);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.process-head > span {
+  color: var(--desk-signal);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+}
+
+.process-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #8fa99e;
+  box-shadow: 0 0 0 4px rgba(155, 184, 173, 0.11);
+}
+
+.agent-process.live .process-live-dot {
+  animation: process-pulse 1.35s ease-out infinite;
+}
+
+@keyframes process-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(155, 184, 173, 0.34); }
+  72%, 100% { box-shadow: 0 0 0 8px rgba(155, 184, 173, 0); }
+}
+
+.process-timeline {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.process-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 11px;
+  padding: 0 0 15px;
+}
+
+.process-step:last-child {
+  padding-bottom: 0;
+}
+
+.process-step:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  top: 25px;
+  bottom: 2px;
+  width: 1px;
+  background: rgba(195, 214, 202, 0.14);
+}
+
+.process-marker {
+  position: relative;
+  z-index: 1;
+  width: 25px;
+  height: 25px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(195, 214, 202, 0.18);
+  border-radius: 7px;
+  background: #15130f;
+  color: var(--ink-text-muted);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  font-weight: 750;
+}
+
+.process-step.running .process-marker {
+  border-color: rgba(155, 184, 173, 0.38);
+  color: #d4e3d8;
+}
+
+.process-step.done .process-marker {
+  border-color: rgba(74, 222, 128, 0.2);
+  background: rgba(34, 197, 94, 0.08);
+  color: #acd4b7;
+}
+
+.process-step.error .process-marker {
+  border-color: rgba(244, 63, 94, 0.22);
+  background: rgba(244, 63, 94, 0.08);
+  color: #fda4af;
+}
+
+.process-body {
+  min-width: 0;
+  padding-top: 2px;
+}
+
+.process-body > header {
   justify-content: space-between;
   gap: 12px;
 }
 
-.trace-head strong {
-  color: var(--desk-accent-bright);
-  font-size: 12px;
-}
-
-.trace-head span {
-  color: var(--desk-signal);
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 11px;
-}
-
-.trace-tools {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.trace-tool-chip {
-  display: grid;
-  gap: 3px;
-  max-width: 260px;
-  padding: 7px 9px;
-  border: 1px solid rgba(195, 214, 202, 0.12);
-  border-radius: 8px;
-  background: rgba(17, 16, 13, 0.68);
-}
-
-.trace-tool-chip strong {
+.process-body > header strong {
   color: var(--ink-text);
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 650;
 }
 
-.trace-tool-chip span {
-  overflow: hidden;
+.process-body > header span {
+  color: var(--ink-text-muted);
+  font-size: 10px;
+}
+
+.process-step.running .process-body > header span {
+  color: #c2d6ca;
+}
+
+.process-body > p {
+  margin: 4px 0 0;
   color: var(--ink-text-muted);
   font-size: 11px;
-  line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.55;
+  text-wrap: pretty;
 }
 
-.trace-card-grid {
+.process-results {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 7px;
+  margin-top: 9px;
 }
 
-.trace-card {
-  display: grid;
-  gap: 5px;
+.process-card-result,
+.process-cell-result,
+.process-generic-result {
   min-width: 0;
-  padding: 12px 14px;
-  border: 1px solid rgba(195, 214, 202, 0.16);
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid rgba(195, 214, 202, 0.11);
   border-radius: 8px;
-  background:
-    linear-gradient(135deg, rgba(155, 184, 173, 0.12), rgba(29, 25, 19, 0.62)),
-    rgba(29, 25, 19, 0.72);
-  color: #eef7f2;
+  background: rgba(29, 25, 19, 0.58);
+  color: var(--ink-text);
   text-align: left;
+}
+
+.process-card-result {
   cursor: pointer;
+  transition: border-color 180ms ease, background 180ms ease, transform 180ms ease;
 }
 
-.trace-card:hover {
-  border-color: rgba(195, 214, 202, 0.42);
-  background:
-    linear-gradient(135deg, rgba(155, 184, 173, 0.22), rgba(29, 25, 19, 0.72)),
-    rgba(29, 25, 19, 0.82);
+.process-card-result:hover {
+  border-color: rgba(195, 214, 202, 0.32);
+  background: rgba(155, 184, 173, 0.1);
+  transform: translateY(-1px);
 }
 
-.trace-card:focus-visible {
+.process-card-result:focus-visible {
   outline: 2px solid #c2d6ca;
   outline-offset: 2px;
 }
 
-.trace-card span {
-  color: #c2d6ca;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.07em;
+.process-card-result > span,
+.process-cell-result > span {
+  color: #a8bdb3;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 
-.trace-card strong {
+.process-card-result > strong,
+.process-generic-result > strong {
   overflow: hidden;
-  color: var(--ink-text);
-  font-size: 14px;
-  line-height: 1.35;
+  font-size: 11px;
+  line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.trace-card small {
-  display: -webkit-box;
+.process-card-result > small,
+.process-cell-result > small,
+.process-generic-result > small {
   overflow: hidden;
-  color: var(--desk-signal);
-  font-size: 11px;
-  line-height: 1.45;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  color: var(--ink-text-muted);
+  font-size: 9px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.trace-extra {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+.process-cell-result {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
 }
 
-.trace-extra span {
-  padding: 4px 8px;
-  border: 1px solid rgba(195, 214, 202, 0.14);
-  border-radius: 7px;
-  background: rgba(155, 184, 173, 0.1);
-  color: var(--desk-accent-bright);
-  font-size: 11px;
+.process-cell-result > span,
+.process-cell-result > small {
+  grid-column: 1;
+}
+
+.process-cell-result > strong {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  color: #dce9e3;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
 }
 
 .evidence-rail {

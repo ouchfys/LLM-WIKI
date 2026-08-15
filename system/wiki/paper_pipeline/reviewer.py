@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from system.core.llm_call import invoke_structured
+
 from system.wiki.paper_pipeline.distiller import parse_json_object
 from system.wiki.paper_pipeline.models import DistilledCandidate, ReviewReport
-from system.wiki.paper_pipeline.store import PaperWikiPipelineStore, normalize_alias
+from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
+from system.wiki.evidence_verifier import EvidenceVerifier
 from system.wiki.wiki_builder import sanitize_wiki_text
 from system.wiki.wiki_store import CARD_TYPES, WikiStore
 
@@ -64,12 +67,38 @@ class PaperReviewAgent:
         self.wiki_store = wiki_store
         self.llm = llm
         self.llm_calls = 0
+        self.evidence_verifier = EvidenceVerifier(pipeline_store, llm=llm)
 
     def review(self, candidate: DistilledCandidate) -> ReviewReport:
         schema_errors = self._schema_errors(candidate)
-        unsupported_claims = self._unsupported_claims(candidate)
+        preflight_unsupported = self._unsupported_claims(candidate)
+        evidence_results = self.evidence_verifier.bind_and_verify_candidate(candidate)
+        verifier_unsupported = [
+            result.statement or "(empty claim)"
+            for result in evidence_results
+            if result.result == "unsupported"
+        ]
+        unsupported_claims = preflight_unsupported + verifier_unsupported
+        unsupported_claims = list(dict.fromkeys(unsupported_claims))
+        # A claim-aware compiler should not discard an otherwise valid paper or
+        # concept because one generated claim failed verification. Keep the
+        # rejection in the report, but pass only verified claims to the merger.
+        candidate.claims = [
+            claim
+            for claim, result in zip(candidate.claims, evidence_results)
+            if result.result in {"supported", "legacy_unverified"}
+        ]
         duplicate = self._duplicate_candidate(candidate)
-        deterministic = self._deterministic_report(candidate, schema_errors, unsupported_claims, duplicate)
+        evidence_quality = (
+            "verified" if candidate.claims and not unsupported_claims and any(result.result == "supported" for result in evidence_results)
+            else "verified_partial" if candidate.claims and verifier_unsupported and any(result.result == "supported" for result in evidence_results)
+            else "legacy_unverified" if candidate.claims and not unsupported_claims
+            else "weak"
+        )
+        deterministic = self._deterministic_report(
+            candidate, schema_errors, unsupported_claims, preflight_unsupported, duplicate, evidence_quality,
+            [result.as_dict() for result in evidence_results],
+        )
         similar_cards = self._similar_cards(candidate) if self._should_use_llm(candidate, schema_errors, unsupported_claims, duplicate) else []
         report = self._llm_report(candidate, schema_errors, unsupported_claims, duplicate, similar_cards) if similar_cards or duplicate else None
         report = report or deterministic
@@ -83,10 +112,13 @@ class PaperReviewAgent:
         candidate: DistilledCandidate,
         schema_errors: list[str],
         unsupported_claims: list[str],
+        preflight_unsupported: list[str],
         duplicate: dict | None,
+        evidence_quality: str,
+        claim_verifications: list[dict[str, Any]],
     ) -> ReviewReport:
         status = "approved"
-        if schema_errors or unsupported_claims:
+        if schema_errors or preflight_unsupported or not candidate.claims:
             status = "needs_revision" if candidate.candidate_type == "paper_page" else "rejected"
         recommendation = self._merge_recommendation(candidate, duplicate, status)
         report = ReviewReport(
@@ -94,9 +126,10 @@ class PaperReviewAgent:
             status=status,
             schema_errors=schema_errors,
             unsupported_claims=unsupported_claims,
-            evidence_quality="good" if candidate.claims and not unsupported_claims else "weak",
+            evidence_quality=evidence_quality,
             duplicate_candidates=[duplicate] if duplicate else [],
             merge_recommendation=recommendation,
+            claim_verifications=claim_verifications,
         )
         return report
 
@@ -127,7 +160,7 @@ class PaperReviewAgent:
         prompt = REVIEW_PROMPT.format(payload=json.dumps(payload, ensure_ascii=False, indent=2))
         try:
             self.llm_calls += 1
-            raw = self.llm.invoke(prompt, temperature=0.0, max_tokens=2200)
+            raw = invoke_structured(self.llm, prompt, temperature=0.0, max_tokens=2200)
         except Exception as exc:
             print(f"[paper_pipeline.reviewer] review LLM failed: {exc}")
             return None
@@ -145,6 +178,7 @@ class PaperReviewAgent:
                     item for item in (parsed.get("duplicate_candidates") or []) if isinstance(item, dict)
                 ],
                 merge_recommendation=parsed.get("merge_recommendation") if isinstance(parsed.get("merge_recommendation"), dict) else {},
+                claim_verifications=[item for item in parsed.get("claim_verifications") or [] if isinstance(item, dict)],
             )
         except Exception:
             return None
@@ -175,6 +209,7 @@ class PaperReviewAgent:
             report.merge_recommendation["target_card_id"] = ""
         report.schema_errors = list(dict.fromkeys(deterministic.schema_errors + report.schema_errors))
         report.unsupported_claims = list(dict.fromkeys(deterministic.unsupported_claims + report.unsupported_claims))
+        report.claim_verifications = deterministic.claim_verifications
         if report.schema_errors or report.unsupported_claims:
             report.status = deterministic.status
         return report
@@ -194,7 +229,7 @@ class PaperReviewAgent:
             return False
         if duplicate:
             return False
-        return False
+        return True
 
     @staticmethod
     def _schema_errors(candidate: DistilledCandidate) -> list[str]:
@@ -232,12 +267,24 @@ class PaperReviewAgent:
         alias_hit = self.pipeline_store.find_card_by_alias(aliases)
         if alias_hit:
             card = self.wiki_store.get_card(alias_hit["card_id"])
-            return {
-                "existing_card_id": alias_hit["card_id"],
-                "existing_title": card.get("title", alias_hit["alias"]) if card else alias_hit["alias"],
-                "confidence": 0.98,
-                "reason": "normalized alias match",
-            }
+            # The alias index is global and ignores page_type, so a MethodPage
+            # candidate can alias-match a same-named ConceptPage card. Only treat
+            # it as a duplicate when the page_type matches; otherwise fall through
+            # so distinct knowledge is not merged into the wrong card.
+            if card and str(card.get("page_type") or "") == candidate.page_type:
+                return {
+                    "existing_card_id": alias_hit["card_id"],
+                    "existing_title": card.get("title", alias_hit["alias"]),
+                    "confidence": 0.98,
+                    "reason": "normalized alias match",
+                }
+            if not card:
+                return {
+                    "existing_card_id": alias_hit["card_id"],
+                    "existing_title": alias_hit["alias"],
+                    "confidence": 0.98,
+                    "reason": "normalized alias match",
+                }
         existing = self.wiki_store.find_duplicate(
             title=candidate.title,
             page_type=candidate.page_type,

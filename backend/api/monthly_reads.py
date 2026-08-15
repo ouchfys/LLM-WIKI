@@ -66,7 +66,7 @@ DEMO_READING_ITEMS = [
         "id": "demo-graphrag",
         "title": "From Local to Global: A Graph RAG Approach to Query-Focused Summarization",
         "url": "https://arxiv.org/abs/2404.16130",
-        "summary": "GraphRAG 代表性工作，强调用图结构组织实体、社区和证据，适合解释本项目为什么保留 GraphRAG 精读能力。",
+        "summary": "研究如何用图结构组织实体、社区和证据，是比较不同知识组织与查询策略的背景材料。",
         "source_type": "paper",
         "source_level": "primary",
         "authors": ["Darren Edge", "Ha Trinh", "Newman Cheng"],

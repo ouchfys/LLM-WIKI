@@ -3,5 +3,4 @@
 __all__ = [
     "config",
     "siliconflow_client",
-    "prompt_templates",
 ]

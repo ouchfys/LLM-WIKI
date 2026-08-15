@@ -103,6 +103,7 @@ class SiliconFlowChat:
             temperature=temperature,
             max_tokens=max_tokens,
             response_format=kwargs.get("response_format"),
+            enable_thinking=kwargs.get("enable_thinking"),
         )
 
         new_history = (history or []) + [(prompt, response_text)]
@@ -198,6 +199,10 @@ class SiliconFlowChat:
             "stream": False,
             "tools": tools,
             "tool_choice": tool_choice,
+            # SiliconFlow reasoning models can spend the whole completion budget
+            # on hidden reasoning and return an empty tool-call message. Native
+            # function calling is a structured-output path, so disable thinking.
+            "enable_thinking": False,
         }
 
         for attempt in range(1, self.max_retries + 1):
@@ -319,6 +324,7 @@ class SiliconFlowChat:
         temperature: float = None,
         max_tokens: int = None,
         response_format: Optional[Dict[str, Any]] = None,
+        enable_thinking: Optional[bool] = None,
     ) -> str:
         """带重试的 API 调用"""
         payload = {
@@ -330,6 +336,8 @@ class SiliconFlowChat:
         }
         if response_format:
             payload["response_format"] = response_format
+        if enable_thinking is not None:
+            payload["enable_thinking"] = enable_thinking
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -377,11 +385,11 @@ class SiliconFlowEmbeddings:
     """
     硅基流动 Embedding API 客户端
     
-    兼容 LangChain 的 Embeddings 接口:
+    提供批量与单条文本向量接口:
       - embed_documents(texts) -> List[List[float]]
       - embed_query(text) -> List[float]
     
-    可直接传入 Neo4jVector.from_documents / from_existing_graph 等方法。
+    当前 Wiki 主查询链路不依赖该兼容客户端。
     """
 
     def __init__(

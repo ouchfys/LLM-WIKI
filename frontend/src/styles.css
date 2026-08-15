@@ -651,22 +651,68 @@ a {
 }
 
 @media (max-width: 780px) {
-  .app-shell,
+  .app-shell {
+    padding: 8px;
+  }
+
   .app-workspace {
-    padding: 12px;
+    padding: 10px;
   }
 
   .desktop-shell {
-    min-height: calc(100dvh - 24px);
+    min-height: calc(100dvh - 16px);
+    border-radius: 16px;
   }
 
   .sidebar-top {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .app-sidebar {
+    min-height: auto;
+    padding: 14px 12px 12px;
+    gap: 0;
   }
 
   .new-chat-button {
-    width: 100%;
+    width: auto;
+    min-width: 92px;
+  }
+
+  .sidebar-section {
+    margin-top: 12px;
+  }
+
+  .sidebar-label {
+    display: none;
+  }
+
+  .sidebar-nav {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    overflow: visible;
+  }
+
+  .sidebar-nav-item {
     min-width: 0;
+    min-height: 42px;
+    display: block;
+    padding: 9px 7px;
+    text-align: center;
+  }
+
+  .sidebar-nav-item .nav-dot,
+  .sidebar-nav-item div > span {
+    display: none;
+  }
+
+  .sidebar-nav-item strong {
+    overflow: hidden;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .metric-grid {

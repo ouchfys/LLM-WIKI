@@ -4,6 +4,8 @@ import json
 import uuid
 from typing import Any
 
+from system.core.llm_call import invoke_structured
+
 from system.wiki.paper_pipeline.distiller import parse_json_object
 from system.wiki.paper_pipeline.models import DistilledCandidate, MergePlan, MergeResult, ReviewReport, SourcePacket
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
@@ -11,6 +13,9 @@ from system.wiki.markdown_reindexer import MarkdownWikiReindexer
 from system.wiki.markdown_vault import MarkdownVault
 from system.wiki.wiki_builder import sanitize_wiki_text
 from system.wiki.wiki_store import WikiStore
+from system.wiki.hierarchical_compiler import HierarchicalWikiCompiler
+from system.wiki.claim_relation_resolver import ClaimRelationResolver
+from system.wiki.revision import WikiRevisionManager
 
 ALLOWED_ACTIONS = {"create_new", "update_existing", "link_only", "skip_duplicate", "needs_human_review"}
 ALLOWED_UPDATE_MODES = {"keep", "replace", "append", "append_list"}
@@ -160,13 +165,17 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 
 class PaperMergeAgent:
-    def __init__(self, pipeline_store: PaperWikiPipelineStore, wiki_store: WikiStore, llm=None):
+    def __init__(self, pipeline_store: PaperWikiPipelineStore, wiki_store: WikiStore, llm=None, approval_mode: str = "auto"):
         self.pipeline_store = pipeline_store
         self.wiki_store = wiki_store
         self.markdown_vault = MarkdownVault()
         self.markdown_reindexer = MarkdownWikiReindexer(db_path=wiki_store.db_path)
         self.llm = llm
         self.llm_calls = 0
+        self.compiler = HierarchicalWikiCompiler()
+        self.relation_resolver = ClaimRelationResolver(llm=llm)
+        self.approval_mode = approval_mode if approval_mode in {"auto", "manual", "risk"} else "risk"
+        self.proposals: list[dict[str, Any]] = []
 
     def merge(
         self,
@@ -178,17 +187,26 @@ class PaperMergeAgent:
         paper_candidate = next((item for item in candidates if item.candidate_type == "paper_page"), None)
         if paper_candidate:
             paper_report = reports.get(paper_candidate.id)
-            result.paper_card_id = self._merge_paper(packet, paper_candidate, paper_report)
-            self._record_merge_audit(
-                packet=packet,
-                candidate=paper_candidate,
-                report=paper_report,
-                plan=MergePlan(action="create_new", reason="paper page upsert", confidence=1.0),
-                paper_card_id=result.paper_card_id,
-                result_card_id=result.paper_card_id,
-                status="applied",
-                result=result,
-            )
+            if paper_report and paper_report.status == "approved":
+                result.paper_card_id = self._merge_paper(packet, paper_candidate, paper_report)
+                self._record_merge_audit(
+                    packet=packet,
+                    candidate=paper_candidate,
+                    report=paper_report,
+                    plan=MergePlan(action="create_new", reason="paper page upsert", confidence=1.0),
+                    paper_card_id=result.paper_card_id,
+                    result_card_id=result.paper_card_id,
+                    status="applied",
+                    result=result,
+                )
+            else:
+                result.review_rejections.append({
+                    "title": paper_candidate.title,
+                    "page_type": paper_candidate.page_type,
+                    "status": paper_report.status if paper_report else "missing_review",
+                    "errors": (paper_report.schema_errors if paper_report else []) + (paper_report.unsupported_claims if paper_report else []),
+                })
+                return result
 
         for candidate in candidates:
             if candidate.candidate_type == "paper_page":
@@ -255,12 +273,16 @@ class PaperMergeAgent:
                 status="applied",
                 result=result,
             )
-            self.pipeline_store.add_card_link(
-                from_card_id=result.paper_card_id,
-                to_card_id=card_id,
-                relation_type="introduces" if candidate.page_type == "ConceptPage" else "uses",
-                source_packet_id=packet.source_id,
-                evidence_text=_first_evidence(candidate),
+            self._apply_or_defer_effect(
+                card_id,
+                "link",
+                {
+                    "from_card_id": result.paper_card_id,
+                    "to_card_id": card_id,
+                    "relation_type": "introduces" if candidate.page_type == "ConceptPage" else "uses",
+                    "source_packet_id": packet.source_id,
+                    "evidence_text": _first_evidence(candidate),
+                },
             )
             for extra_link in plan.links_to_add:
                 to_card_id = str(extra_link.get("to_card_id") or "")
@@ -269,12 +291,16 @@ class PaperMergeAgent:
                     relation_type = "related"
                 if not to_card_id or to_card_id == result.paper_card_id or not self.wiki_store.get_card(to_card_id):
                     continue
-                self.pipeline_store.add_card_link(
-                    from_card_id=card_id,
-                    to_card_id=to_card_id,
-                    relation_type=relation_type,
-                    source_packet_id=packet.source_id,
-                    evidence_text=str(extra_link.get("reason") or ""),
+                self._apply_or_defer_effect(
+                    card_id,
+                    "link",
+                    {
+                        "from_card_id": card_id,
+                        "to_card_id": to_card_id,
+                        "relation_type": relation_type,
+                        "source_packet_id": packet.source_id,
+                        "evidence_text": str(extra_link.get("reason") or ""),
+                    },
                 )
             _append_link_result(
                 result.linked_cards,
@@ -284,8 +310,9 @@ class PaperMergeAgent:
                 relation_type="introduces" if candidate.page_type == "ConceptPage" else "uses",
             )
 
-        if result.paper_card_id:
+        if result.paper_card_id and self.approval_mode == "auto":
             self._write_import_impact(result.paper_card_id, result)
+        result.proposals = list(self.proposals)
         return result
 
     def _merge_paper(
@@ -298,7 +325,7 @@ class PaperMergeAgent:
         content.update({
             "schema_version": content.get("schema_version") or "paper-wiki-v1",
             "compile_status": content.get("compile_status") or "llm_refined",
-            "pipeline": "four_agent",
+            "pipeline": "wiki_compile",
             "source_packet_id": packet.source_id,
             "raw_source_path": packet.raw_source_path,
             "pdf_storage_uri": packet.pdf_storage_uri,
@@ -307,6 +334,19 @@ class PaperMergeAgent:
             "review_status": report.status if report else "missing",
         })
         existing = self.wiki_store.find_duplicate(candidate.title, "PaperPage", packet.source_urls)
+        existing_claims = ((existing or {}).get("content_json") or {}).get("claims", [])
+        relation_decisions = self.relation_resolver.resolve(
+            page_title=candidate.title,
+            incoming_claims=candidate.claims,
+            existing_claims=existing_claims,
+        )
+        content = self.compiler.compile_claims(
+            content_json=content,
+            existing_claims=existing_claims,
+            candidate=candidate,
+            packet=packet,
+            relation_decisions=relation_decisions,
+        ).content_json
         card_id = existing["id"] if existing else str(uuid.uuid4())
         summary = _merge_summary(existing.get("summary", ""), candidate.summary) if existing else candidate.summary
         source_urls = _unique_list((existing.get("source_urls") if existing else []) + packet.source_urls)
@@ -322,17 +362,23 @@ class PaperMergeAgent:
             related_topics=related_topics,
             existing_card=existing,
         )
-        self.pipeline_store.add_aliases(card_id, [candidate.title] + candidate.aliases)
-        self.pipeline_store.add_card_source(
-            card_id=card_id,
-            source_packet_id=packet.source_id,
-            source_card_id=card_id,
-            raw_source_path=packet.raw_source_path,
-            source_url=packet.source_urls[0] if packet.source_urls else "",
-            section_id=candidate.claims[0].section_id if candidate.claims else "",
-            evidence_text=_first_evidence(candidate),
-            claim_text=candidate.claims[0].claim if candidate.claims else candidate.summary,
-            confidence=1.0,
+        self._apply_or_defer_effect(
+            card_id, "aliases", {"card_id": card_id, "aliases": [candidate.title] + candidate.aliases}
+        )
+        self._apply_or_defer_effect(
+            card_id,
+            "source",
+            {
+                "card_id": card_id,
+                "source_packet_id": packet.source_id,
+                "source_card_id": card_id,
+                "raw_source_path": packet.raw_source_path,
+                "source_url": packet.source_urls[0] if packet.source_urls else "",
+                "section_id": candidate.claims[0].section_id if candidate.claims else "",
+                "evidence_text": _first_evidence(candidate),
+                "claim_text": candidate.claims[0].claim if candidate.claims else candidate.summary,
+                "confidence": 1.0,
+            },
         )
         return card_id
 
@@ -355,7 +401,7 @@ class PaperMergeAgent:
             related_topics=candidate.related_topics,
         )
         aliases = [candidate.title] + candidate.aliases + ((plan.aliases_to_add if plan else []) or [])
-        self.pipeline_store.add_aliases(card_id, aliases)
+        self._apply_or_defer_effect(card_id, "aliases", {"card_id": card_id, "aliases": aliases})
         self._add_sources(card_id, paper_card_id, packet, candidate)
         return card_id
 
@@ -384,7 +430,7 @@ class PaperMergeAgent:
             existing_card=existing,
         )
         aliases = [candidate.title] + candidate.aliases + ((plan.aliases_to_add if plan else []) or [])
-        self.pipeline_store.add_aliases(card_id, aliases)
+        self._apply_or_defer_effect(card_id, "aliases", {"card_id": card_id, "aliases": aliases})
         self._add_sources(card_id, paper_card_id, packet, candidate)
         return card_id
 
@@ -401,19 +447,30 @@ class PaperMergeAgent:
         related_topics: list[str],
         existing_card: dict[str, Any] | None = None,
     ) -> str:
-        """Write Markdown as the authority layer, then rebuild SQLite caches."""
-        markdown_path = self.markdown_vault.write_card(
-            card_id=card_id,
-            title=title,
-            page_type=page_type,
-            summary=summary,
-            content_json=content_json,
-            source_level=source_level,
-            source_urls=source_urls,
-            related_topics=related_topics,
-            existing_path=(existing_card or {}).get("markdown_path", ""),
+        """Verify a page proposal, commit its revision, then rebuild caches."""
+        manager = WikiRevisionManager(
+            store=self.pipeline_store,
+            vault=self.markdown_vault,
+            reindexer=self.markdown_reindexer,
         )
-        indexed = self.markdown_reindexer.reindex_reference(markdown_path)
+        kwargs = dict(
+            card_id=card_id, title=title, page_type=page_type, summary=summary,
+            content_json=content_json, source_level=source_level,
+            source_urls=source_urls, related_topics=related_topics,
+            existing_card=existing_card, reason="paper compiler merge",
+        )
+        if self.approval_mode in {"manual", "risk"}:
+            indexed = manager.propose_card(**kwargs)
+            if indexed.get("review_status") == "proposed":
+                self.proposals.append({
+                    "revision_id": indexed.get("revision_id", ""),
+                    "card_id": card_id,
+                    "title": title,
+                    "page_type": page_type,
+                    "patch": indexed.get("patch", ""),
+                })
+        else:
+            indexed = manager.commit_card(**kwargs)
         return str(indexed.get("card_id") or card_id)
 
     def _knowledge_content(
@@ -464,7 +521,19 @@ class PaperMergeAgent:
             "confidence": plan.confidence if plan else 0.0,
         })
         content["merge_history"] = history[-20:]
-        return content
+        existing_claims = _as_list(existing.get("claims"))
+        relation_decisions = self.relation_resolver.resolve(
+            page_title=candidate.title,
+            incoming_claims=candidate.claims,
+            existing_claims=existing_claims,
+        )
+        return self.compiler.compile_claims(
+            content_json=content,
+            existing_claims=existing_claims,
+            candidate=candidate,
+            packet=packet,
+            relation_decisions=relation_decisions,
+        ).content_json
 
     def _plan_merge(self, packet: SourcePacket, candidate: DistilledCandidate, report: ReviewReport) -> MergePlan:
         fallback = _fallback_merge_plan(report)
@@ -486,7 +555,7 @@ class PaperMergeAgent:
         prompt = MERGE_PROMPT.format(payload=json.dumps(payload, ensure_ascii=False, indent=2))
         try:
             self.llm_calls += 1
-            raw = self.llm.invoke(prompt, temperature=0.0, max_tokens=3600)
+            raw = invoke_structured(self.llm, prompt, temperature=0.0, max_tokens=3600)
         except Exception as exc:
             print(f"[paper_pipeline.merger] merge planner LLM failed: {exc}")
             return fallback
@@ -537,18 +606,69 @@ class PaperMergeAgent:
             for item in links.get("sources", [])[:8]
         ]
 
+    def _apply_or_defer_effect(self, owner_card_id: str, kind: str, payload: dict[str, Any]) -> None:
+        if self.approval_mode in {"manual", "risk"}:
+            candidate_ids = {
+                owner_card_id,
+                str(payload.get("card_id") or ""),
+                str(payload.get("from_card_id") or ""),
+                str(payload.get("source_card_id") or ""),
+            }
+            proposal = next(
+                (
+                    item for item in reversed(self.proposals)
+                    if str(item.get("card_id") or "") in candidate_ids
+                ),
+                None,
+            )
+            if proposal is None:
+                # link_only/skip_duplicate updates an existing target without creating a
+                # target-page proposal. Its metadata effects belong to the paper proposal,
+                # so they are still blocked by the same human approval boundary.
+                proposal = next(
+                    (
+                        item for item in self.proposals
+                        if str(item.get("page_type") or "") == "PaperPage"
+                    ),
+                    self.proposals[0] if self.proposals else None,
+                )
+            if proposal is None:
+                raise RuntimeError(
+                    f"Manual approval mode refused an unowned {kind} side effect for {owner_card_id}."
+                )
+            effect = {"kind": kind, "payload": payload}
+            self.pipeline_store.append_revision_post_commit_effect(
+                str(proposal["revision_id"]), effect
+            )
+            proposal.setdefault("post_commit_effects", []).append(effect)
+            return
+        if kind == "aliases":
+            self.pipeline_store.add_aliases(
+                str(payload.get("card_id") or owner_card_id), list(payload.get("aliases") or [])
+            )
+        elif kind == "source":
+            self.pipeline_store.add_card_source(**payload)
+        elif kind == "link":
+            self.pipeline_store.add_card_link(**payload)
+        else:
+            raise ValueError(f"Unsupported Wiki post-commit effect: {kind}")
+
     def _add_sources(self, card_id: str, paper_card_id: str, packet: SourcePacket, candidate: DistilledCandidate) -> None:
         for claim in candidate.claims[:5]:
-            self.pipeline_store.add_card_source(
-                card_id=card_id,
-                source_packet_id=packet.source_id,
-                source_card_id=paper_card_id,
-                raw_source_path=packet.raw_source_path,
-                source_url=packet.source_urls[0] if packet.source_urls else "",
-                section_id=claim.section_id,
-                evidence_text=claim.evidence,
-                claim_text=claim.claim,
-                confidence=1.0,
+            self._apply_or_defer_effect(
+                card_id,
+                "source",
+                {
+                    "card_id": card_id,
+                    "source_packet_id": packet.source_id,
+                    "source_card_id": paper_card_id,
+                    "raw_source_path": packet.raw_source_path,
+                    "source_url": packet.source_urls[0] if packet.source_urls else "",
+                    "section_id": claim.section_id,
+                    "evidence_text": claim.evidence,
+                    "claim_text": claim.claim,
+                    "confidence": 1.0,
+                },
             )
 
     def _record_merge_audit(

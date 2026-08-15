@@ -25,7 +25,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 from agentic_wiki_answer_reviewer import AgenticWikiAnswerReviewer
 
-DEFAULT_DATASET = TEST_EVAL_ROOT / "datasets" / "wiki_chat" / "all_agentic_wiki_eval.csv"
+DEFAULT_DATASET = TEST_EVAL_ROOT / "datasets" / "wiki_chat" / "current_papers_30.csv"
 DEFAULT_API_URL = "http://127.0.0.1:8000/api/wiki/chat"
 DEFAULT_SESSION_ID = "eval-agentic-wiki"
 

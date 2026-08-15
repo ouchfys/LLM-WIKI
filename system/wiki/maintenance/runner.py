@@ -104,7 +104,8 @@ class WikiMaintenanceRunner:
 
         post_validation: dict[str, Any] = {}
         changed = bool(
-            (llm_repair_result.get("processed") if isinstance(llm_repair_result, dict) else 0)
+            (repair_result.get("processed") if isinstance(repair_result, dict) else 0)
+            or (llm_repair_result.get("processed") if isinstance(llm_repair_result, dict) else 0)
             or (query_insight_result.get("processed") if isinstance(query_insight_result, dict) else 0)
             or (candidate_result.get("processed") if isinstance(candidate_result, dict) else 0)
             or (web_source_result.get("processed") if isinstance(web_source_result, dict) else 0)

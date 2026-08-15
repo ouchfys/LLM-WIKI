@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import ast
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,6 +25,8 @@ class ParsedMarkdownCard:
     page_type: str
     status: str = "draft"
     source_level: str = ""
+    created: str = ""
+    updated: str = ""
     aliases: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     sources: list[dict[str, str]] = field(default_factory=list)
@@ -32,6 +35,8 @@ class ParsedMarkdownCard:
     sections: dict[str, str] = field(default_factory=dict)
     body: str = ""
     frontmatter: dict[str, Any] = field(default_factory=dict)
+    claims: list[dict[str, Any]] = field(default_factory=list)
+    system_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 SECTION_TO_FIELD = {
@@ -52,6 +57,8 @@ SECTION_TO_FIELD = {
     "notes": "notes",
     "import impact": "import_impact",
     "review status": "review_status_text",
+    "claims": "claims",
+    "knowledge claims": "claims",
 }
 
 
@@ -80,6 +87,8 @@ def parse_markdown_card(markdown: str) -> ParsedMarkdownCard:
         page_type=page_type,
         status=str(frontmatter.get("status") or "draft"),
         source_level=str(frontmatter.get("source_level") or ""),
+        created=str(frontmatter.get("created") or "").strip(),
+        updated=str(frontmatter.get("updated") or "").strip(),
         aliases=_string_list(frontmatter.get("aliases")),
         tags=_string_list(frontmatter.get("tags")),
         sources=_source_list(frontmatter.get("sources")),
@@ -88,6 +97,8 @@ def parse_markdown_card(markdown: str) -> ParsedMarkdownCard:
         sections=sections,
         body=body.strip(),
         frontmatter=frontmatter,
+        claims=parse_claims(body),
+        system_metadata=parse_system_metadata(body),
     )
 
 
@@ -134,7 +145,11 @@ def parse_frontmatter(raw: str) -> dict[str, Any]:
             continue
         if stripped.startswith("- "):
             item = stripped[2:].strip()
-            if ":" in item and not item.startswith(("http:", "https:", "file:", "oss:", "local:")):
+            if (
+                ":" in item
+                and not item.startswith('"')
+                and not item.startswith(("http:", "https:", "file:", "oss:", "local:"))
+            ):
                 key, _, value = item.partition(":")
                 current_item = {key.strip(): str(_parse_scalar(value.strip()))}
                 current_list.append(current_item)
@@ -182,9 +197,13 @@ def content_json_from_sections(card: ParsedMarkdownCard) -> dict[str, Any]:
     if source_packet_ids:
         content["source_packet_id"] = source_packet_ids[0]
         content["source_packet_ids"] = source_packet_ids
+    if card.claims:
+        content["claims"] = card.claims
+    if card.system_metadata:
+        content.update(card.system_metadata)
     for heading, value in card.sections.items():
         key = SECTION_TO_FIELD.get(heading.strip().lower()) or _field_key_from_heading(heading)
-        if key == "summary":
+        if key in {"summary", "claims"}:
             continue
         if key in {"key_takeaways"}:
             content[key] = _bullet_items(value)
@@ -193,6 +212,29 @@ def content_json_from_sections(card: ParsedMarkdownCard) -> dict[str, Any]:
         else:
             content[key] = value.strip()
     return content
+
+
+def parse_claims(body: str) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    for raw in re.findall(r"<!--\s*wiki-claim\s+(\{.*?\})\s*-->", body or "", flags=re.DOTALL):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("id") and payload.get("statement"):
+            claims.append(payload)
+    return claims
+
+
+def parse_system_metadata(body: str) -> dict[str, Any]:
+    matches = re.findall(r"<!--\s*wiki-system\s+(\{.*?\})\s*-->", body or "", flags=re.DOTALL)
+    if not matches:
+        return {}
+    try:
+        payload = json.loads(matches[-1])
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def wikilinks(text: str) -> list[str]:

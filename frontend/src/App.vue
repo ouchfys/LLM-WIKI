@@ -1,5 +1,6 @@
 <template>
   <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides">
+    <n-message-provider>
     <div class="app-shell">
       <div class="ambient-light-layer" aria-hidden="true">
         <div class="ambient-blob ambient-blob-a"></div>
@@ -9,10 +10,10 @@
         <aside class="app-sidebar">
           <div class="sidebar-top">
             <div class="brand-lockup">
-              <img class="brand-logo" :src="logoUrl" alt="笔记贾维斯" />
+              <img class="brand-logo" :src="logoUrl" alt="LLM-WIKI" />
               <div class="brand-copy">
-                <strong>笔记贾维斯</strong>
-                <span>Private Research OS</span>
+                <strong>LLM-WIKI</strong>
+          <span>Evidence-first Research Wiki</span>
               </div>
             </div>
 
@@ -87,13 +88,14 @@
         </main>
       </div>
     </div>
+    </n-message-provider>
   </n-config-provider>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { darkTheme, NButton, NConfigProvider, type GlobalThemeOverrides } from 'naive-ui'
+import { darkTheme, NButton, NConfigProvider, NMessageProvider, type GlobalThemeOverrides } from 'naive-ui'
 import { api } from './api'
 
 type ChatSession = {
@@ -109,9 +111,10 @@ const logoUrl = new URL('./assets/logo-ui.png', import.meta.url).href
 
 const navItems = [
   { path: '/', label: '对话', hint: '用个人知识库回答问题' },
-  { path: '/capture', label: '采集台', hint: '论文、小红书、截图入库' },
+  { path: '/capture', label: '采集台', hint: '论文与社媒资料编译入库' },
   { path: '/vault', label: '知识库', hint: '论文卡片与概念网络' },
   { path: '/evaluation', label: '评测', hint: 'Benchmark 与失败样例' },
+  { path: '/reviews', label: '冲突审批', hint: '查看冲突来源与结论对象' },
   { path: '/daily', label: '推荐', hint: '每日论文与项目线索' }
 ]
 

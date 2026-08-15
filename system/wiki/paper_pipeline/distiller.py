@@ -5,13 +5,15 @@ import re
 import uuid
 from typing import Any
 
+from system.core.llm_call import invoke_structured
+
 from system.wiki.paper_pipeline.models import CandidateClaim, DistilledCandidate, SourcePacket
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore, normalize_alias
 from system.wiki.wiki_builder import sanitize_wiki_text
 
 
 DISTILL_PROMPT = """\
-You are the paper knowledge distillation agent for Jarvis Notes.
+You are the paper knowledge distillation agent for LLM-WIKI.
 Input is one paper_pdf SourcePacket. Produce source-grounded reusable wiki
 candidates, not a one-off long summary.
 
@@ -25,8 +27,11 @@ Hard rules:
 - Do not invent authors, datasets, metrics, numbers, or conclusions.
 - Prefer durable ConceptPage and MethodPage cards that can be reused by later papers.
 - Do not create cards for incidental details that are only useful inside this paper.
-- Every claim must include evidence copied or tightly paraphrased from the source
-  and a section_id.
+- Every claim must include evidence copied or tightly paraphrased from the source,
+  a section_id, and the evidence_ids shown in the source section header.
+- Describe each claim with subject/aspect/predicate/value/scope. Do not decide
+  whether it supports, challenges, or supersedes the Wiki; the merge stage owns
+  all cross-source relation decisions.
 - If evidence is weak, leave fields empty instead of guessing.
 - ConceptPage/MethodPage candidates must have aliases.
 - candidate_type must be one of: paper_page, concept_card, method_card.
@@ -62,7 +67,19 @@ Return this exact JSON shape:
       "interview_notes": [],
       "notes": ""
     }},
-    "claims": [{{"claim": "...", "evidence": "...", "section_id": "...", "page_start": 0}}],
+    "claims": [{{
+      "claim": "...",
+      "subject": "the knowledge entity being discussed",
+      "aspect": "the specific property being asserted",
+      "predicate": "requires / improves / uses / equals / ...",
+      "value": "normalized value when applicable",
+      "scope": {{"version": "", "model": "", "dataset": "", "task": "", "setting": ""}},
+      "qualifiers": [],
+      "evidence": "...",
+      "section_id": "...",
+      "page_start": 0,
+      "evidence_ids": ["ev-..."]
+    }}],
     "related_topics": [],
     "source_level": "primary"
   }},
@@ -83,7 +100,19 @@ Return this exact JSON shape:
         "limitations": "",
         "key_takeaways": []
       }},
-      "claims": [{{"claim": "...", "evidence": "...", "section_id": "...", "page_start": 0}}],
+      "claims": [{{
+        "claim": "...",
+        "subject": "the card concept or method",
+        "aspect": "the specific property being asserted",
+        "predicate": "requires / improves / uses / equals / ...",
+        "value": "normalized value when applicable",
+        "scope": {{"version": "", "model": "", "dataset": "", "task": "", "setting": ""}},
+        "qualifiers": [],
+        "evidence": "...",
+        "section_id": "...",
+        "page_start": 0,
+        "evidence_ids": ["ev-..."]
+      }}],
       "related_topics": [],
       "source_level": "primary"
     }}
@@ -127,7 +156,7 @@ class PaperDistiller:
             sections=self._sections_for_prompt(packet),
         )
         try:
-            raw = self.llm.invoke(prompt, temperature=0.0, max_tokens=4500)
+            raw = invoke_structured(self.llm, prompt, temperature=0.0, max_tokens=4500)
         except Exception as exc:
             print(f"[paper_pipeline.distiller] LLM distill failed: {exc}")
             return []
@@ -165,11 +194,28 @@ class PaperDistiller:
             claim_text = sanitize_wiki_text(str(claim.get("claim") or ""))
             evidence = sanitize_wiki_text(str(claim.get("evidence") or ""))
             if claim_text and evidence:
+                scope_payload = claim.get("scope") if isinstance(claim.get("scope"), dict) else {}
                 claims.append(CandidateClaim(
                     claim=claim_text,
                     evidence=evidence[:1000],
+                    subject=sanitize_wiki_text(str(claim.get("subject") or title)),
+                    aspect=sanitize_wiki_text(str(claim.get("aspect") or "")),
+                    predicate=sanitize_wiki_text(str(claim.get("predicate") or "")),
+                    value=sanitize_wiki_text(str(claim.get("value") or "")),
+                    scope={
+                        sanitize_wiki_text(str(key)): sanitize_wiki_text(str(value))
+                        for key, value in scope_payload.items()
+                        if str(key).strip() and str(value).strip()
+                    },
+                    qualifiers=[
+                        sanitize_wiki_text(str(value))
+                        for value in claim.get("qualifiers") or [] if str(value).strip()
+                    ],
                     section_id=str(claim.get("section_id") or ""),
                     page_start=int(claim.get("page_start") or 0),
+                    evidence_ids=[str(value) for value in claim.get("evidence_ids") or [] if str(value)],
+                    relation=str(claim.get("relation") or "supports") if str(claim.get("relation") or "supports") in {"supports", "challenges", "supersedes"} else "supports",
+                    confidence=float(claim.get("confidence") or 1.0),
                 ))
         return DistilledCandidate(
             candidate_type=candidate_type,
@@ -201,7 +247,7 @@ class PaperDistiller:
                 "key_takeaways": [packet.abstract[:220]] if packet.abstract else [],
                 "notes": "LLM distillation unavailable; local paper candidate generated from abstract.",
             },
-            claims=[CandidateClaim(claim=packet.abstract[:240] or packet.title, evidence=evidence["text"], section_id=evidence["section_id"], page_start=evidence["page_start"])],
+            claims=[CandidateClaim(claim=packet.abstract[:240] or packet.title, evidence=evidence["text"], section_id=evidence["section_id"], page_start=evidence["page_start"], evidence_ids=evidence["evidence_ids"])],
             related_topics=[],
         )
         return [paper]
@@ -287,6 +333,7 @@ class PaperDistiller:
                     evidence=evidence["text"],
                     section_id=evidence["section_id"],
                     page_start=evidence["page_start"],
+                    evidence_ids=evidence["evidence_ids"],
                 )],
                 related_topics=["LLM", "difficulty perception"],
             ))
@@ -341,17 +388,34 @@ class PaperDistiller:
             if not text:
                 continue
             parts.append(
-                f"[section_id={section.section_id}; heading={section.heading}; page={section.page_start}]\n{text[:1000]}"
+                f"[section_id={section.section_id}; heading={section.heading}; page={section.page_start}; evidence_ids={','.join(section.evidence_ids)}]\n{text[:1000]}"
             )
-        return "\n\n---\n\n".join(parts)[:7500]
+        for table in packet.tables[:4]:
+            cell_refs = ",".join(cell.cell_id for cell in table.cells[:80])
+            section = " / ".join(table.section_path)
+            parts.append(
+                f"[table_id={table.table_id}; heading={section}; page={table.page}; "
+                f"element_id={table.element_id}; cell_ids={cell_refs}]\n"
+                f"Caption: {table.caption}\n{table.markdown[:2200]}"
+            )
+        for element in packet.elements:
+            if element.element_type not in {"figure", "formula"}:
+                continue
+            parts.append(
+                f"[element_id={element.element_id}; type={element.element_type}; page={element.page}; "
+                f"heading={' / '.join(element.heading_path)}]\n{element.caption or element.text}"
+            )
+            if len(parts) >= 12:
+                break
+        return "\n\n---\n\n".join(parts)[:10500]
 
 
 def _best_evidence(packet: SourcePacket) -> dict[str, Any]:
     for section in packet.sections:
         text = sanitize_wiki_text(section.text)
         if len(text) >= 80:
-            return {"text": text[:900], "section_id": section.section_id, "page_start": section.page_start}
-    return {"text": sanitize_wiki_text(packet.abstract or packet.title)[:900], "section_id": "abstract", "page_start": 1}
+            return {"text": text[:900], "section_id": section.section_id, "page_start": section.page_start, "evidence_ids": section.evidence_ids[:4]}
+    return {"text": sanitize_wiki_text(packet.abstract or packet.title)[:900], "section_id": "abstract", "page_start": 1, "evidence_ids": []}
 
 
 def _fallback_multiline(text: str, target_lines: int) -> str:

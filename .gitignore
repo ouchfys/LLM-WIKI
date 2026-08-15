@@ -1,7 +1,6 @@
 # 环境变量 (含 API Key，不要提交)
 .env
 .claude/
-.streamlit/
 .impeccable/
 
 # Runtime data
@@ -23,6 +22,7 @@ data/*
 
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 *.egg-info/
@@ -35,6 +35,7 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/*.tsbuildinfo
+.playwright-cli/
 
 # IDE
 .idea/

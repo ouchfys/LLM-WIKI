@@ -3,10 +3,13 @@
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generator, List, Optional
+from queue import Queue
+from threading import Thread
+from typing import Any, Callable, Dict, Generator, List, Optional
 
 from system.memory.profile_signal_extractor import ProfileSignalExtractor
 from system.wiki.maintenance.query_archive import QueryArchive
+from system.wiki.wiki_resolver import WikiResolver
 
 
 @dataclass
@@ -73,6 +76,8 @@ class WikiChatService:
         web_search=None,
         web_fetch=None,
         resource_recommender=None,
+        wiki_resolver=None,
+        table_qa=None,
     ):
         self.wiki_store = wiki_store
         self.learning_profile = learning_profile
@@ -82,6 +87,8 @@ class WikiChatService:
         self.web_search = web_search
         self.web_fetch = web_fetch
         self.resource_recommender = resource_recommender
+        self.wiki_resolver = wiki_resolver or WikiResolver(wiki_store)
+        self.table_qa = table_qa
         self.profile_extractor = ProfileSignalExtractor()
 
     def chat(self, message: str, session_id: str = "", limit: int = 6) -> WikiChatResult:
@@ -139,16 +146,40 @@ class WikiChatService:
                 "detail": "resolved the follow-up query from recent turns",
             }
 
-        tool_run = self._run_tool_loop(message, effective_query, history, limit=limit)
+        event_queue: Queue[Any] = Queue()
+        tool_run_box: Dict[str, Any] = {}
+        tool_run_done = object()
+
+        def run_tools() -> None:
+            try:
+                tool_run_box["result"] = self._run_tool_loop(
+                    message,
+                    effective_query,
+                    history,
+                    limit=limit,
+                    event_callback=event_queue.put,
+                )
+            except BaseException as exc:  # propagate after flushing already emitted events
+                tool_run_box["error"] = exc
+            finally:
+                event_queue.put(tool_run_done)
+
+        Thread(target=run_tools, name="wiki-chat-tool-stream", daemon=True).start()
+        while True:
+            event = event_queue.get()
+            if event is tool_run_done:
+                break
+            yield event
+
+        if "error" in tool_run_box:
+            raise tool_run_box["error"]
+        tool_run = tool_run_box["result"]
         plan = tool_run["plan"]
         cards: List[Dict[str, Any]] = tool_run["cards"]
         web_results: List[Any] = tool_run["web_results"]
         resources: List[Dict[str, str]] = tool_run["resources"]
         trace = tool_run["trace"]
         yield {"type": "tool_plan", "plan": self._plan_payload(plan)}
-
-        for event in tool_run.get("events", []):
-            yield event
 
         citations = [self._citation(card) for card in cards]
         yield {"type": "card_list", "citations": [c.__dict__ for c in citations]}
@@ -239,8 +270,8 @@ class WikiChatService:
         use_web = self._should_search_web(query)
         use_resources = self._should_recommend_resources(query)
         tools = [
-            ToolCallPlan("wiki_search", query, "retrieve stable private Wiki memory"),
-            ToolCallPlan("wiki_card", query, "open matching Wiki cards as reusable skills"),
+            ToolCallPlan("wiki_search", query, "resolve a small set of relevant compiled Wiki pages"),
+            ToolCallPlan("wiki_card", query, "open the strongest resolved Wiki pages"),
         ]
         if use_web:
             tools.append(ToolCallPlan("web_search", self._web_search_query(query), "freshness or external source check"))
@@ -263,6 +294,7 @@ class WikiChatService:
         history: List,
         limit: int = 6,
         max_steps: int = 3,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Run a Claude-Code-style plan -> tool call -> observation loop.
 
@@ -275,6 +307,12 @@ class WikiChatService:
         observations: List[AgentToolObservation] = []
         executed_calls: List[ToolCallPlan] = []
         events: List[Dict[str, Any]] = []
+
+        def emit(event: Dict[str, Any], *, record: bool = False) -> None:
+            if record:
+                events.append(event)
+            if event_callback:
+                event_callback(event)
 
         seen_signatures: set[str] = set()
         used_llm_step = False
@@ -296,6 +334,7 @@ class WikiChatService:
                     if signature in seen_signatures:
                         continue
                     seen_signatures.add(signature)
+                    emit(self._tool_running_event(call))
                     observation = self._execute_agent_tool_call(
                         call=call,
                         cards=cards,
@@ -309,7 +348,7 @@ class WikiChatService:
                         query=str(call.arguments.get("query") or ""),
                         reason=call.reason,
                     ))
-                    events.append(self._tool_status_event(observation))
+                    emit(self._tool_status_event(observation), record=True)
                 if any(call.name in {"web_fetch", "resource_recommend"} for call in tool_calls):
                     break
 
@@ -321,6 +360,7 @@ class WikiChatService:
                     arguments={"query": call_plan.query, "limit": limit},
                     reason=call_plan.reason,
                 )
+                emit(self._tool_running_event(call))
                 observation = self._execute_agent_tool_call(
                     call=call,
                     cards=cards,
@@ -330,7 +370,39 @@ class WikiChatService:
                 )
                 observations.append(observation)
                 executed_calls.append(call_plan)
-                events.append(self._tool_status_event(observation))
+                emit(self._tool_status_event(observation), record=True)
+
+        # Safety net: the LLM resolved pages but never opened one.  Auto-open
+        # the deterministic resolver results so answers still use private Wiki
+        # content without sending the full catalog to the model.
+        if (
+            not cards
+            and any(call.name == "wiki_search" for call in executed_calls)
+            and not web_results
+        ):
+            auto_call = AgentToolCall(
+                name="wiki_card",
+                arguments={"query": effective_query or message, "limit": limit},
+                reason="open the strongest resolved Wiki pages",
+            )
+            emit(self._tool_running_event(auto_call))
+            auto = self._open_cards(
+                auto_call,
+                query=effective_query or message,
+                call_limit=limit,
+            )
+            if auto:
+                self._merge_cards(cards, auto)
+                observation = AgentToolObservation(
+                    tool="wiki_card",
+                    query=effective_query or message,
+                    status="done",
+                    summary=f"auto-opened {len(auto)} resolved Wiki pages (no card_id selected)",
+                    items=[self._trace_card(card) for card in auto],
+                )
+                observations.append(observation)
+                executed_calls.append(ToolCallPlan("wiki_card", effective_query or message, observation.summary))
+                emit(self._tool_status_event(observation), record=True)
 
         if (
             cards
@@ -346,6 +418,7 @@ class WikiChatService:
                 arguments={"query": effective_query or message, "limit": 5},
                 reason="wiki tools returned no strong observation",
             )
+            emit(self._tool_running_event(call))
             observation = self._execute_agent_tool_call(
                 call=call,
                 cards=cards,
@@ -355,7 +428,7 @@ class WikiChatService:
             )
             observations.append(observation)
             executed_calls.append(ToolCallPlan(call.name, call.arguments["query"], call.reason))
-            events.append(self._tool_status_event(observation))
+            emit(self._tool_status_event(observation), record=True)
 
         if (
             web_results
@@ -372,6 +445,7 @@ class WikiChatService:
                     arguments={"query": effective_query or message, "url": url, "limit": min(limit, 4)},
                     reason="auto-fetch top web result so web evidence includes readable passages",
                 )
+                emit(self._tool_running_event(call))
                 observation = self._execute_agent_tool_call(
                     call=call,
                     cards=cards,
@@ -381,7 +455,7 @@ class WikiChatService:
                 )
                 observations.append(observation)
                 executed_calls.append(ToolCallPlan(call.name, call.arguments["query"], call.reason))
-                events.append(self._tool_status_event(observation))
+                emit(self._tool_status_event(observation), record=True)
 
         plan = self._tool_plan_from_calls(executed_calls, effective_query, used_llm_step)
         trace = self._trace_payload(
@@ -483,13 +557,16 @@ class WikiChatService:
             "You are the tool-use controller for a private Wiki assistant. "
             "Do not answer the user in natural language. Decide whether the next step needs a tool call.\n"
             "Rules:\n"
-            "- Prefer wiki_search first for private notes, papers, concepts, methods, and interview prep.\n"
-            "- Use wiki_card after wiki_search when you need to open matched cards as evidence.\n"
-            "- Use web_search only for latest/current/source discovery or when Wiki observations are weak.\n"
+            "- Call wiki_search first with the effective query. It returns only a small ranked set of compiled Wiki pages "
+            "with card_id, score, and match reasons; it never returns raw paper chunks.\n"
+            "- Read the resolved results, then call wiki_card with card_ids = the 1-5 most relevant values to open their full contents.\n"
+            "- The same topic may have several cards of different page_type (e.g. a PaperPage and a ConceptPage); pick the ones that fit the question.\n"
+            "- Use web_search only for latest/current/source discovery or when the resolved Wiki pages clearly lack the topic.\n"
             "- If the user provides a concrete URL and asks to inspect it, call web_fetch directly with that URL.\n"
             "- Use web_fetch after web_search to open a concrete URL before treating web information as evidence.\n"
             "- Use resource_recommend only when the user asks for follow-up papers, tutorials, videos, links, or study resources.\n"
-            "- If observations are enough, return no tool calls.\n"
+            "- After opening relevant Wiki cards, use table_query for exact numbers, rankings, table comparisons, or cross-paper aggregation.\n"
+            "- Once you have opened the relevant cards (or decided none fit), return no tool calls.\n"
         )
         user_text = (
             f"Step: {step_index + 1}\n"
@@ -522,8 +599,24 @@ class WikiChatService:
             {
                 "type": "function",
                 "function": {
+                    "name": "table_query",
+                    "description": "Resolve first-class paper tables within selected Wiki/source scope and answer exact cell, ranking, comparison, or cross-paper aggregation questions with read-only DuckDB and cell citations.",
+                    "parameters": schema(
+                        {
+                            "query": {"type": "string", "description": "Exact table question."},
+                            "card_ids": {"type": "array", "items": {"type": "string"}, "description": "Relevant card IDs opened from Wiki."},
+                            "sql": {"type": "string", "description": "Optional read-only SELECT over evidence_cells."},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 8},
+                        },
+                        ["query"],
+                    ),
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "wiki_search",
-                    "description": "Search private Wiki chunks and cards.",
+                    "description": "Resolve a query to a small ranked set of compiled Wiki pages using title, aliases, page metadata, and page full-text search. Returns match reasons and card_ids; it never returns the full catalog or raw paper chunks.",
                     "parameters": schema(query_limit, ["query"]),
                 },
             },
@@ -531,8 +624,19 @@ class WikiChatService:
                 "type": "function",
                 "function": {
                     "name": "wiki_card",
-                    "description": "Open matched Wiki cards as structured memory.",
-                    "parameters": schema(query_limit, ["query"]),
+                    "description": "Open specific compiled Wiki pages by card_id from wiki_search and load their full Markdown body plus a bounded list of linked Wiki pages for optional traversal.",
+                    "parameters": schema(
+                        {
+                            "card_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "One or more card_id values copied from the bounded wiki_search results.",
+                            },
+                            "query": {"type": "string", "description": "Optional fallback query if no card_id is known."},
+                            "limit": {"type": "integer", "description": "Maximum number of cards to open.", "minimum": 1, "maximum": 8},
+                        },
+                        [],
+                    ),
                 },
             },
             {
@@ -579,7 +683,7 @@ class WikiChatService:
         tool_calls = data.get("tool_calls") or []
         if not isinstance(tool_calls, list):
             return []
-        allowed = {"wiki_search", "wiki_card", "web_search", "web_fetch", "resource_recommend"}
+        allowed = {"wiki_search", "wiki_card", "table_query", "web_search", "web_fetch", "resource_recommend"}
         result: List[AgentToolCall] = []
         for item in tool_calls:
             if not isinstance(item, dict):
@@ -600,16 +704,33 @@ class WikiChatService:
                 args = {}
             query = str(args.get("query") or default_query).strip()
             url = str(args.get("url") or "").strip()
+            sql = str(args.get("sql") or "").strip()
+            card_ids = WikiChatService._extract_card_ids(args)
             try:
                 limit = int(args.get("limit") or default_limit)
             except (TypeError, ValueError):
                 limit = default_limit
             result.append(AgentToolCall(
                 name=name,
-                arguments={"query": query, "url": url, "limit": max(1, min(limit, 8))},
+                arguments={"query": query, "url": url, "sql": sql, "card_ids": card_ids, "limit": max(1, min(limit, 8))},
                 reason="native function calling",
             ))
         return result[:3]
+
+    @staticmethod
+    def _extract_card_ids(args: Dict[str, Any]) -> List[str]:
+        """Pull card_ids/card_id out of tool arguments in any reasonable shape."""
+        raw = args.get("card_ids")
+        if raw is None:
+            raw = args.get("card_id")
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            parts = re.split(r"[,\s]+", raw.strip())
+            return [p for p in (s.strip() for s in parts) if p]
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        return [str(raw).strip()] if str(raw).strip() else []
 
     def _tool_loop_prompt(
         self,
@@ -630,16 +751,17 @@ class WikiChatService:
             "Available tools are defined by this schema:\n"
             f"{tool_specs}\n\n"
             "Tool-use rules:\n"
-            "- Prefer wiki_search first for private notes, papers, concepts, methods, and interview prep.\n"
-            "- Use wiki_card after wiki_search when you need to open the matched cards as evidence.\n"
-            "- Use web_search only for latest/current/source discovery or when Wiki observations are weak.\n"
+            "- Call wiki_search first with the effective query. It deterministically returns only a small ranked set of compiled Wiki pages and explains each match.\n"
+            "- Read those results, then call wiki_card with card_ids = the 1-5 most relevant values to open their full contents.\n"
+            "- The same topic may have several cards of different page_type; pick the ones that fit the question.\n"
+            "- Use web_search only for latest/current/source discovery or when the resolved Wiki pages clearly lack the topic.\n"
             "- If the user provides a concrete URL and asks to inspect it, call web_fetch directly with that URL.\n"
             "- Use web_fetch after web_search to open a concrete URL before treating web information as evidence.\n"
             "- Use resource_recommend only when the user asks for follow-up papers, tutorials, videos, links, or study resources.\n"
-            "- Stop by returning {\"finish\": true, \"tool_calls\": []} when observations are enough.\n"
+            "- Stop by returning {\"finish\": true, \"tool_calls\": []} when the relevant cards are opened.\n"
             "JSON shape:\n"
             "{\"thought\": string, \"finish\": boolean, "
-            "\"tool_calls\": [{\"name\": string, \"arguments\": {\"query\": string, \"url\": string, \"limit\": number}, \"reason\": string}]}\n\n"
+            "\"tool_calls\": [{\"name\": string, \"arguments\": {\"query\": string, \"card_ids\": [string], \"url\": string, \"limit\": number}, \"reason\": string}]}\n\n"
             f"Step: {step_index + 1}\n"
             f"Default limit: {limit}\n"
             f"User message: {message}\n"
@@ -653,13 +775,18 @@ class WikiChatService:
         return [
             {
                 "name": "wiki_search",
-                "description": "Search private Wiki chunks and cards.",
+                "description": "Resolve a query to a small ranked set of compiled Wiki pages with explainable title, alias, metadata, and page-FTS matches.",
                 "arguments": {"query": "string", "limit": "integer"},
             },
             {
                 "name": "wiki_card",
-                "description": "Open matched Wiki cards as structured memory.",
-                "arguments": {"query": "string", "limit": "integer"},
+                "description": "Open compiled Wiki pages by card_id and return their full Markdown plus bounded outgoing/incoming Wiki links.",
+                "arguments": {"card_ids": "string[]", "query": "string", "limit": "integer"},
+            },
+            {
+                "name": "table_query",
+                "description": "Resolve structured tables and run exact/cross-paper read-only DuckDB analysis with table-cell citations.",
+                "arguments": {"query": "string", "card_ids": "string[]", "sql": "optional SELECT", "limit": "integer"},
             },
             {
                 "name": "web_search",
@@ -686,7 +813,7 @@ class WikiChatService:
     ) -> List[AgentToolCall]:
         if not isinstance(data, dict) or data.get("finish") is True:
             return []
-        allowed = {"wiki_search", "wiki_card", "web_search", "web_fetch", "resource_recommend"}
+        allowed = {"wiki_search", "wiki_card", "table_query", "web_search", "web_fetch", "resource_recommend"}
         raw_calls = data.get("tool_calls")
         if raw_calls is None:
             raw_calls = data.get("tools")
@@ -700,13 +827,15 @@ class WikiChatService:
             args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
             query = str(args.get("query") or item.get("query") or default_query).strip()
             url = str(args.get("url") or item.get("url") or "").strip()
+            sql = str(args.get("sql") or item.get("sql") or "").strip()
+            card_ids = WikiChatService._extract_card_ids(args) or WikiChatService._extract_card_ids(item)
             try:
                 limit = int(args.get("limit") or default_limit)
             except (TypeError, ValueError):
                 limit = default_limit
             result.append(AgentToolCall(
                 name=name,
-                arguments={"query": query, "url": url, "limit": max(1, min(limit, 8))},
+                arguments={"query": query, "url": url, "sql": sql, "card_ids": card_ids, "limit": max(1, min(limit, 8))},
                 reason=str(item.get("reason") or data.get("thought") or ""),
             ))
         return result[:3]
@@ -722,24 +851,46 @@ class WikiChatService:
         query = str(call.arguments.get("query") or "").strip()
         call_limit = max(1, min(int(call.arguments.get("limit") or limit), 8))
         if call.name == "wiki_search":
-            found = self._retrieve_cards(query, limit=call_limit)
-            self._merge_cards(cards, found)
+            resolved = self.wiki_resolver.resolve(query, limit=call_limit)
             return AgentToolObservation(
                 tool=call.name,
                 query=query,
                 status="done",
-                summary=f"found {len(found)} wiki cards",
-                items=[self._trace_card(card) for card in found[:call_limit]],
+                summary=f"resolved {len(resolved)} compiled Wiki pages",
+                items=resolved,
             )
         if call.name == "wiki_card":
-            found = cards[:call_limit] or self._retrieve_cards(query, limit=call_limit)
-            self._merge_cards(cards, found)
+            opened = self._open_cards(call, query, call_limit)
+            self._merge_cards(cards, opened)
             return AgentToolObservation(
                 tool=call.name,
                 query=query,
-                status="done",
-                summary=f"opened {len(found)} wiki cards",
-                items=[self._trace_card(card) for card in found[:call_limit]],
+                status="done" if opened else "error",
+                summary=f"opened {len(opened)} wiki cards" if opened else "no card matched the given card_id(s)",
+                items=[self._trace_card(card) for card in opened],
+            )
+        if call.name == "table_query":
+            if not self.table_qa:
+                return AgentToolObservation(tool=call.name, query=query, status="error", summary="table query unavailable")
+            try:
+                result = self.table_qa.answer(
+                    query,
+                    card_ids=[str(value) for value in call.arguments.get("card_ids") or [] if str(value)],
+                    sql=str(call.arguments.get("sql") or ""),
+                    limit=call_limit,
+                )
+            except Exception as exc:
+                return AgentToolObservation(tool=call.name, query=query, status="error", summary=f"table query failed: {exc}")
+            items = [
+                {"title": f"{row.get('source_title', '')} / {row.get('caption', '')}", **row}
+                for row in result.get("rows", [])[:30]
+            ]
+            return AgentToolObservation(
+                tool=call.name,
+                query=query,
+                status="done" if result.get("rows") else "error",
+                summary=str(result.get("answer") or "")[:1200],
+                items=items,
             )
         if call.name == "web_search":
             found = self._retrieve_web(query, cards, force=True)
@@ -822,6 +973,57 @@ class WikiChatService:
             status="error",
             summary="unknown tool",
         )
+
+    def _open_cards(self, call: "AgentToolCall", query: str, call_limit: int) -> List[Dict[str, Any]]:
+        """Open specific cards by card_id and load their full markdown body."""
+        raw_ids = call.arguments.get("card_ids")
+        if not raw_ids:
+            single = call.arguments.get("card_id")
+            raw_ids = [single] if single else []
+        ids = [str(cid).strip() for cid in raw_ids if str(cid).strip()]
+
+        resolutions: Dict[str, Dict[str, Any]] = {}
+        # Fallback: if the model gave a query but no card_id, use the same
+        # deterministic Wiki resolver as wiki_search.
+        if not ids and query:
+            for item in self.wiki_resolver.resolve(query, limit=call_limit):
+                card_id = str(item.get("card_id") or "")
+                if card_id:
+                    ids.append(card_id)
+                    resolutions[card_id] = item
+
+        opened: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for cid in ids[:call_limit]:
+            if cid in seen:
+                continue
+            seen.add(cid)
+            card = self.wiki_store.get_card(cid)
+            if card:
+                card["_full_text"] = self._read_card_markdown(card)
+                card["_linked_pages"] = self.wiki_store.list_linked_pages(cid, limit=12)
+                if cid in resolutions:
+                    card["_resolution"] = resolutions[cid]
+                opened.append(card)
+        return opened
+
+    def _read_card_markdown(self, card: Dict[str, Any]) -> str:
+        """Read the full markdown body for a card; fall back to compacted content_json."""
+        path = str(card.get("markdown_path") or "").strip()
+        if path:
+            try:
+                if path.startswith(("oss://", "local://")):
+                    from system.storage import get_object_storage
+
+                    text = get_object_storage().read_text(path)
+                else:
+                    resolved = self.wiki_store.vault.resolve_markdown_path(path)
+                    text = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
+                if text and text.strip():
+                    return text.strip()[:8000]
+            except Exception as exc:
+                print(f"[WikiChatService] read markdown failed for {path}: {exc}")
+        return self._compact_content(card.get("content_json") or {})
 
     @staticmethod
     def _merge_cards(target: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> None:
@@ -920,6 +1122,21 @@ class WikiChatService:
                 f"[Observation {index}] tool={observation.tool}; query={observation.query}; "
                 f"status={observation.status}; summary={observation.summary}"
             )
+            # Resolver results are already bounded, so expose every returned
+            # candidate and its explanation to the controller.
+            if observation.tool == "wiki_search":
+                for item in observation.items:
+                    cid = item.get("card_id", "")
+                    title = item.get("title", "")
+                    ptype = item.get("page_type", "")
+                    summary = str(item.get("summary", "") or "")[:160]
+                    score = item.get("score", "")
+                    reason = item.get("match_reason", "")
+                    lines.append(
+                        f"- card_id={cid} | [{ptype}] {title} | score={score}; "
+                        f"match={reason} | {summary}"
+                    )
+                continue
             for item in observation.items[:3]:
                 title = item.get("title") or item.get("url") or item.get("card_id") or ""
                 url = item.get("url") or ""
@@ -931,6 +1148,11 @@ class WikiChatService:
                 if url:
                     detail = f"url={url}; {detail}"
                 lines.append(f"- {title}: {detail}")
+                for linked in (item.get("linked_pages") or [])[:5]:
+                    lines.append(
+                        "  -> linked card_id={card_id} | [{page_type}] {title} | "
+                        "relation={relation_type}; direction={direction}".format(**linked)
+                    )
         return "\n".join(lines)
 
     @staticmethod
@@ -955,23 +1177,84 @@ class WikiChatService:
                     detail = passages[0].get("text") or detail
                 if title or detail:
                     lines.append(f"- {title}: {str(detail)[:260]}")
+                for linked in (item.get("linked_pages") or [])[:5]:
+                    lines.append(
+                        "  -> linked card_id={card_id} | [{page_type}] {title} | "
+                        "relation={relation_type}; direction={direction}".format(**linked)
+                    )
         return "\n".join(lines) if lines else "(none)"
 
     @staticmethod
-    def _tool_status_event(observation: AgentToolObservation) -> Dict[str, Any]:
+    def _tool_label(tool: str) -> str:
         labels = {
             "wiki_search": "Wiki Search",
             "wiki_card": "Wiki Card",
+            "table_query": "Table Query",
             "web_search": "Web Search",
             "web_fetch": "Web Fetch",
             "resource_recommend": "Resource Recommend",
         }
+        return labels.get(tool, tool)
+
+    @classmethod
+    def _tool_running_event(cls, call: AgentToolCall) -> Dict[str, Any]:
+        query = str(call.arguments.get("query") or "")
         return {
             "type": "tool_status",
+            "event_id": f"{call.name}:{query}",
+            "tool": call.name,
+            "label": cls._tool_label(call.name),
+            "status": "running",
+            "detail": call.reason or query,
+            "query": query,
+            "reason": call.reason,
+            "items": [],
+        }
+
+    @staticmethod
+    def _compact_tool_event_items(observation: AgentToolObservation) -> List[Dict[str, Any]]:
+        visible_fields = (
+            "card_id",
+            "title",
+            "page_type",
+            "summary",
+            "markdown_path",
+            "score",
+            "match_reason",
+            "source_title",
+            "table_id",
+            "page",
+            "row_label",
+            "column_label",
+            "value",
+            "cell_id",
+            "url",
+            "snippet",
+        )
+        compact: List[Dict[str, Any]] = []
+        for raw in (observation.items or [])[:4]:
+            if not isinstance(raw, dict):
+                continue
+            item = {field: raw.get(field) for field in visible_fields if raw.get(field) not in (None, "")}
+            for text_field in ("summary", "snippet"):
+                if text_field in item:
+                    item[text_field] = str(item[text_field])[:280]
+            if item:
+                compact.append(item)
+        return compact
+
+    @classmethod
+    def _tool_status_event(cls, observation: AgentToolObservation) -> Dict[str, Any]:
+        return {
+            "type": "tool_status",
+            "event_id": f"{observation.tool}:{observation.query}",
             "tool": observation.tool,
-            "label": labels.get(observation.tool, observation.tool),
+            "label": cls._tool_label(observation.tool),
             "status": "done" if observation.status == "done" else "error",
             "detail": observation.summary,
+            "query": observation.query,
+            "reason": "",
+            "items": cls._compact_tool_event_items(observation),
         }
 
     @staticmethod
@@ -985,14 +1268,14 @@ class WikiChatService:
             intent="tool_use_agent_answer",
             answer_mode="plan_call_observe_answer" if used_llm_step else "fallback_plan_call_observe_answer",
             tools=calls or [ToolCallPlan("wiki_search", default_query, "default private Wiki lookup")],
-            use_wiki=bool({"wiki_search", "wiki_card"} & names) or not names,
+            use_wiki=bool({"wiki_search", "wiki_card", "table_query"} & names) or not names,
             use_web=bool({"web_search", "web_fetch"} & names),
             use_resources="resource_recommend" in names,
             open_cards="wiki_card" in names,
         )
 
     def _normalize_tool_plan(self, data: Dict[str, Any], default_query: str) -> WikiToolPlan:
-        allowed = {"wiki_search", "wiki_card", "web_search", "web_fetch", "resource_recommend"}
+        allowed = {"wiki_search", "wiki_card", "table_query", "web_search", "web_fetch", "resource_recommend"}
         calls: List[ToolCallPlan] = []
         for item in data.get("tools", []) if isinstance(data, dict) else []:
             name = str(item.get("name", "")).strip()
@@ -1014,7 +1297,7 @@ class WikiChatService:
             intent=str(data.get("intent") or "answer_from_private_wiki") if isinstance(data, dict) else "answer_from_private_wiki",
             answer_mode=str(data.get("answer_mode") or "wiki_first") if isinstance(data, dict) else "wiki_first",
             tools=calls,
-            use_wiki="wiki_search" in names or "wiki_card" in names,
+            use_wiki=bool({"wiki_search", "wiki_card", "table_query"} & names),
             use_web=bool({"web_search", "web_fetch"} & names),
             use_resources="resource_recommend" in names,
             open_cards="wiki_card" in names,
@@ -1064,12 +1347,15 @@ class WikiChatService:
 
     @staticmethod
     def _trace_card(card: Dict[str, Any]) -> Dict[str, Any]:
+        resolution = card.get("_resolution") if isinstance(card.get("_resolution"), dict) else {}
         return {
             "card_id": card.get("id", ""),
             "title": card.get("title", ""),
             "page_type": card.get("page_type", ""),
             "summary": card.get("summary", ""),
             "markdown_path": card.get("markdown_path", ""),
+            "resolution": resolution,
+            "linked_pages": (card.get("_linked_pages") or [])[:12],
             "matched_chunks": [str(item)[:600] for item in (card.get("_matched_chunks") or [])[:3]],
         }
 
@@ -1132,31 +1418,6 @@ class WikiChatService:
         ]
         return any(marker in text for marker in private_scope) and not any(marker in text for marker in explicit_external)
 
-    def _retrieve_cards(self, message: str, limit: int) -> List[Dict[str, Any]]:
-        # 1. Try unified chunk search first
-        if self.chunk_index:
-            chunks = self.chunk_index.search(message, limit=limit * 5)
-            chunks = self._filter_relevant_chunks(message, chunks)
-            if chunks:
-                return self._cards_from_chunks(chunks, limit)
-
-        # 2. Fallback to card title/summary search
-        cards = self.wiki_store.search_cards(message, limit=limit)
-        cards = self._filter_relevant_cards(message, cards)
-        if cards:
-            return self._dedupe_cards(cards)[:limit]
-
-        # 3. Keyword scan with relevance threshold
-        terms = self._terms(message)
-        scored = []
-        for card in self.wiki_store.get_recent_cards(limit=200):
-            text = self._card_text(card).lower()
-            score = sum(1 for term in terms if self._is_meaningful_term(term) and term.lower() in text)
-            if score >= 2:
-                scored.append((score, card))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return self._dedupe_cards([card for _, card in scored])[:limit]
-
     def _retrieve_web(self, message: str, cards: List[Dict[str, Any]], force: bool = False) -> List[Any]:
         if not self.web_search or not getattr(self.web_search, "available", False):
             return []
@@ -1181,35 +1442,6 @@ class WikiChatService:
         except Exception as exc:
             print(f"[WikiChatService] resource recommendation failed: {exc}")
             return []
-
-    def _cards_from_chunks(self, chunks: List[Dict], limit: int) -> List[Dict[str, Any]]:
-        """Dedupe by card_id, enrich cards with matched chunk snippets."""
-        seen = set()
-        result: List[Dict[str, Any]] = []
-        chunk_snippets: Dict[str, List[str]] = {}
-
-        for chunk in chunks:
-            cid = chunk["card_id"]
-            if cid not in chunk_snippets:
-                chunk_snippets[cid] = []
-            chunk_snippets[cid].append(chunk["text"][:300])
-
-        for chunk in chunks:
-            cid = chunk["card_id"]
-            if cid in seen:
-                continue
-            seen.add(cid)
-
-            card = self.wiki_store.get_card(cid)
-            if card:
-                # Attach matched chunk snippets for the prompt
-                card["_matched_chunks"] = chunk_snippets.get(cid, [])[:3]
-                result.append(card)
-
-            if len(result) >= limit:
-                break
-
-        return result
 
     def _answer(
         self,
@@ -1284,9 +1516,12 @@ class WikiChatService:
                 f"type: {card.get('page_type', '')}",
                 f"summary: {card.get('summary', '')}",
             ]
-            # Prefer matched chunk snippets over compacted content_json
+            # Prefer the full opened markdown body; fall back to chunks, then content_json.
+            full_text = card.get("_full_text")
             matched = card.get("_matched_chunks")
-            if matched:
+            if full_text:
+                parts.append(f"full content:\n{str(full_text)[:6000]}")
+            elif matched:
                 parts.append("matched passages:")
                 for ci, snippet in enumerate(matched, start=1):
                     parts.append(f"  passage {ci}: {snippet[:600]}")
@@ -1508,114 +1743,6 @@ class WikiChatService:
         ]
         return any(marker in text for marker in followup_markers)
 
-    def _should_use_external_tools(
-        self,
-        message: str,
-        effective_query: str,
-        cards: List[Dict[str, Any]],
-    ) -> bool:
-        if cards and not self._should_search_web(effective_query):
-            return False
-        if effective_query != message and self._is_example_followup(message):
-            return False
-        return self._should_search_web(effective_query) or not cards
-
-    @staticmethod
-    def _is_example_followup(message: str) -> bool:
-        text = (message or "").strip().lower()
-        markers = ["举例", "例子", "案例", "各个", "分别", "参考", "example", "examples"]
-        return any(marker in text for marker in markers)
-
-    def _filter_relevant_chunks(self, message: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not chunks:
-            return []
-        terms = self._meaningful_terms(message)
-        if not terms:
-            return chunks[:6]
-        specific_terms = self._specific_terms(terms)
-
-        scored = []
-        for chunk in chunks:
-            text = " ".join([
-                str(chunk.get("title", "")),
-                str(chunk.get("section", "")),
-                str(chunk.get("text", "")),
-            ]).lower()
-            title = str(chunk.get("title", "")).lower()
-            if specific_terms and not any(term.lower() in text for term in specific_terms):
-                continue
-            score = 0.0
-            for term in terms:
-                term_lower = term.lower()
-                if term_lower in title:
-                    score += 2.0
-                if term_lower in text:
-                    score += 1.0
-            if score >= self._relevance_threshold(terms):
-                scored.append((score, chunk))
-
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [chunk for _, chunk in scored]
-
-    def _filter_relevant_cards(self, message: str, cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not cards:
-            return []
-        terms = self._meaningful_terms(message)
-        if not terms:
-            return cards
-        specific_terms = self._specific_terms(terms)
-
-        scored = []
-        for card in cards:
-            title = str(card.get("title", "")).lower()
-            text = self._card_text(card).lower()
-            if specific_terms and not any(term.lower() in text for term in specific_terms):
-                continue
-            score = 0.0
-            for term in terms:
-                term_lower = term.lower()
-                if term_lower in title:
-                    score += 2.0
-                if term_lower in text:
-                    score += 1.0
-            if score >= self._relevance_threshold(terms):
-                scored.append((score, card))
-
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [card for _, card in scored]
-
-    @classmethod
-    def _meaningful_terms(cls, text: str) -> List[str]:
-        terms = [term for term in cls._terms(text) if cls._is_meaningful_term(term)]
-        return list(dict.fromkeys(terms))[:8]
-
-    @staticmethod
-    def _specific_terms(terms: List[str]) -> List[str]:
-        generic = {"agent", "agents", "ai", "llm", "llms", "system", "systems", "大模型", "智能体"}
-        return [term for term in terms if term.lower() not in generic]
-
-    @staticmethod
-    def _is_meaningful_term(term: str) -> bool:
-        value = (term or "").strip().lower()
-        if not value:
-            return False
-        stop = {
-            "and", "or", "the", "for", "with", "from", "what", "how", "why",
-            "are", "is", "was", "were", "this", "that", "into", "about",
-            "什么", "怎么", "如何", "为什么", "区别", "不同", "对比", "比较",
-            "主流", "技术", "里面", "这个", "那个", "一下", "哪些", "相关",
-            "内容", "最近", "保存", "记录", "帮我", "总结",
-        }
-        return value not in stop
-
-    @staticmethod
-    def _relevance_threshold(terms: List[str]) -> float:
-        if len(terms) <= 1:
-            return 1.0
-        if len(terms) <= 3:
-            return 2.0
-        return 2.5
-
     @staticmethod
     def _should_search_web(message: str) -> bool:
         text = (message or "").lower()
@@ -1724,55 +1851,12 @@ class WikiChatService:
         )
 
     @staticmethod
-    def _dedupe_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        seen = set()
-        result = []
-        for card in cards:
-            urls = card.get("source_urls") or []
-            key = (
-                str(card.get("title", "")).strip().lower(),
-                str(urls[0] if urls else card.get("markdown_path", "")).strip().lower(),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(card)
-        return result
-
-    @staticmethod
-    def _card_text(card: Dict[str, Any]) -> str:
-        return " ".join([
-            str(card.get("title", "")),
-            str(card.get("summary", "")),
-            str(card.get("content_json", "")),
-            " ".join(card.get("related_topics", []) or []),
-        ])
-
-    @staticmethod
     def _compact_content(content: Dict[str, Any]) -> str:
         parts = []
         for key, value in (content or {}).items():
             if value not in ("", None, [], {}):
                 parts.append(f"{key}: {value}")
         return "\n".join(parts)[:1600]
-
-    @staticmethod
-    def _terms(text: str) -> List[str]:
-        terms = re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]{1,}|[\u4e00-\u9fff]{2,}", text or "")
-        return list(dict.fromkeys(terms))
-
-    @classmethod
-    def _extract_topics(cls, text: str) -> List[str]:
-        candidates = cls._terms(text)
-        stop = {"这个", "那个", "什么", "怎么", "如何", "为什么", "哪些", "一下", "帮我", "总结"}
-        result = []
-        for item in candidates:
-            if item.lower() in stop or item in stop:
-                continue
-            if len(item) > 24:
-                continue
-            result.append(item)
-        return result[:8]
 
     def _profile_context(self) -> str:
         if not self.learning_profile:
