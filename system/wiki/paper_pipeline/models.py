@@ -124,7 +124,7 @@ class DistilledCandidate(BaseModel):
     id: str = ""
     source_packet_id: str = ""
     candidate_type: Literal["paper_page", "concept_card", "method_card"]
-    page_type: Literal["PaperPage", "ConceptPage", "MethodPage"]
+    page_type: Literal["PaperPage", "TopicPage", "ConceptPage", "MethodPage"]
     title: str
     aliases: list[str] = Field(default_factory=list)
     summary: str = ""

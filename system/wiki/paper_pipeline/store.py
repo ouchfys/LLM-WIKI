@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import uuid
@@ -9,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from system.storage.layout import get_storage_layout
+from system.storage.object_storage import get_object_storage
 from system.wiki.paper_pipeline.models import DistilledCandidate, ReviewReport, SourcePacket
 
 
@@ -79,6 +82,16 @@ class PaperWikiPipelineStore:
                 )
                 """
             )
+            source_document_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(source_documents)").fetchall()
+            }
+            for name, declaration in (
+                ("docling_json_uri", "TEXT DEFAULT ''"),
+                ("docling_json_hash", "TEXT DEFAULT ''"),
+                ("docling_json_size", "INTEGER DEFAULT 0"),
+            ):
+                if source_document_columns and name not in source_document_columns:
+                    conn.execute(f"ALTER TABLE source_documents ADD COLUMN {name} {declaration}")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS document_elements (
@@ -344,7 +357,18 @@ class PaperWikiPipelineStore:
         return source_id
 
     def replace_source_evidence(self, packet: SourcePacket) -> None:
-        """Persist raw Docling JSON and its queryable projection atomically."""
+        """Persist lossless Docling JSON as an object and its projection in SQLite."""
+        raw_docling = self.dump_json(packet.docling_json)
+        raw_bytes = raw_docling.encode("utf-8")
+        docling_hash = hashlib.sha256(raw_bytes).hexdigest() if packet.docling_json else ""
+        docling_uri = ""
+        if packet.docling_json:
+            key = get_storage_layout().docling_json_key(packet.source_id, packet.source_hash or docling_hash)
+            docling_uri = get_object_storage().write_text(
+                key,
+                raw_docling,
+                content_type="application/json; charset=utf-8",
+            )
         with closing(self._connect()) as conn:
             conn.execute("DELETE FROM document_table_cells WHERE source_packet_id = ?", (packet.source_id,))
             conn.execute("DELETE FROM document_tables WHERE source_packet_id = ?", (packet.source_id,))
@@ -354,15 +378,16 @@ class PaperWikiPipelineStore:
                 """
                 INSERT INTO source_documents
                 (id, source_packet_id, content_hash, parser, parser_version, process_config_json,
-                 original_uri, docling_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 original_uri, docling_json, docling_json_uri, docling_json_hash,
+                 docling_json_size, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()), packet.source_id, packet.source_hash, packet.parser_used,
                     str(packet.metadata.get("docling_version") or ""),
                     self.dump_json({"docling_mode": packet.metadata.get("docling_mode"), "json_export_available": packet.metadata.get("json_export_available")}),
                     packet.pdf_storage_uri or packet.raw_source_path,
-                    self.dump_json(packet.docling_json), self.now_iso(),
+                    "{}", docling_uri, docling_hash, len(raw_bytes), self.now_iso(),
                 ),
             )
             for element in packet.elements:
@@ -398,6 +423,29 @@ class PaperWikiPipelineStore:
                          cell.page, self.dump_json(cell.bbox)),
                     )
             conn.commit()
+
+    def load_source_document_json(self, source_packet_id: str) -> dict[str, Any]:
+        """Load the lossless document from object storage, with legacy DB fallback."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT docling_json, docling_json_uri, docling_json_hash
+                   FROM source_documents WHERE source_packet_id = ? LIMIT 1""",
+                (source_packet_id,),
+            ).fetchone()
+        if not row:
+            return {}
+        inline = self.load_json(row["docling_json"])
+        if isinstance(inline, dict) and inline:
+            return inline
+        uri = str(row["docling_json_uri"] or "")
+        if not uri:
+            return {}
+        raw = get_object_storage().read_text(uri)
+        expected_hash = str(row["docling_json_hash"] or "")
+        if expected_hash and hashlib.sha256(raw.encode("utf-8")).hexdigest() != expected_hash:
+            raise ValueError(f"Docling artifact checksum mismatch for source {source_packet_id}.")
+        payload = self.load_json(raw)
+        return payload if isinstance(payload, dict) else {}
 
     def get_evidence(self, evidence_ids: list[str]) -> list[dict[str, Any]]:
         if not evidence_ids:
@@ -533,7 +581,8 @@ class PaperWikiPipelineStore:
     def get_source_packet(self, source_packet_id: str) -> SourcePacket | None:
         with closing(self._connect()) as conn:
             row = conn.execute(
-                """SELECT sp.packet_json, sd.id AS source_document_id, sd.parser AS source_document_parser
+                """SELECT sp.packet_json, sd.id AS source_document_id, sd.parser AS source_document_parser,
+                          sd.docling_json_uri
                    FROM source_packets sp
                    LEFT JOIN source_documents sd ON sd.source_packet_id = sp.id
                    WHERE sp.id = ? LIMIT 1""",
@@ -549,11 +598,12 @@ class PaperWikiPipelineStore:
         # was updated by source_hash.
         data["source_id"] = source_packet_id
         if not data.get("docling_json") and row["source_document_id"] and str(row["source_document_parser"] or "").startswith("docling"):
-            # The lossless document stays in source_documents.docling_json to
-            # avoid duplicating a multi-megabyte payload inside packet_json.
+            # The lossless document stays in object storage to avoid placing a
+            # multi-megabyte payload in the operational SQLite database.
             # A marker preserves the semantic distinction from fallback data.
             data["docling_json"] = {
                 "persisted_source_document_id": str(row["source_document_id"]),
+                "storage_uri": str(row["docling_json_uri"] or ""),
             }
         try:
             return SourcePacket(**data)
@@ -1094,8 +1144,8 @@ def model_json(model: Any) -> str:
 def packet_json(packet: SourcePacket) -> str:
     """Serialize packet metadata without duplicating the large raw Docling JSON.
 
-    The lossless artifact lives in source_documents.docling_json; packet_json
-    keeps the normalized elements/tables required by pipeline replay.
+    The lossless artifact lives in object storage; packet_json keeps the
+    normalized elements/tables required by pipeline replay.
     """
     if hasattr(packet, "model_dump"):
         payload = packet.model_dump(exclude={"docling_json"})

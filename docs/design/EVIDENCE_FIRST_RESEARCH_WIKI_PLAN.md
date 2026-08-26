@@ -55,7 +55,7 @@ source -> chunk -> retrieve -> answer -> forget
 
 4. **Wiki-native 查询已完成第一步，关系展开仍待实现**
    - 已新增确定性的 Wiki Resolver，通过 title、alias、页面 FTS 和元数据评分返回有解释的少量候选。
-   - 默认全目录扫描已移除，`wiki_card` 只读取 Resolver 选中的完整 Markdown 页面。
+   - 默认全目录扫描已移除，`wiki_open`（兼容旧名 `wiki_card`）只读取 Resolver 选中的面向用户的 Markdown 正文。
    - 已读取持久化 incoming/outgoing links 供工具控制器有限展开；当前仍缺少 heading/body 独立字段权重、coverage-driven 自动展开和 source audit。
 
 5. **评测只覆盖回答效果**
@@ -611,7 +611,7 @@ F  E + verified write-back and revisions
 - [x] 实现 title/alias/card-id 和元数据确定性解析。
 - [x] 将当前全目录扫描改为 resolver-first。
 - [x] 返回 bounded candidates、score、match reason 和 matched alias。
-- [x] `wiki_card` query fallback 复用同一 Resolver，并在 tool observation 中保留解析轨迹。
+- [x] `wiki_open` query fallback 复用同一 Resolver，并在 tool observation 中保留解析轨迹；`wiki_card` 仅作兼容别名。
 - [x] 打开页面时返回有上限的 incoming/outgoing Wiki links，允许控制器在下一步按关系打开页面。
 - [ ] 将页面 FTS 从 title/summary 扩展为 title/alias/summary/heading/body 的独立字段权重。
 - [ ] 增加 coverage check，自动决定是否展开关系或进入 source audit。

@@ -8,9 +8,11 @@ from system.recommender.item_scorer import ProfileAwareRecommender
 from system.paper_index.store import PaperIndexStore
 from system.wiki.wiki_store import WikiStore
 from system.wiki.wiki_chat import WikiChatService
+from system.wiki.wiki_resolver import WikiResolver
 from system.wiki.chunk_index import WikiChunkIndex
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 from system.wiki.table_qa import TableQuestionAnswerer
+from system.agent_runtime import AgentRunStore
 from system.search.resource_recommender import LearningResourceRecommender
 from system.search.web_fetch import WebFetchTool
 from system.search.web_search import WebSearchTool
@@ -24,12 +26,17 @@ from system.core.config import (
     WEB_SEARCH_MAX_RESULTS,
     WEB_SEARCH_MODE,
     WEB_SEARCH_TIMEOUT_SECONDS,
+    WIKI_EMBEDDING_BATCH_SIZE,
+    WIKI_EMBEDDING_MODEL,
+    WIKI_RRF_K,
+    WIKI_VECTOR_SEARCH_ENABLED,
 )
 
 try:
-    from system.core.siliconflow_client import SiliconFlowChat
+    from system.core.siliconflow_client import SiliconFlowChat, SiliconFlowEmbeddings
 except Exception:
     SiliconFlowChat = None
+    SiliconFlowEmbeddings = None
 
 
 @lru_cache(maxsize=1)
@@ -152,6 +159,29 @@ def get_chunk_index() -> WikiChunkIndex:
 
 
 @lru_cache(maxsize=1)
+def get_wiki_embeddings():
+    if not WIKI_VECTOR_SEARCH_ENABLED or SiliconFlowEmbeddings is None:
+        return None
+    try:
+        return SiliconFlowEmbeddings(
+            model=WIKI_EMBEDDING_MODEL,
+            batch_size=WIKI_EMBEDDING_BATCH_SIZE,
+        )
+    except Exception as exc:
+        print(f"[deps] Wiki embeddings unavailable: {exc}")
+        return None
+
+
+@lru_cache(maxsize=1)
+def get_wiki_resolver() -> WikiResolver:
+    return WikiResolver(
+        get_wiki_store(),
+        embedder=get_wiki_embeddings(),
+        rrf_k=WIKI_RRF_K,
+    )
+
+
+@lru_cache(maxsize=1)
 def get_web_search() -> WebSearchTool:
     return WebSearchTool(
         mode=WEB_SEARCH_MODE,
@@ -188,6 +218,8 @@ def get_recommender() -> ProfileAwareRecommender:
 
 @lru_cache(maxsize=1)
 def get_wiki_chat() -> WikiChatService:
+    pipeline_store = PaperWikiPipelineStore(db_path=get_wiki_store().db_path)
+    runtime = AgentRunStore(db_path=get_wiki_store().db_path)
     return WikiChatService(
         wiki_store=get_wiki_store(),
         learning_profile=get_learning_profile(),
@@ -197,8 +229,11 @@ def get_wiki_chat() -> WikiChatService:
         web_search=get_web_search(),
         web_fetch=get_web_fetch(),
         resource_recommender=get_resource_recommender(),
+        wiki_resolver=get_wiki_resolver(),
+        evidence_store=pipeline_store,
+        runtime=runtime,
         table_qa=TableQuestionAnswerer(
-            PaperWikiPipelineStore(db_path=get_wiki_store().db_path),
+            pipeline_store,
             llm=get_chat_llm(),
         ),
     )

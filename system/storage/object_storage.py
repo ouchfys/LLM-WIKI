@@ -43,7 +43,14 @@ class ObjectStorage:
             rel = local_path.name
         return self._normalize_key(rel)
 
-    def upload_text(self, key: str, text: str, content_type: str = "text/markdown; charset=utf-8") -> str:
+    def write_text(self, key: str, text: str, content_type: str = "text/plain; charset=utf-8") -> str:
+        """Persist text to the configured durable backend and return its URI.
+
+        ``upload_text`` historically became a no-op when the backend was local.
+        That was safe only for callers which had already written a cache file.
+        Evidence artifacts do not have such a cache, so storage writes now have
+        one explicit, backend-independent contract.
+        """
         key = self._normalize_key(key)
         if self.enabled:
             self._get_bucket().put_object(
@@ -51,6 +58,24 @@ class ObjectStorage:
                 text.encode("utf-8"),
                 headers={"Content-Type": content_type},
             )
+        else:
+            path = self.local_cache_path_for_key(key)
+            if path is None:
+                raise ValueError("Object storage key cannot be empty.")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return self.uri_for_key(key)
+
+    def upload_text(self, key: str, text: str, content_type: str = "text/markdown; charset=utf-8") -> str:
+        """Upload a cache-backed text file.
+
+        Local Markdown callers already wrote their cache file, so the legacy
+        method remains a local no-op. Artifact-only callers must use
+        :meth:`write_text`, whose contract always persists data.
+        """
+        key = self._normalize_key(key)
+        if self.enabled:
+            return self.write_text(key, text, content_type=content_type)
         return self.uri_for_key(key)
 
     def read_text(self, reference: str, encoding: str = "utf-8") -> str:

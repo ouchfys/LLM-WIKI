@@ -279,7 +279,7 @@ class PaperMergeAgent:
                 {
                     "from_card_id": result.paper_card_id,
                     "to_card_id": card_id,
-                    "relation_type": "introduces" if candidate.page_type == "ConceptPage" else "uses",
+                    "relation_type": "introduces" if candidate.candidate_type == "concept_card" else "uses",
                     "source_packet_id": packet.source_id,
                     "evidence_text": _first_evidence(candidate),
                 },
@@ -307,7 +307,7 @@ class PaperMergeAgent:
                 from_card_id=result.paper_card_id,
                 to_card_id=card_id,
                 candidate=candidate,
-                relation_type="introduces" if candidate.page_type == "ConceptPage" else "uses",
+                relation_type="introduces" if candidate.candidate_type == "concept_card" else "uses",
             )
 
         if result.paper_card_id and self.approval_mode == "auto":

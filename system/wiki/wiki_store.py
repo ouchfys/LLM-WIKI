@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from system.wiki.markdown_vault import MarkdownVault
+from system.wiki.wiki_search_index import WikiSearchIndex
 
 CARD_TYPES = [
     "ConceptPage",
+    "TopicPage",
     "PaperPage",
     "MethodPage",
     "ComparePage",
@@ -41,6 +43,7 @@ class WikiStore:
         self.vault = MarkdownVault()
         self._fts_enabled = False
         self._init_db()
+        self.search_index = WikiSearchIndex(db_path=self.db_path)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -85,6 +88,7 @@ class WikiStore:
             self._ensure_column(conn, "wiki_pages", "markdown_path", "TEXT DEFAULT ''")
             self._ensure_column(conn, "wiki_pages", "dedupe_key", "TEXT DEFAULT ''")
             self._ensure_column(conn, "wiki_pages", "current_revision_id", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "wiki_pages", "index_status", "TEXT DEFAULT 'pending'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_wiki_pages_dedupe_key ON wiki_pages(dedupe_key)")
             self._init_fts(conn)
             conn.commit()
@@ -194,6 +198,7 @@ class WikiStore:
                 ),
             )
             conn.commit()
+        self._reindex_search_card(card_id)
         return card_id
 
     def get_card(self, card_id: str) -> Optional[Dict[str, Any]]:
@@ -265,6 +270,7 @@ class WikiStore:
                 values,
             )
             conn.commit()
+        self._reindex_search_card(card_id)
 
     def delete_card(self, card_id: str) -> None:
         card = self.get_card(card_id)
@@ -275,6 +281,7 @@ class WikiStore:
                 pass
             conn.execute("DELETE FROM wiki_pages WHERE id = ?", (card_id,))
             conn.commit()
+        self.search_index.delete_page(card_id)
         if card:
             self.vault.delete_card(card.get("markdown_path", ""))
 
@@ -368,6 +375,66 @@ class WikiStore:
 
     def get_cards_by_type(self, page_type: str, limit: int = 50) -> List[Dict[str, Any]]:
         return self.list_cards(page_type=page_type, limit=limit)
+
+    def get_cards_by_ids(self, card_ids: List[str]) -> List[Dict[str, Any]]:
+        """Hydrate only resolver candidates, preserving the requested order."""
+        ids = [str(item) for item in card_ids if str(item)]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT * FROM wiki_pages WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        by_id = {row["id"]: self._row_to_dict(row) for row in rows}
+        return [by_id[card_id] for card_id in ids if card_id in by_id]
+
+    def find_exact_resolution_candidates(
+        self,
+        query: str,
+        normalized_alias: str,
+        limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        """Use indexed identifiers/title/aliases without enumerating the Wiki."""
+        with closing(self._connect()) as conn:
+            try:
+                rows = conn.execute(
+                    """SELECT p.*, a.alias AS resolution_alias
+                       FROM wiki_pages p
+                       LEFT JOIN wiki_aliases a ON a.card_id = p.id
+                       WHERE p.id = ? OR lower(p.title) = lower(?) OR a.normalized_alias = ?
+                          OR (length(replace(a.normalized_alias, ' ', '')) >= 2
+                              AND instr(replace(?, ' ', ''), replace(a.normalized_alias, ' ', '')) > 0)
+                       ORDER BY CASE
+                           WHEN p.id = ? THEN 0
+                           WHEN lower(p.title) = lower(?) THEN 1
+                           WHEN a.normalized_alias = ? THEN 2
+                           ELSE 3 END,
+                           length(a.normalized_alias) DESC, p.updated_at DESC
+                       LIMIT ?""",
+                    (
+                        query, query, normalized_alias, normalized_alias, query, query,
+                        normalized_alias, max(1, min(int(limit), 50)),
+                    ),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = conn.execute(
+                    """SELECT p.*, '' AS resolution_alias FROM wiki_pages p
+                       WHERE p.id = ? OR lower(p.title) = lower(?)
+                       LIMIT ?""",
+                    (query, query, max(1, min(int(limit), 50))),
+                ).fetchall()
+        output = []
+        seen: set[str] = set()
+        for row in rows:
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            item = self._row_to_dict(row)
+            item["_resolution_alias"] = row["resolution_alias"]
+            output.append(item)
+        return output
 
     def get_recent_cards(self, limit: int = 10) -> List[Dict[str, Any]]:
         return self.list_cards(limit=limit)
@@ -471,4 +538,19 @@ class WikiStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "current_revision_id": row["current_revision_id"] if "current_revision_id" in row.keys() else "",
+            "index_status": row["index_status"] if "index_status" in row.keys() else "",
         }
+
+    def _reindex_search_card(self, card_id: str) -> None:
+        card = self.get_card(card_id)
+        if not card:
+            return
+        status = "ready"
+        try:
+            self.search_index.replace_page(card)
+        except Exception:
+            # The Markdown page remains durable; derived search can be rebuilt.
+            status = "pending"
+        with closing(self._connect()) as conn:
+            conn.execute("UPDATE wiki_pages SET index_status = ? WHERE id = ?", (status, card_id))
+            conn.commit()

@@ -81,6 +81,11 @@ def parse_markdown_card(markdown: str) -> ParsedMarkdownCard:
 
     sections = parse_sections(body)
     summary = sections.get("Summary", "").strip()
+    system_metadata = parse_system_metadata(body)
+    hidden_claims = system_metadata.get("claims") if isinstance(system_metadata, dict) else []
+    claims = parse_claims(body)
+    if not claims and isinstance(hidden_claims, list):
+        claims = [item for item in hidden_claims if isinstance(item, dict)]
     return ParsedMarkdownCard(
         id=card_id,
         title=title,
@@ -97,8 +102,8 @@ def parse_markdown_card(markdown: str) -> ParsedMarkdownCard:
         sections=sections,
         body=body.strip(),
         frontmatter=frontmatter,
-        claims=parse_claims(body),
-        system_metadata=parse_system_metadata(body),
+        claims=claims,
+        system_metadata=system_metadata,
     )
 
 

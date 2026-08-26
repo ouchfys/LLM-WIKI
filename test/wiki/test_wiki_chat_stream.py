@@ -2,8 +2,8 @@ from system.wiki.wiki_chat import ToolCallPlan, WikiChatResult, WikiChatService,
 
 
 class _StreamingWikiChatService(WikiChatService):
-    def __init__(self):
-        super().__init__(wiki_store=object(), wiki_resolver=object())
+    def __init__(self, runtime=None):
+        super().__init__(wiki_store=object(), wiki_resolver=object(), runtime=runtime)
 
     def _load_history(self, session_id):
         return []
@@ -84,3 +84,18 @@ def test_sync_chat_remains_a_regular_result():
 
     assert isinstance(result, WikiChatResult)
     assert result.answer == "test answer"
+
+
+def test_stream_chat_finishes_runtime_and_emits_final_metrics(tmp_path):
+    from system.agent_runtime import AgentRunStore
+
+    runtime = AgentRunStore(db_path=str(tmp_path / "stream-runtime.db"))
+    service = _StreamingWikiChatService(runtime=runtime)
+
+    chunks = list(service.chat_stream("test question", session_id="session-1"))
+
+    run = runtime.list_runs(limit=1)[0]
+    assert run["current_state"] == "COMPLETED"
+    traces = [chunk["trace"] for chunk in chunks if chunk.get("type") == "agent_trace"]
+    assert traces[-1]["runtime"]["run_id"] == run["id"]
+    assert traces[-1]["runtime"]["current_state"] == "COMPLETED"

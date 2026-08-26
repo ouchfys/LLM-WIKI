@@ -1,14 +1,19 @@
 """Chat with the user's private Wiki."""
 
+import hashlib
 import json
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from queue import Queue
 from threading import Thread
 from typing import Any, Callable, Dict, Generator, List, Optional
 
+from system.agent_runtime import AgentRunStore, TraceRecorder, get_current_trace
+from system.agent_runtime.tracing import estimate_token_usage
 from system.memory.profile_signal_extractor import ProfileSignalExtractor
 from system.wiki.maintenance.query_archive import QueryArchive
+from system.wiki.markdown_vault import SYSTEM_CONTENT_KEYS, readable_markdown
 from system.wiki.wiki_resolver import WikiResolver
 
 
@@ -78,6 +83,8 @@ class WikiChatService:
         resource_recommender=None,
         wiki_resolver=None,
         table_qa=None,
+        evidence_store=None,
+        runtime: Optional[AgentRunStore] = None,
     ):
         self.wiki_store = wiki_store
         self.learning_profile = learning_profile
@@ -89,43 +96,67 @@ class WikiChatService:
         self.resource_recommender = resource_recommender
         self.wiki_resolver = wiki_resolver or WikiResolver(wiki_store)
         self.table_qa = table_qa
+        self.evidence_store = evidence_store
+        self.runtime = runtime
         self.profile_extractor = ProfileSignalExtractor()
 
     def chat(self, message: str, session_id: str = "", limit: int = 6) -> WikiChatResult:
         message = (message or "").strip()
         if not message:
             return WikiChatResult(answer="你可以问我：我之前记录过哪些 RAG 评估内容？或者把某个主题整理成面试回答。")
+        run_id, recorder = self._start_chat_runtime(message, session_id, limit)
+        try:
+            binding = recorder.bind() if recorder else nullcontext()
+            with binding:
+                with self._runtime_span(recorder, "memory.load", kind="memory") as memory_span:
+                    history = self._load_history(session_id)
+                    memory_span["output"] = {"recent_turns": len(history)}
+                effective_query = self._effective_query(message, history)
+                tool_run = self._run_tool_loop(message, effective_query, history, limit=limit)
+                plan = tool_run["plan"]
+                cards = tool_run["cards"]
+                web_results = tool_run["web_results"]
+                resources = tool_run["resources"]
+                citations = [self._citation(card) for card in cards]
+                tool_plan_payload = self._plan_payload(plan)
+                trace = tool_run["trace"]
+                answer = self._answer(
+                    message,
+                    cards,
+                    history,
+                    web_results,
+                    resources,
+                    effective_query,
+                    plan,
+                    tool_observations=trace.get("tool_observations", []),
+                )
+                with self._runtime_span(recorder, "memory.update", kind="memory") as memory_span:
+                    profile_updates = self._update_profile_from_message(message, answer, cards)
+                    memory_span["output"] = {"profile_updates": len(profile_updates)}
 
-        history = self._load_history(session_id)
-        effective_query = self._effective_query(message, history)
-        tool_run = self._run_tool_loop(message, effective_query, history, limit=limit)
-        plan = tool_run["plan"]
-        cards = tool_run["cards"]
-        web_results = tool_run["web_results"]
-        resources = tool_run["resources"]
-        citations = [self._citation(card) for card in cards]
-        tool_plan_payload = self._plan_payload(plan)
-        trace = tool_run["trace"]
-        answer = self._answer(
-            message,
-            cards,
-            history,
-            web_results,
-            resources,
-            effective_query,
-            plan,
-            tool_observations=trace.get("tool_observations", []),
-        )
-        profile_updates = self._update_profile_from_message(message, answer, cards)
-        self._save_turn(session_id, message, answer, citations, resources, profile_updates, tool_plan_payload, trace)
-        return WikiChatResult(
-            answer=answer,
-            citations=citations,
-            resources=resources,
-            profile_updates=profile_updates,
-            tool_plan=tool_plan_payload,
-            trace=trace,
-        )
+            self._complete_chat_runtime(
+                run_id,
+                answer=answer,
+                cards=cards,
+                web_results=web_results,
+                resources=resources,
+            )
+            self._attach_runtime_trace(trace, run_id)
+            self._save_turn(
+                session_id, message, answer, citations, resources, profile_updates,
+                tool_plan_payload, trace,
+            )
+            return WikiChatResult(
+                answer=answer,
+                citations=citations,
+                resources=resources,
+                profile_updates=profile_updates,
+                tool_plan=tool_plan_payload,
+                trace=trace,
+            )
+        except BaseException as exc:
+            self._fail_chat_runtime(run_id, exc)
+            raise
 
     def chat_stream(self, message: str, session_id: str = "", limit: int = 6) -> Generator[dict, None, None]:
         """Stream wiki chat with agentic tool routing."""
@@ -134,108 +165,339 @@ class WikiChatService:
             yield {"type": "token", "text": "你可以问我：我之前记录过哪些 RAG 评估内容？或者把某个主题整理成面试回答。"}
             yield {"type": "done"}
             return
+        run_id, recorder = self._start_chat_runtime(message, session_id, limit)
+        try:
+            with self._runtime_span(recorder, "memory.load", kind="memory") as memory_span:
+                history = self._load_history(session_id)
+                memory_span["output"] = {"recent_turns": len(history)}
+            effective_query = self._effective_query(message, history)
+            if effective_query != message:
+                yield {
+                    "type": "tool_status",
+                    "tool": "context",
+                    "label": "Conversation Context",
+                    "status": "done",
+                    "detail": "resolved the follow-up query from recent turns",
+                }
 
-        history = self._load_history(session_id)
-        effective_query = self._effective_query(message, history)
-        if effective_query != message:
-            yield {
-                "type": "tool_status",
-                "tool": "context",
-                "label": "Conversation Context",
-                "status": "done",
-                "detail": "resolved the follow-up query from recent turns",
-            }
+            event_queue: Queue[Any] = Queue()
+            tool_run_box: Dict[str, Any] = {}
+            tool_run_done = object()
 
-        event_queue: Queue[Any] = Queue()
-        tool_run_box: Dict[str, Any] = {}
-        tool_run_done = object()
+            def run_tools() -> None:
+                try:
+                    binding = recorder.bind() if recorder else nullcontext()
+                    with binding:
+                        tool_run_box["result"] = self._run_tool_loop(
+                            message,
+                            effective_query,
+                            history,
+                            limit=limit,
+                            event_callback=event_queue.put,
+                        )
+                except BaseException as exc:  # propagate after flushing emitted events
+                    tool_run_box["error"] = exc
+                finally:
+                    event_queue.put(tool_run_done)
 
-        def run_tools() -> None:
-            try:
-                tool_run_box["result"] = self._run_tool_loop(
+            Thread(target=run_tools, name="wiki-chat-tool-stream", daemon=True).start()
+            while True:
+                event = event_queue.get()
+                if event is tool_run_done:
+                    break
+                yield event
+
+            if "error" in tool_run_box:
+                raise tool_run_box["error"]
+            tool_run = tool_run_box["result"]
+            plan = tool_run["plan"]
+            cards: List[Dict[str, Any]] = tool_run["cards"]
+            web_results: List[Any] = tool_run["web_results"]
+            resources: List[Dict[str, str]] = tool_run["resources"]
+            trace = tool_run["trace"]
+            self._attach_runtime_trace(trace, run_id)
+            yield {"type": "tool_plan", "plan": self._plan_payload(plan)}
+
+            citations = [self._citation(card) for card in cards]
+            yield {"type": "card_list", "citations": [c.__dict__ for c in citations]}
+            if resources:
+                yield {"type": "resource_list", "resources": resources}
+            yield {"type": "agent_trace", "trace": trace}
+
+            full_text = ""
+            if self.llm:
+                prompt = self._build_prompt(
                     message,
-                    effective_query,
+                    cards,
                     history,
-                    limit=limit,
-                    event_callback=event_queue.put,
+                    web_results,
+                    resources,
+                    effective_query,
+                    plan,
+                    tool_observations=trace.get("tool_observations", []),
                 )
-            except BaseException as exc:  # propagate after flushing already emitted events
-                tool_run_box["error"] = exc
-            finally:
-                event_queue.put(tool_run_done)
+                try:
+                    for token in self._stream_llm(
+                        prompt, recorder=recorder, temperature=0.1, max_tokens=1200,
+                    ):
+                        full_text += token
+                        yield {"type": "token", "text": token}
+                except Exception as exc:
+                    print(f"[WikiChatService] stream_invoke failed: {exc}, trying invoke...")
+                    try:
+                        binding = recorder.bind() if recorder else nullcontext()
+                        with binding:
+                            full_text = self._invoke_llm(
+                                prompt, operation="llm.invoke_fallback",
+                                temperature=0.1, max_tokens=1200,
+                            ).strip()
+                        if full_text:
+                            yield {"type": "token", "text": full_text}
+                    except Exception as exc2:
+                        print(f"[WikiChatService] invoke also failed: {exc2}")
+                        full_text = self._fallback_answer(cards, web_results, resources)
+                        yield {"type": "token", "text": full_text}
+            else:
+                full_text = self._fallback_answer(cards, web_results, resources)
+                yield {"type": "token", "text": full_text}
 
-        Thread(target=run_tools, name="wiki-chat-tool-stream", daemon=True).start()
-        while True:
-            event = event_queue.get()
-            if event is tool_run_done:
-                break
-            yield event
+            with self._runtime_span(recorder, "memory.update", kind="memory") as memory_span:
+                profile_updates = self._update_profile_from_message(message, full_text, cards)
+                memory_span["output"] = {"profile_updates": len(profile_updates)}
+            if profile_updates:
+                yield {"type": "profile", "updates": profile_updates}
 
-        if "error" in tool_run_box:
-            raise tool_run_box["error"]
-        tool_run = tool_run_box["result"]
-        plan = tool_run["plan"]
-        cards: List[Dict[str, Any]] = tool_run["cards"]
-        web_results: List[Any] = tool_run["web_results"]
-        resources: List[Dict[str, str]] = tool_run["resources"]
-        trace = tool_run["trace"]
-        yield {"type": "tool_plan", "plan": self._plan_payload(plan)}
+            self._complete_chat_runtime(
+                run_id,
+                answer=full_text,
+                cards=cards,
+                web_results=web_results,
+                resources=resources,
+            )
+            self._attach_runtime_trace(trace, run_id)
+            self._save_turn(
+                session_id,
+                message,
+                full_text,
+                citations,
+                resources,
+                profile_updates,
+                self._plan_payload(plan),
+                trace,
+            )
+            # Replace the earlier running snapshot with final usage/failure metrics.
+            yield {"type": "agent_trace", "trace": trace}
+            yield {"type": "done"}
+        except BaseException as exc:
+            self._fail_chat_runtime(run_id, exc)
+            raise
 
-        citations = [self._citation(card) for card in cards]
-        yield {"type": "card_list", "citations": [c.__dict__ for c in citations]}
-        if resources:
-            yield {"type": "resource_list", "resources": resources}
+    @staticmethod
+    def _runtime_span(recorder: Optional[TraceRecorder], name: str, *, kind: str = "node"):
+        if recorder:
+            return recorder.span(name, kind=kind)
+        return nullcontext({"output": {}, "usage": {}})
 
-        yield {
-            "type": "agent_trace",
-            "trace": trace,
+    def _start_chat_runtime(
+        self, message: str, session_id: str, limit: int,
+    ) -> tuple[str, Optional[TraceRecorder]]:
+        if not self.runtime:
+            return "", None
+        try:
+            run = self.runtime.create_run(
+                run_type="wiki_chat",
+                source_uri=f"session:{session_id}" if session_id else "session:anonymous",
+                approval_mode="auto",
+                context={
+                    "session_id": session_id,
+                    "message_chars": len(message),
+                    "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    "limit": int(limit),
+                },
+            )
+            run_id = str(run["id"])
+            self.runtime.transition(run_id, "CHAT_RUNNING", reason="chat turn accepted")
+            return run_id, TraceRecorder(self.runtime, run_id)
+        except Exception as exc:
+            print(f"[WikiChatService] runtime trace unavailable: {exc}")
+            return "", None
+
+    def _complete_chat_runtime(
+        self,
+        run_id: str,
+        *,
+        answer: str,
+        cards: List[Dict[str, Any]],
+        web_results: List[Any],
+        resources: List[Dict[str, str]],
+    ) -> None:
+        if not self.runtime or not run_id:
+            return
+        self.runtime.transition(
+            run_id,
+            "COMPLETED",
+            result={
+                "answer_chars": len(answer or ""),
+                "answer_sha256": hashlib.sha256((answer or "").encode("utf-8")).hexdigest(),
+                "wiki_page_count": len(cards or []),
+                "web_result_count": len(web_results or []),
+                "resource_count": len(resources or []),
+            },
+            reason="answer persisted",
+            expected_state="CHAT_RUNNING",
+        )
+
+    def _fail_chat_runtime(self, run_id: str, exc: BaseException) -> None:
+        if not self.runtime or not run_id:
+            return
+        try:
+            run = self.runtime.get_run(run_id) or {}
+            if run.get("current_state") == "CHAT_RUNNING":
+                self.runtime.mark_failed(run_id, str(exc) or exc.__class__.__name__)
+        except Exception as trace_exc:
+            print(f"[WikiChatService] could not mark chat trace failed: {trace_exc}")
+
+    def _attach_runtime_trace(self, trace: Dict[str, Any], run_id: str) -> None:
+        if self.runtime and run_id:
+            trace["runtime"] = self.runtime.summarize_trace(run_id)
+
+    def _model_name(self) -> str:
+        if not self.llm:
+            return ""
+        return str(
+            getattr(self.llm, "model", "")
+            or getattr(self.llm, "model_name", "")
+            or self.llm.__class__.__name__
+        )
+
+    @staticmethod
+    def _model_trace_input(payload: Any, *, max_tokens: int, temperature: float) -> Dict[str, Any]:
+        serialized = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, default=str)
+        return {
+            "input_chars": len(serialized),
+            "input_sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
         }
 
-        full_text = ""
-        if self.llm:
-            prompt = self._build_prompt(
-                message,
-                cards,
-                history,
-                web_results,
-                resources,
-                effective_query,
-                plan,
-                tool_observations=trace.get("tool_observations", []),
-            )
-            try:
-                for token in self.llm.stream_invoke(prompt, temperature=0.1, max_tokens=1200):
-                    full_text += token
-                    yield {"type": "token", "text": token}
-            except Exception as exc:
-                print(f"[WikiChatService] stream_invoke failed: {exc}, trying invoke...")
-                try:
-                    full_text = self.llm.invoke(prompt, temperature=0.1, max_tokens=1200).strip()
-                    if full_text:
-                        yield {"type": "token", "text": full_text}
-                except Exception as exc2:
-                    print(f"[WikiChatService] invoke also failed: {exc2}")
-                    full_text = self._fallback_answer(cards, web_results, resources)
-                    yield {"type": "token", "text": full_text}
-        else:
-            full_text = self._fallback_answer(cards, web_results, resources)
-            yield {"type": "token", "text": full_text}
+    def _invoke_llm(
+        self,
+        prompt: str,
+        *,
+        operation: str = "llm.invoke",
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        trace = get_current_trace()
+        if not trace:
+            return self.llm.invoke(prompt, temperature=temperature, max_tokens=max_tokens)
+        with trace.span(
+            operation,
+            kind="model",
+            model=self._model_name(),
+            tool_name="invoke",
+            input_data=self._model_trace_input(
+                prompt, max_tokens=max_tokens, temperature=temperature,
+            ),
+        ) as span:
+            output = self.llm.invoke(prompt, temperature=temperature, max_tokens=max_tokens)
+            span["output"].update({
+                "response_chars": len(output or ""),
+                "response_sha256": hashlib.sha256((output or "").encode("utf-8")).hexdigest(),
+                "attempts": max(1, int(span.get("retry_count") or 0) + 1),
+            })
+            if not span.get("usage"):
+                span["usage"] = estimate_token_usage(prompt, output)
+            return output
 
-        profile_updates = self._update_profile_from_message(message, full_text, cards)
-        if profile_updates:
-            yield {"type": "profile", "updates": profile_updates}
-
-        self._save_turn(
-            session_id,
-            message,
-            full_text,
-            citations,
-            resources,
-            profile_updates,
-            self._plan_payload(plan),
-            trace,
+    def _call_llm_tools(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+    ) -> Dict[str, Any]:
+        trace = get_current_trace()
+        call = lambda: self.llm.tool_call(
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
-        yield {"type": "done"}
+        if not trace:
+            return call()
+        trace_input = {"messages": messages, "tool_names": [item.get("function", {}).get("name", "") for item in tools]}
+        with trace.span(
+            "llm.tool_call",
+            kind="model",
+            model=self._model_name(),
+            tool_name="tool_call",
+            input_data=self._model_trace_input(
+                trace_input, max_tokens=max_tokens, temperature=temperature,
+            ),
+        ) as span:
+            output = call()
+            output_text = json.dumps(output, ensure_ascii=False, default=str)
+            span["output"].update({
+                "response_chars": len(output_text),
+                "response_sha256": hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+                "tool_call_count": len(output.get("tool_calls") or []) if isinstance(output, dict) else 0,
+                "attempts": max(1, int(span.get("retry_count") or 0) + 1),
+            })
+            if not span.get("usage"):
+                span["usage"] = estimate_token_usage(trace_input, output)
+            return output
+
+    def _stream_llm(
+        self,
+        prompt: str,
+        *,
+        recorder: Optional[TraceRecorder],
+        temperature: float,
+        max_tokens: int,
+    ) -> Generator[str, None, None]:
+        if not recorder:
+            yield from self.llm.stream_invoke(
+                prompt, temperature=temperature, max_tokens=max_tokens,
+            )
+            return
+        span = recorder.start_span(
+            "llm.stream_invoke",
+            kind="model",
+            model=self._model_name(),
+            tool_name="stream_invoke",
+            input_data=self._model_trace_input(
+                prompt, max_tokens=max_tokens, temperature=temperature,
+            ),
+        )
+        output_parts: List[str] = []
+        try:
+            iterator = iter(self.llm.stream_invoke(
+                prompt, temperature=temperature, max_tokens=max_tokens,
+            ))
+            while True:
+                try:
+                    with recorder.activate_span(span):
+                        token = next(iterator)
+                except StopIteration:
+                    break
+                output_parts.append(token)
+                yield token
+        except BaseException as exc:
+            recorder.finish_span(span, status="failed", error=str(exc) or exc.__class__.__name__)
+            raise
+        else:
+            output = "".join(output_parts)
+            span["output"].update({
+                "response_chars": len(output),
+                "response_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+                "attempts": max(1, int(span.get("retry_count") or 0) + 1),
+            })
+            if not span.get("usage"):
+                span["usage"] = estimate_token_usage(prompt, output)
+            recorder.finish_span(span, status="completed")
 
     def _plan_tools(self, message: str, effective_query: str, history: List) -> WikiToolPlan:
         fallback = self._fallback_tool_plan(message, effective_query)
@@ -244,19 +506,21 @@ class WikiChatService:
 
         prompt = (
             "Return a strict JSON object for routing a private Wiki chat. Do not answer the user.\n"
-            "Allowed tools: wiki_search, wiki_card, web_search, resource_recommend.\n"
+            "Allowed tools: wiki_search, wiki_open, table_query, evidence_lookup, web_search, web_fetch, resource_recommend.\n"
             "Rules:\n"
-            "- Prefer wiki_search/wiki_card for stable concepts, paper notes, and interview prep already in the user's Wiki.\n"
+            "- Prefer wiki_search/wiki_open for stable concepts, paper notes, and interview prep already in the user's Wiki.\n"
             "- Use web_search only for latest/current/mainstream status, GitHub/arXiv/source discovery, or when private Wiki is likely missing.\n"
             "- Use resource_recommend only when the user asks for papers, tutorials, videos, links, or follow-up reading.\n"
-            "- wiki_card means opening the strongest returned Wiki cards as skill-like memory, not raw chunk dumping.\n"
+            "- wiki_open opens only the strongest returned Wiki pages; evidence_lookup is only for a claim that needs source verification.\n"
             "Schema: {\"intent\": string, \"answer_mode\": string, \"tools\": [{\"name\": string, \"query\": string, \"reason\": string}]}.\n\n"
             f"User message: {message}\n"
             f"Effective query: {effective_query}\n"
             f"Recent turns: {history[-2:] if history else []}\n"
         )
         try:
-            raw = self.llm.invoke(prompt, temperature=0.0, max_tokens=400).strip()
+            raw = self._invoke_llm(
+                prompt, operation="llm.route_plan", temperature=0.0, max_tokens=400,
+            ).strip()
             parsed = self._parse_json_object(raw)
             plan = self._normalize_tool_plan(parsed, effective_query)
             if plan.tools:
@@ -271,7 +535,7 @@ class WikiChatService:
         use_resources = self._should_recommend_resources(query)
         tools = [
             ToolCallPlan("wiki_search", query, "resolve a small set of relevant compiled Wiki pages"),
-            ToolCallPlan("wiki_card", query, "open the strongest resolved Wiki pages"),
+            ToolCallPlan("wiki_open", query, "open the strongest resolved Wiki pages"),
         ]
         if use_web:
             tools.append(ToolCallPlan("web_search", self._web_search_query(query), "freshness or external source check"))
@@ -381,27 +645,25 @@ class WikiChatService:
             and not web_results
         ):
             auto_call = AgentToolCall(
-                name="wiki_card",
+                name="wiki_open",
                 arguments={"query": effective_query or message, "limit": limit},
                 reason="open the strongest resolved Wiki pages",
             )
             emit(self._tool_running_event(auto_call))
-            auto = self._open_cards(
-                auto_call,
-                query=effective_query or message,
-                call_limit=limit,
+            observation = self._execute_agent_tool_call(
+                call=auto_call,
+                cards=cards,
+                web_results=web_results,
+                resources=resources,
+                limit=limit,
             )
-            if auto:
-                self._merge_cards(cards, auto)
-                observation = AgentToolObservation(
-                    tool="wiki_card",
-                    query=effective_query or message,
-                    status="done",
-                    summary=f"auto-opened {len(auto)} resolved Wiki pages (no card_id selected)",
-                    items=[self._trace_card(card) for card in auto],
+            if observation.status == "done":
+                observation.summary = (
+                    f"auto-opened {len(observation.items)} resolved Wiki pages "
+                    "(no card_id selected)"
                 )
                 observations.append(observation)
-                executed_calls.append(ToolCallPlan("wiki_card", effective_query or message, observation.summary))
+                executed_calls.append(ToolCallPlan("wiki_open", effective_query or message, observation.summary))
                 emit(self._tool_status_event(observation), record=True)
 
         if (
@@ -503,7 +765,9 @@ class WikiChatService:
             limit=limit,
         )
         try:
-            raw = self.llm.invoke(prompt, temperature=0.0, max_tokens=900).strip()
+            raw = self._invoke_llm(
+                prompt, operation="llm.plan_next_tools", temperature=0.0, max_tokens=900,
+            ).strip()
             parsed = self._parse_json_object(raw)
         except Exception as exc:
             print(f"[WikiChatService] tool loop planning failed: {exc}")
@@ -530,10 +794,9 @@ class WikiChatService:
             limit=limit,
         )
         try:
-            raw_message = self.llm.tool_call(
+            raw_message = self._call_llm_tools(
                 messages=messages,
                 tools=self._native_tool_specs(),
-                tool_choice="auto",
                 temperature=0.0,
                 max_tokens=600,
             )
@@ -559,13 +822,14 @@ class WikiChatService:
             "Rules:\n"
             "- Call wiki_search first with the effective query. It returns only a small ranked set of compiled Wiki pages "
             "with card_id, score, and match reasons; it never returns raw paper chunks.\n"
-            "- Read the resolved results, then call wiki_card with card_ids = the 1-5 most relevant values to open their full contents.\n"
-            "- The same topic may have several cards of different page_type (e.g. a PaperPage and a ConceptPage); pick the ones that fit the question.\n"
+            "- Read the resolved results, then call wiki_open with card_ids = the 1-5 most relevant values to open their readable contents.\n"
+            "- The same topic may have a PaperPage and a TopicPage; pick the ones that fit the question.\n"
             "- Use web_search only for latest/current/source discovery or when the resolved Wiki pages clearly lack the topic.\n"
             "- If the user provides a concrete URL and asks to inspect it, call web_fetch directly with that URL.\n"
             "- Use web_fetch after web_search to open a concrete URL before treating web information as evidence.\n"
             "- Use resource_recommend only when the user asks for follow-up papers, tutorials, videos, links, or study resources.\n"
-            "- After opening relevant Wiki cards, use table_query for exact numbers, rankings, table comparisons, or cross-paper aggregation.\n"
+            "- Use table_query only for exact numbers, rankings, table comparisons, or cross-paper aggregation.\n"
+            "- Use evidence_lookup only when an important claim needs source verification; do not fetch raw PDF evidence by default.\n"
             "- Once you have opened the relevant cards (or decided none fit), return no tool calls.\n"
         )
         user_text = (
@@ -616,15 +880,15 @@ class WikiChatService:
                 "type": "function",
                 "function": {
                     "name": "wiki_search",
-                    "description": "Resolve a query to a small ranked set of compiled Wiki pages using title, aliases, page metadata, and page full-text search. Returns match reasons and card_ids; it never returns the full catalog or raw paper chunks.",
+                    "description": "Resolve a query to a small ranked set of compiled Wiki pages using section FTS, multilingual vector recall, and RRF. Returns match reasons and card_ids; never returns the full catalog or raw paper chunks.",
                     "parameters": schema(query_limit, ["query"]),
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "wiki_card",
-                    "description": "Open specific compiled Wiki pages by card_id from wiki_search and load their full Markdown body plus a bounded list of linked Wiki pages for optional traversal.",
+                    "name": "wiki_open",
+                    "description": "Open specific compiled Wiki pages by card_id from wiki_search and load only reader-facing Markdown plus a bounded list of linked pages.",
                     "parameters": schema(
                         {
                             "card_ids": {
@@ -636,6 +900,21 @@ class WikiChatService:
                             "limit": {"type": "integer", "description": "Maximum number of cards to open.", "minimum": 1, "maximum": 8},
                         },
                         [],
+                    ),
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "evidence_lookup",
+                    "description": "On demand, verify a specific claim against normalized source paragraphs or table evidence for selected Wiki pages.",
+                    "parameters": schema(
+                        {
+                            "query": {"type": "string", "description": "Claim or fact to verify."},
+                            "card_ids": {"type": "array", "items": {"type": "string"}, "description": "Opened Wiki page IDs whose sources should be checked."},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 8},
+                        },
+                        ["query"],
                     ),
                 },
             },
@@ -683,7 +962,7 @@ class WikiChatService:
         tool_calls = data.get("tool_calls") or []
         if not isinstance(tool_calls, list):
             return []
-        allowed = {"wiki_search", "wiki_card", "table_query", "web_search", "web_fetch", "resource_recommend"}
+        allowed = {"wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend"}
         result: List[AgentToolCall] = []
         for item in tool_calls:
             if not isinstance(item, dict):
@@ -752,7 +1031,7 @@ class WikiChatService:
             f"{tool_specs}\n\n"
             "Tool-use rules:\n"
             "- Call wiki_search first with the effective query. It deterministically returns only a small ranked set of compiled Wiki pages and explains each match.\n"
-            "- Read those results, then call wiki_card with card_ids = the 1-5 most relevant values to open their full contents.\n"
+            "- Read those results, then call wiki_open with card_ids = the 1-5 most relevant values to open their readable contents.\n"
             "- The same topic may have several cards of different page_type; pick the ones that fit the question.\n"
             "- Use web_search only for latest/current/source discovery or when the resolved Wiki pages clearly lack the topic.\n"
             "- If the user provides a concrete URL and asks to inspect it, call web_fetch directly with that URL.\n"
@@ -779,14 +1058,19 @@ class WikiChatService:
                 "arguments": {"query": "string", "limit": "integer"},
             },
             {
-                "name": "wiki_card",
-                "description": "Open compiled Wiki pages by card_id and return their full Markdown plus bounded outgoing/incoming Wiki links.",
+                "name": "wiki_open",
+                "description": "Open compiled Wiki pages by card_id and return reader-facing Markdown plus bounded Wiki links.",
                 "arguments": {"card_ids": "string[]", "query": "string", "limit": "integer"},
             },
             {
                 "name": "table_query",
                 "description": "Resolve structured tables and run exact/cross-paper read-only DuckDB analysis with table-cell citations.",
                 "arguments": {"query": "string", "card_ids": "string[]", "sql": "optional SELECT", "limit": "integer"},
+            },
+            {
+                "name": "evidence_lookup",
+                "description": "Verify one important claim against source paragraphs or table evidence on demand.",
+                "arguments": {"query": "string", "card_ids": "string[]", "limit": "integer"},
             },
             {
                 "name": "web_search",
@@ -813,7 +1097,7 @@ class WikiChatService:
     ) -> List[AgentToolCall]:
         if not isinstance(data, dict) or data.get("finish") is True:
             return []
-        allowed = {"wiki_search", "wiki_card", "table_query", "web_search", "web_fetch", "resource_recommend"}
+        allowed = {"wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend"}
         raw_calls = data.get("tool_calls")
         if raw_calls is None:
             raw_calls = data.get("tools")
@@ -848,6 +1132,50 @@ class WikiChatService:
         resources: List[Dict[str, str]],
         limit: int,
     ) -> AgentToolObservation:
+        trace = get_current_trace()
+        if not trace:
+            return self._execute_agent_tool_call_impl(
+                call, cards, web_results, resources, limit,
+            )
+        safe_arguments = {
+            "query_chars": len(str(call.arguments.get("query") or "")),
+            "query_sha256": hashlib.sha256(
+                str(call.arguments.get("query") or "").encode("utf-8")
+            ).hexdigest(),
+            "limit": max(1, min(int(call.arguments.get("limit") or limit), 8)),
+            "card_ids": [str(value) for value in (call.arguments.get("card_ids") or [])[:8]],
+            "has_url": bool(call.arguments.get("url")),
+            "has_sql": bool(call.arguments.get("sql")),
+            "reason": str(call.reason or "")[:300],
+        }
+        with trace.span(
+            call.name,
+            kind="tool",
+            tool_name=call.name,
+            input_data=safe_arguments,
+        ) as span:
+            observation = self._execute_agent_tool_call_impl(
+                call, cards, web_results, resources, limit,
+            )
+            span["output"] = {
+                "status": observation.status,
+                "summary": observation.summary[:500],
+                "item_count": len(observation.items or []),
+                **({"retry_count": span.get("retry_count", 0)} if span.get("retry_count") else {}),
+            }
+            if observation.status != "done":
+                span["status"] = "failed"
+                span["error"] = observation.summary[:1000]
+            return observation
+
+    def _execute_agent_tool_call_impl(
+        self,
+        call: AgentToolCall,
+        cards: List[Dict[str, Any]],
+        web_results: List[Any],
+        resources: List[Dict[str, str]],
+        limit: int,
+    ) -> AgentToolObservation:
         query = str(call.arguments.get("query") or "").strip()
         call_limit = max(1, min(int(call.arguments.get("limit") or limit), 8))
         if call.name == "wiki_search":
@@ -859,7 +1187,7 @@ class WikiChatService:
                 summary=f"resolved {len(resolved)} compiled Wiki pages",
                 items=resolved,
             )
-        if call.name == "wiki_card":
+        if call.name in {"wiki_open", "wiki_card"}:
             opened = self._open_cards(call, query, call_limit)
             self._merge_cards(cards, opened)
             return AgentToolObservation(
@@ -869,6 +1197,8 @@ class WikiChatService:
                 summary=f"opened {len(opened)} wiki cards" if opened else "no card matched the given card_id(s)",
                 items=[self._trace_card(card) for card in opened],
             )
+        if call.name == "evidence_lookup":
+            return self._lookup_evidence(call, query, call_limit)
         if call.name == "table_query":
             if not self.table_qa:
                 return AgentToolObservation(tool=call.name, query=query, status="error", summary="table query unavailable")
@@ -921,11 +1251,20 @@ class WikiChatService:
                 )
             attempts: List[Any] = []
             errors: List[str] = []
-            for url in urls[: max(1, min(call_limit, 4))]:
+            candidate_urls = urls[: max(1, min(call_limit, 4))]
+            for url_index, url in enumerate(candidate_urls):
                 try:
                     fetched = self.web_fetch.fetch(url, query=query, max_passages=min(call_limit, 4))
                 except Exception as exc:
                     errors.append(f"{url}: {exc}")
+                    if url_index < len(candidate_urls) - 1:
+                        from system.agent_runtime.tracing import record_current_retry
+
+                        record_current_retry(
+                            kind="tool", name="web_fetch", tool_name="web_fetch",
+                            attempt=url_index + 1, max_attempts=len(candidate_urls),
+                            error=str(exc),
+                        )
                     continue
                 attempts.append(fetched)
                 if getattr(fetched, "status", "") == "done":
@@ -939,6 +1278,14 @@ class WikiChatService:
                         items=[self._trace_web_result(fetched)],
                     )
                 errors.append(f"{url}: {getattr(fetched, 'error', '') or 'web_fetch failed'}")
+                if url_index < len(candidate_urls) - 1:
+                    from system.agent_runtime.tracing import record_current_retry
+
+                    record_current_retry(
+                        kind="tool", name="web_fetch", tool_name="web_fetch",
+                        attempt=url_index + 1, max_attempts=len(candidate_urls),
+                        error=str(getattr(fetched, "error", "") or "web_fetch failed"),
+                    )
 
             if requested_url and len(urls) == 1:
                 status = "error"
@@ -1007,6 +1354,60 @@ class WikiChatService:
                 opened.append(card)
         return opened
 
+    def _lookup_evidence(
+        self,
+        call: "AgentToolCall",
+        query: str,
+        call_limit: int,
+    ) -> AgentToolObservation:
+        if not self.evidence_store:
+            return AgentToolObservation(
+                tool=call.name, query=query, status="error", summary="evidence lookup unavailable"
+            )
+        source_ids: list[str] = []
+        for card_id in self._extract_card_ids(call.arguments):
+            try:
+                links = self.evidence_store.list_card_links(card_id)
+            except Exception:
+                links = {}
+            for source in links.get("sources", []) if isinstance(links, dict) else []:
+                source_id = str(source.get("source_packet_id") or "")
+                if source_id and source_id not in source_ids:
+                    source_ids.append(source_id)
+            card = self.wiki_store.get_card(card_id)
+            content = card.get("content_json", {}) if card else {}
+            for source_id in [content.get("source_packet_id"), *(content.get("source_packet_ids") or [])]:
+                source_id = str(source_id or "")
+                if source_id and source_id not in source_ids:
+                    source_ids.append(source_id)
+        items: list[dict[str, Any]] = []
+        for source_id in source_ids[:6]:
+            for evidence in self.evidence_store.find_evidence(
+                source_id,
+                text=query,
+                limit=call_limit,
+            ):
+                heading = evidence.get("heading_path")
+                if heading is None and evidence.get("heading_path_json"):
+                    heading = self.evidence_store.load_json(evidence.get("heading_path_json"))
+                items.append({
+                    "source_packet_id": source_id,
+                    "evidence_kind": evidence.get("evidence_kind", "element"),
+                    "page": evidence.get("page", 0),
+                    "section": " > ".join(heading or []) if isinstance(heading, list) else str(heading or ""),
+                    "text": str(evidence.get("text") or evidence.get("caption") or "")[:1200],
+                    "score": evidence.get("score", 0),
+                })
+        items.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+        items = items[:call_limit]
+        return AgentToolObservation(
+            tool=call.name,
+            query=query,
+            status="done" if items else "error",
+            summary=f"verified against {len(items)} source evidence item(s)" if items else "no matching source evidence",
+            items=items,
+        )
+
     def _read_card_markdown(self, card: Dict[str, Any]) -> str:
         """Read the full markdown body for a card; fall back to compacted content_json."""
         path = str(card.get("markdown_path") or "").strip()
@@ -1020,7 +1421,7 @@ class WikiChatService:
                     resolved = self.wiki_store.vault.resolve_markdown_path(path)
                     text = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
                 if text and text.strip():
-                    return text.strip()[:8000]
+                    return readable_markdown(text)[:8000]
             except Exception as exc:
                 print(f"[WikiChatService] read markdown failed for {path}: {exc}")
         return self._compact_content(card.get("content_json") or {})
@@ -1188,8 +1589,10 @@ class WikiChatService:
     def _tool_label(tool: str) -> str:
         labels = {
             "wiki_search": "Wiki Search",
-            "wiki_card": "Wiki Card",
+            "wiki_open": "Wiki Open",
+            "wiki_card": "Wiki Open",
             "table_query": "Table Query",
+            "evidence_lookup": "Evidence Lookup",
             "web_search": "Web Search",
             "web_fetch": "Web Fetch",
             "resource_recommend": "Resource Recommend",
@@ -1221,6 +1624,7 @@ class WikiChatService:
             "markdown_path",
             "score",
             "match_reason",
+            "matched_sections",
             "source_title",
             "table_id",
             "page",
@@ -1230,13 +1634,16 @@ class WikiChatService:
             "cell_id",
             "url",
             "snippet",
+            "section",
+            "text",
+            "evidence_kind",
         )
         compact: List[Dict[str, Any]] = []
         for raw in (observation.items or [])[:4]:
             if not isinstance(raw, dict):
                 continue
             item = {field: raw.get(field) for field in visible_fields if raw.get(field) not in (None, "")}
-            for text_field in ("summary", "snippet"):
+            for text_field in ("summary", "snippet", "text"):
                 if text_field in item:
                     item[text_field] = str(item[text_field])[:280]
             if item:
@@ -1268,14 +1675,14 @@ class WikiChatService:
             intent="tool_use_agent_answer",
             answer_mode="plan_call_observe_answer" if used_llm_step else "fallback_plan_call_observe_answer",
             tools=calls or [ToolCallPlan("wiki_search", default_query, "default private Wiki lookup")],
-            use_wiki=bool({"wiki_search", "wiki_card", "table_query"} & names) or not names,
+            use_wiki=bool({"wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup"} & names) or not names,
             use_web=bool({"web_search", "web_fetch"} & names),
             use_resources="resource_recommend" in names,
-            open_cards="wiki_card" in names,
+            open_cards=bool({"wiki_open", "wiki_card"} & names),
         )
 
     def _normalize_tool_plan(self, data: Dict[str, Any], default_query: str) -> WikiToolPlan:
-        allowed = {"wiki_search", "wiki_card", "table_query", "web_search", "web_fetch", "resource_recommend"}
+        allowed = {"wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend"}
         calls: List[ToolCallPlan] = []
         for item in data.get("tools", []) if isinstance(data, dict) else []:
             name = str(item.get("name", "")).strip()
@@ -1290,17 +1697,17 @@ class WikiChatService:
         if "wiki_search" not in names:
             calls.insert(0, ToolCallPlan("wiki_search", default_query, "default private Wiki lookup"))
             names.add("wiki_search")
-        if "wiki_card" not in names:
-            calls.insert(1, ToolCallPlan("wiki_card", default_query, "open matched Wiki cards"))
-            names.add("wiki_card")
+        if not {"wiki_open", "wiki_card"} & names:
+            calls.insert(1, ToolCallPlan("wiki_open", default_query, "open matched Wiki pages"))
+            names.add("wiki_open")
         return WikiToolPlan(
             intent=str(data.get("intent") or "answer_from_private_wiki") if isinstance(data, dict) else "answer_from_private_wiki",
             answer_mode=str(data.get("answer_mode") or "wiki_first") if isinstance(data, dict) else "wiki_first",
             tools=calls,
-            use_wiki=bool({"wiki_search", "wiki_card", "table_query"} & names),
+            use_wiki=bool({"wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup"} & names),
             use_web=bool({"web_search", "web_fetch"} & names),
             use_resources="resource_recommend" in names,
-            open_cards="wiki_card" in names,
+            open_cards=bool({"wiki_open", "wiki_card"} & names),
         )
 
     @staticmethod
@@ -1340,6 +1747,7 @@ class WikiChatService:
             "resources": resources or [],
             "diagnostics": {
                 "wiki_card_count": len(cards or []),
+                "wiki_page_count": len(cards or []),
                 "web_result_count": len(web_results or []),
                 "resource_count": len(resources or []),
             },
@@ -1466,7 +1874,9 @@ class WikiChatService:
                 tool_observations=tool_observations,
             )
             try:
-                return self.llm.invoke(prompt, temperature=0.1, max_tokens=1200).strip()
+                return self._invoke_llm(
+                    prompt, operation="llm.answer", temperature=0.1, max_tokens=1200,
+                ).strip()
             except Exception as exc:
                 print(f"[WikiChatService] LLM answer failed: {exc}")
         return self._fallback_answer(cards, web_results, resources)
@@ -1541,7 +1951,7 @@ class WikiChatService:
             "You are the user's private Wiki assistant. Treat tools as explicit capabilities, not a fixed RAG pipeline.\n"
             "The runtime follows a plan-call-observe-answer loop: the model proposes tool calls, Python executes them, "
             "and observations below are the only executed tool results.\n"
-            "Wiki Search/Wiki Cards are stable personal memory and should be the primary source. "
+            "Wiki Search/Wiki Open are stable personal memory and should be the primary source. "
             "Web Search discovers public links; Web Fetch opens a URL and supplies citeable external passages. "
             "Web evidence is temporary context for freshness, missing coverage, or source discovery; "
             "do not merge web facts into Wiki unless the user imports them. "
@@ -1854,7 +2264,7 @@ class WikiChatService:
     def _compact_content(content: Dict[str, Any]) -> str:
         parts = []
         for key, value in (content or {}).items():
-            if value not in ("", None, [], {}):
+            if key not in SYSTEM_CONTENT_KEYS and not key.startswith("_") and value not in ("", None, [], {}):
                 parts.append(f"{key}: {value}")
         return "\n".join(parts)[:1600]
 

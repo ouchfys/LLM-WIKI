@@ -25,7 +25,7 @@ Output language:
 Hard rules:
 - Return valid JSON only. No markdown fences and no prose outside JSON.
 - Do not invent authors, datasets, metrics, numbers, or conclusions.
-- Prefer durable ConceptPage and MethodPage cards that can be reused by later papers.
+- Prefer durable TopicPage articles that can be reused and extended by later papers.
 - Do not create cards for incidental details that are only useful inside this paper.
 - Every claim must include evidence copied or tightly paraphrased from the source,
   a section_id, and the evidence_ids shown in the source section header.
@@ -33,9 +33,9 @@ Hard rules:
   whether it supports, challenges, or supersedes the Wiki; the merge stage owns
   all cross-source relation decisions.
 - If evidence is weak, leave fields empty instead of guessing.
-- ConceptPage/MethodPage candidates must have aliases.
+- TopicPage candidates must have aliases.
 - candidate_type must be one of: paper_page, concept_card, method_card.
-- page_type must be one of: PaperPage, ConceptPage, MethodPage.
+- page_type must be one of: PaperPage, TopicPage.
 - Field quality targets:
   problem: explain the research problem and why it matters.
   key_idea: explain the central insight with enough detail for a user to understand it later.
@@ -86,7 +86,7 @@ Return this exact JSON shape:
   "knowledge_cards": [
     {{
       "candidate_type": "concept_card",
-      "page_type": "ConceptPage",
+      "page_type": "TopicPage",
       "title": "...",
       "aliases": ["..."],
       "summary": "...",
@@ -182,8 +182,12 @@ class PaperDistiller:
         page_type = item.get("page_type")
         if candidate_type not in {"paper_page", "concept_card", "method_card"}:
             return None
-        if page_type not in {"PaperPage", "ConceptPage", "MethodPage"}:
+        if page_type not in {"PaperPage", "TopicPage", "ConceptPage", "MethodPage"}:
             return None
+        if candidate_type in {"concept_card", "method_card"}:
+            # Concept/Method remain ingestion hints. Both compile to one clean,
+            # reusable topic article instead of parallel user-facing card types.
+            page_type = "TopicPage"
         title = sanitize_wiki_text(str(item.get("title") or "")).strip()
         if not title:
             return None
@@ -314,7 +318,7 @@ class PaperDistiller:
             candidate_type = "method_card" if page_type == "MethodPage" else "concept_card"
             candidates.append(DistilledCandidate(
                 candidate_type=candidate_type,
-                page_type=page_type,
+                page_type="TopicPage",
                 title=title,
                 aliases=aliases + [title],
                 summary=definition,

@@ -577,14 +577,7 @@ def _evidence_detail(element_id: str, pipeline: PaperWikiPipelineStore) -> dict[
 def _page_size(pipeline: PaperWikiPipelineStore, source_packet_id: str, page: int) -> dict[str, float]:
     if not source_packet_id or page <= 0:
         return {"width": 1.0, "height": 1.0}
-    with pipeline._connect() as conn:
-        row = conn.execute(
-            "SELECT docling_json FROM source_documents WHERE source_packet_id=? LIMIT 1",
-            (source_packet_id,),
-        ).fetchone()
-    if not row:
-        return {"width": 1.0, "height": 1.0}
-    payload = pipeline.load_json(row["docling_json"])
+    payload = pipeline.load_source_document_json(source_packet_id)
     pages = payload.get("pages") if isinstance(payload, dict) else {}
     page_data = pages.get(str(page), {}) if isinstance(pages, dict) else {}
     size = page_data.get("size") if isinstance(page_data, dict) else {}

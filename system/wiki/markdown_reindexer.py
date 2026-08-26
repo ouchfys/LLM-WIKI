@@ -112,6 +112,11 @@ class MarkdownWikiReindexer:
             markdown_path=markdown_path,
             source_kind="markdown_wiki",
         )
+        indexed_card = self.wiki_store.get_card(card.id)
+        search_units = self.wiki_store.search_index.replace_page(indexed_card) if indexed_card else 0
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("UPDATE wiki_pages SET index_status = 'ready' WHERE id = ?", (card.id,))
+            conn.commit()
         return {
             "ok": True,
             "action": action,
@@ -119,6 +124,7 @@ class MarkdownWikiReindexer:
             "title": card.title,
             "page_type": card.page_type,
             "chunks": chunks,
+            "search_units": search_units,
             "aliases": len(card.aliases),
             "sources": len(source_urls),
             "related": len(related),

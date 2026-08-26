@@ -16,7 +16,8 @@ EXECUTING_STATES = {
     "COMPILING_PROPOSAL", "COMMITTING", "REINDEXING",
 }
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    "QUEUED": {"EXTRACTING", "FAILED", "CANCELLED"},
+    "QUEUED": {"EXTRACTING", "CHAT_RUNNING", "FAILED", "CANCELLED"},
+    "CHAT_RUNNING": {"COMPLETED", "FAILED", "CANCELLED"},
     "EXTRACTING": {"DISTILLING", "FAILED", "CANCELLED"},
     "DISTILLING": {"VERIFYING", "FAILED", "CANCELLED"},
     "VERIFYING": {"REVISING", "COMPILING_PROPOSAL", "REJECTED", "FAILED", "CANCELLED"},
@@ -480,6 +481,62 @@ class AgentRunStore:
                 (run_id, max(0, int(after)), max(1, min(int(limit), 5000))),
             ).fetchall()
         return [self._event_row(row) for row in rows]
+
+    def summarize_trace(self, run_id: str) -> dict[str, Any]:
+        """Aggregate model/tool observability without double-counting started events."""
+        events = self.list_events(run_id, after=0, limit=5000)
+        run = self.get_run(run_id) or {}
+        model_events = [
+            item for item in events
+            if item.get("event_type") in {"model.completed", "model.failed"}
+        ]
+        tool_events = [
+            item for item in events
+            if item.get("event_type") in {"tool.completed", "tool.failed"}
+        ]
+        retry_events = [item for item in events if str(item.get("event_type") or "").endswith(".retry")]
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        estimated_calls = 0
+        for item in model_events:
+            usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+            prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            total = int(usage.get("total_tokens") or (prompt + completion))
+            prompt_tokens += prompt
+            completion_tokens += completion
+            total_tokens += total
+            if usage.get("estimated"):
+                estimated_calls += 1
+        wall_time_ms = 0.0
+        try:
+            created = datetime.fromisoformat(str(run.get("created_at") or ""))
+            updated = datetime.fromisoformat(str(run.get("updated_at") or ""))
+            wall_time_ms = round(max(0.0, (updated - created).total_seconds() * 1000), 2)
+        except (TypeError, ValueError):
+            pass
+        return {
+            "run_id": run_id,
+            "status": str(run.get("status") or ""),
+            "current_state": str(run.get("current_state") or ""),
+            "event_count": len(events),
+            "wall_time_ms": wall_time_ms,
+            "model_calls": len(model_events),
+            "model_failures": sum(1 for item in model_events if item.get("event_type") == "model.failed"),
+            "model_duration_ms": round(sum(float(item.get("duration_ms") or 0) for item in model_events), 2),
+            "tool_calls": len(tool_events),
+            "tool_failures": sum(1 for item in tool_events if item.get("event_type") == "tool.failed"),
+            "tool_duration_ms": round(sum(float(item.get("duration_ms") or 0) for item in tool_events), 2),
+            "retry_count": len(retry_events),
+            "token_usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "estimated_calls": estimated_calls,
+                "contains_estimates": estimated_calls > 0,
+            },
+        }
 
     def create_approval(self, *, run_id: str, revision_id: str, page_id: str, title: str = "") -> dict[str, Any]:
         existing = self.get_approval_by_revision(revision_id)

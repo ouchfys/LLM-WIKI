@@ -323,7 +323,7 @@ Responsibilities:
 
 Trigger only when:
 
-- The answer used `wiki_card`, `wiki_search`, `web_search`, or `web_fetch`.
+- The answer used `wiki_open`, `wiki_search`, `web_search`, or `web_fetch` (`wiki_card` is a compatibility alias).
 - The answer contains reusable cross-paper synthesis.
 - The user explicitly asks to remember, summarize, or save the result.
 - The answer improves a weak card or resolves an ambiguity.
@@ -345,7 +345,7 @@ Tools:
 web_search
 web_fetch
 wiki_search
-wiki_card
+wiki_open
 ```
 
 Responsibilities:

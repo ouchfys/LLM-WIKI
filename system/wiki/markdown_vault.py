@@ -17,6 +17,7 @@ from system.storage import get_object_storage, get_storage_layout
 
 PAGE_TYPE_DIRS = {
     "ConceptPage": "concepts",
+    "TopicPage": "topics",
     "PaperPage": "papers",
     "MethodPage": "methods",
     "ComparePage": "comparisons",
@@ -35,7 +36,15 @@ SYSTEM_CONTENT_KEYS = {
     "source_packet_id", "source_packet_ids", "raw_source_path",
     "pdf_storage_uri", "parser_used", "review_status", "aliases", "sources",
     "evidence_updates", "merge_history", "affected_claims", "compiler",
-    "import_impact",
+    "import_impact", "claims", "markdown_status", "review_status_text",
+    "evidence", "links",
+}
+
+INTERNAL_SECTION_HEADINGS = {
+    "claims", "knowledge claims", "evidence", "evidence updates",
+    "merge history", "affected claims", "compiler", "import impact",
+    "review status", "schema version", "compile status", "markdown status",
+    "compiler model", "pipeline", "parser used", "review status text",
 }
 
 
@@ -227,28 +236,11 @@ class MarkdownVault:
             inline_summary = re.sub(r"^#{1,6}\s*", "", inline_summary)
             body.extend(["## Summary", "", inline_summary, ""])
         body.extend(self._render_content_sections(page_type, content_json))
-        if source_urls:
-            body.extend(["## Evidence", ""])
-            for url in source_urls:
-                label = source_level or "source"
-                body.append(f"- [{label}] {url}")
-            body.append("")
         if related_topics:
             body.extend(["## Links", ""])
             for topic in related_topics:
                 body.append(f"- [[{topic}]]")
             body.append("")
-        body.extend([
-            "## Notes",
-            "",
-            "- ",
-            "",
-            "## Review Status",
-            "",
-            f"- status: {status}",
-            f"- reviewer: {review_status or 'unreviewed'}",
-            "",
-        ])
         return "\n".join(frontmatter + body).rstrip() + "\n"
 
     def _ensure_local_vault(self) -> None:
@@ -373,6 +365,16 @@ class MarkdownVault:
                 ("examples", "Examples"),
                 ("related_concepts", "Related Concepts"),
             ],
+            "TopicPage": [
+                ("definition", "Definition"),
+                ("mechanism", "Mechanism"),
+                ("method", "Method"),
+                ("findings", "Findings"),
+                ("limitations", "Limitations"),
+                ("key_takeaways", "Key Takeaways"),
+                ("examples", "Examples"),
+                ("related_concepts", "Related Topics"),
+            ],
             "MethodPage": [
                 ("definition", "Definition"),
                 ("mechanism", "Mechanism"),
@@ -410,12 +412,13 @@ class MarkdownVault:
             if key in content:
                 lines.extend(MarkdownVault._render_value(label, content.get(key)))
                 seen.add(key)
-        claims = content.get("claims")
-        if isinstance(claims, list) and claims:
-            lines.extend(MarkdownVault._render_claims(claims))
-            seen.add("claims")
         for key, value in content.items():
-            if key not in seen and not key.startswith("_") and key not in SYSTEM_CONTENT_KEYS:
+            if (
+                key not in seen
+                and not key.startswith("_")
+                and key not in SYSTEM_CONTENT_KEYS
+                and len(key) <= 64
+            ):
                 lines.extend(MarkdownVault._render_value(key.replace("_", " ").title(), value))
         system_metadata = {
             key: value for key, value in content.items()
@@ -427,22 +430,10 @@ class MarkdownVault:
         return lines
 
     @staticmethod
-    def _render_claims(claims: List[Dict[str, Any]]) -> List[str]:
-        lines = ["## Knowledge Claims", ""]
-        for claim in claims:
-            if not isinstance(claim, dict) or not str(claim.get("statement") or "").strip():
-                continue
-            payload = json.dumps(claim, ensure_ascii=False, separators=(",", ":")).replace("-->", "--\\u003e")
-            lines.append(f"<!-- wiki-claim {payload} -->")
-            status = str(claim.get("status") or "unknown")
-            claim_id = str(claim.get("id") or "")
-            lines.append(f"- **[{status}]** {claim.get('statement')}")
-        lines.append("")
-        return lines
-
-    @staticmethod
     def _render_value(label: str, value: Any) -> List[str]:
         if value in (None, "", [], {}):
+            return []
+        if isinstance(value, str) and value.strip() in {"-", "- ", "[]"}:
             return []
         lines = [f"## {label}", ""]
         if isinstance(value, list):
@@ -504,6 +495,7 @@ class MarkdownVault:
         base = {
             "PaperPage": ["paper"],
             "ConceptPage": ["concept"],
+            "TopicPage": ["topic"],
             "MethodPage": ["method"],
             "ComparePage": ["compare"],
             "InterviewQA": ["interview"],
@@ -518,3 +510,28 @@ class MarkdownVault:
                 seen.add(value.lower())
                 cleaned.append(value)
         return cleaned
+
+
+def readable_markdown(markdown: str) -> str:
+    """Return only reader-facing Wiki prose.
+
+    The sanitizer also understands legacy pages, so old compiler audit sections
+    never leak into prompts while the corpus is being migrated lazily.
+    """
+    from system.wiki.markdown_parser import split_frontmatter
+
+    _, body = split_frontmatter(markdown or "")
+    output: list[str] = []
+    skipping = False
+    for line in body.replace("\r\n", "\n").splitlines():
+        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading:
+            skipping = heading.group(1).strip().lower() in INTERNAL_SECTION_HEADINGS
+            if skipping:
+                continue
+        if not skipping:
+            output.append(line)
+    text = "\n".join(output)
+    text = re.sub(r"<!--\s*wiki-(?:system|claim)\s+.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text

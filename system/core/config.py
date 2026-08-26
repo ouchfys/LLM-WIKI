@@ -112,6 +112,19 @@ SILICONFLOW_MAINTENANCE_FAST_MODEL = os.environ.get(
     SILICONFLOW_FAST_MODEL,
 )
 
+# Section-level Wiki retrieval. The 0.6B embedding model is intentionally used
+# for recall rather than generation: it is inexpensive, multilingual, and the
+# main chat model still makes the final page selection.
+WIKI_VECTOR_SEARCH_ENABLED = os.environ.get("WIKI_VECTOR_SEARCH_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+WIKI_EMBEDDING_MODEL = os.environ.get(
+    "WIKI_EMBEDDING_MODEL",
+    "Qwen/Qwen3-Embedding-0.6B",
+)
+WIKI_EMBEDDING_BATCH_SIZE = int(os.environ.get("WIKI_EMBEDDING_BATCH_SIZE", "16"))
+WIKI_RRF_K = int(os.environ.get("WIKI_RRF_K", "60"))
+
 # ========== Docling 远程解析服务配置 ==========
 
 DOCLING_MODE = os.environ.get("DOCLING_MODE", "off")  # remote | local | off
@@ -152,6 +165,7 @@ def get_model_runtime_summary():
         "merge_model": SILICONFLOW_MERGE_MODEL,
         "maintenance_model": SILICONFLOW_MAINTENANCE_MODEL,
         "maintenance_fast_model": SILICONFLOW_MAINTENANCE_FAST_MODEL,
+        "embedding_model": WIKI_EMBEDDING_MODEL if WIKI_VECTOR_SEARCH_ENABLED else "disabled",
         "docling_mode": DOCLING_MODE,
         "docling_base_url": DOCLING_BASE_URL if DOCLING_MODE == "remote" else "n/a",
         "web_search_mode": WEB_SEARCH_MODE,

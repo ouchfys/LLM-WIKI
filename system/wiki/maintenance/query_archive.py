@@ -42,7 +42,10 @@ class QueryArchive:
         if resources:
             return True
         observations = trace.get("tool_observations", []) if isinstance(trace, dict) else []
-        return any(obs.get("tool") in {"wiki_card", "web_fetch", "web_search"} for obs in observations if isinstance(obs, dict))
+        return any(
+            obs.get("tool") in {"wiki_open", "wiki_card", "web_fetch", "web_search"}
+            for obs in observations if isinstance(obs, dict)
+        )
 
     def archive_turn(
         self,

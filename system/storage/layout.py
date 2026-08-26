@@ -53,6 +53,11 @@ class StorageLayout:
     def paper_original_key(self, filename: str) -> str:
         return f"sources/papers/originals/{self.safe_filename(filename or 'paper.pdf')}"
 
+    def docling_json_key(self, source_id: str, content_hash: str = "") -> str:
+        """Stable object key for a paper's lossless Docling document."""
+        identity = self.slug(content_hash or source_id) or "unknown"
+        return f"sources/papers/docling/{identity}/document.json"
+
     def query_artifact_path(self, category: str, name: str, suffix: str = ".md") -> Path:
         safe_suffix = suffix if suffix.startswith(".") else f".{suffix}"
         return self.queries_dir / self.slug(category or "artifacts") / f"{self.slug(name) or 'artifact'}{safe_suffix}"

@@ -95,6 +95,62 @@ def test_wiki_search_returns_bounded_resolutions_not_full_catalog(tmp_path):
     assert cards == []
 
 
+def test_resolver_never_enumerates_full_card_catalog(tmp_path, monkeypatch):
+    store, grpo_id, _, _ = _build_store(tmp_path)
+    monkeypatch.setattr(
+        store,
+        "list_cards",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("full scan is forbidden")),
+    )
+
+    results = WikiResolver(store).resolve("policy optimization", limit=2)
+
+    assert results[0]["card_id"] == grpo_id
+    assert "section_fts" in results[0]["match_reasons"]
+
+
+def test_multilingual_vector_recalls_english_page_for_chinese_query(tmp_path):
+    store = WikiStore(str(tmp_path / "vectors.sqlite"))
+    target = store.create_card(
+        title="Speculative Decoding",
+        page_type="TopicPage",
+        summary="Accelerates autoregressive generation with a draft model.",
+        content_json={"mechanism": "A small draft model proposes tokens and a target model verifies them."},
+    )
+    store.create_card(
+        title="Random Forest",
+        page_type="TopicPage",
+        summary="An ensemble of decision trees.",
+        content_json={"mechanism": "Bagging and feature sampling."},
+    )
+
+    class FakeMultilingualEmbeddings:
+        model = "fake-multilingual"
+
+        @staticmethod
+        def _vector(text):
+            lowered = text.lower()
+            if "speculative" in lowered or "推测解码" in text:
+                return [1.0, 0.0]
+            return [0.0, 1.0]
+
+        def embed_documents(self, texts):
+            return [self._vector(text) for text in texts]
+
+        def embed_query(self, text):
+            return self._vector(text)
+
+    embedder = FakeMultilingualEmbeddings()
+    store.search_index.embedder = embedder
+    while store.search_index.backfill_embeddings(limit=16):
+        pass
+
+    results = WikiResolver(store, embedder=embedder).resolve("推测解码怎么加速生成", limit=2)
+
+    assert results[0]["card_id"] == target
+    assert "multilingual_vector" in results[0]["match_reasons"]
+
+
 def test_wiki_card_query_fallback_uses_resolver_and_opens_page(tmp_path):
     store, grpo_id, _, _ = _build_store(tmp_path)
     service = WikiChatService(store, wiki_resolver=WikiResolver(store))
@@ -108,6 +164,17 @@ def test_wiki_card_query_fallback_uses_resolver_and_opens_page(tmp_path):
     assert [card["id"] for card in opened] == [grpo_id]
     assert opened[0]["_resolution"]["matched_alias"] == "GRPO"
     assert "value model" in opened[0]["_full_text"]
+
+
+def test_agent_exposes_clean_page_and_on_demand_evidence_tools():
+    native_names = {
+        item["function"]["name"] for item in WikiChatService._native_tool_specs()
+    }
+    fallback_names = {item["name"] for item in WikiChatService._tool_specs()}
+
+    assert {"wiki_search", "wiki_open", "table_query", "evidence_lookup"} <= native_names
+    assert {"wiki_search", "wiki_open", "table_query", "evidence_lookup"} <= fallback_names
+    assert "wiki_card" not in native_names
 
 
 def test_opened_page_exposes_bounded_bidirectional_wiki_links(tmp_path):

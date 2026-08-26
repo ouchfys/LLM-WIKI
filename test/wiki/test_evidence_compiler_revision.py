@@ -493,7 +493,8 @@ def test_markdown_hides_runtime_audit_fields_but_reindexes_them_losslessly() -> 
         },
         source_level="primary", source_urls=[], related_topics=[],
     )
-    assert "## Knowledge Claims" in markdown
+    assert "## Knowledge Claims" not in markdown
+    assert "GRPO does not require a critic model." in markdown  # hidden maintenance snapshot
     assert "`claim:" not in markdown
     assert "## Merge History" not in markdown
     assert "<!-- wiki-system " in markdown

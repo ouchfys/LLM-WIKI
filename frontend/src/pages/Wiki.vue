@@ -89,6 +89,9 @@
                             <strong>{{ item.title }}</strong>
                             <small v-if="item.score !== undefined">匹配分 {{ formatScore(item.score) }} · {{ formatMatchReason(item.match_reason) }}</small>
                             <small v-else>{{ item.summary || '已读取页面正文与关联关系' }}</small>
+                            <small v-if="item.matched_sections?.length">
+                              命中小节：{{ item.matched_sections.map(section => section.section).filter(Boolean).join(' / ') }}
+                            </small>
                           </button>
 
                           <div v-else-if="step.tool === 'table_query'" class="process-cell-result">
@@ -99,7 +102,7 @@
 
                           <div v-else class="process-generic-result">
                             <strong>{{ item.title || item.url || '工具结果' }}</strong>
-                            <small>{{ item.snippet || item.summary || '' }}</small>
+                            <small>{{ item.snippet || item.summary || item.text || item.section || '' }}</small>
                           </div>
                         </template>
                       </div>
@@ -251,6 +254,7 @@ type ToolEventItem = {
   markdown_path?: string
   score?: number
   match_reason?: string
+  matched_sections?: Array<{ section?: string; snippet?: string; route?: string }>
   source_title?: string
   table_id?: string
   page?: number
@@ -260,6 +264,9 @@ type ToolEventItem = {
   cell_id?: string
   url?: string
   snippet?: string
+  section?: string
+  text?: string
+  evidence_kind?: string
 }
 
 type ToolEvent = {
@@ -306,8 +313,29 @@ type AgentTrace = {
   resources?: LearningResource[]
   diagnostics?: {
     wiki_card_count?: number
+    wiki_page_count?: number
     web_result_count?: number
     resource_count?: number
+  }
+  runtime?: {
+    run_id?: string
+    status?: string
+    current_state?: string
+    wall_time_ms?: number
+    model_calls?: number
+    model_failures?: number
+    model_duration_ms?: number
+    tool_calls?: number
+    tool_failures?: number
+    tool_duration_ms?: number
+    retry_count?: number
+    token_usage?: {
+      prompt_tokens?: number
+      completion_tokens?: number
+      total_tokens?: number
+      estimated_calls?: number
+      contains_estimates?: boolean
+    }
   }
 }
 
@@ -615,8 +643,30 @@ function processSummary(message: ChatMessage) {
     if (active) return processStepTitle(active.tool)
     return message.content.trim() ? '正在生成回答' : '正在规划下一步'
   }
-  const cardCount = message.trace?.diagnostics?.wiki_card_count ?? message.trace?.retrieved_cards?.length ?? 0
-  return `${steps.length} 步${cardCount ? ` · ${cardCount} 张 Wiki 卡片` : ''}`
+  const cardCount = message.trace?.diagnostics?.wiki_page_count ?? message.trace?.diagnostics?.wiki_card_count ?? message.trace?.retrieved_cards?.length ?? 0
+  const runtime = message.trace?.runtime
+  const parts = [`${steps.length} 步`]
+  if (cardCount) parts.push(`${cardCount} 个 Wiki 页面`)
+  if (runtime?.wall_time_ms) parts.push(formatDuration(runtime.wall_time_ms))
+  if (runtime?.token_usage?.total_tokens) {
+    const prefix = runtime.token_usage.contains_estimates ? '约 ' : ''
+    parts.push(`${prefix}${formatTokenCount(runtime.token_usage.total_tokens)} tokens`)
+  }
+  if (runtime?.retry_count) parts.push(`${runtime.retry_count} 次重试`)
+  if ((runtime?.model_failures || 0) + (runtime?.tool_failures || 0) > 0) {
+    parts.push(`${(runtime?.model_failures || 0) + (runtime?.tool_failures || 0)} 次失败`)
+  }
+  return parts.join(' · ')
+}
+
+function formatDuration(value: number) {
+  if (value < 1000) return `${Math.round(value)}ms`
+  return `${(value / 1000).toFixed(1)}s`
+}
+
+function formatTokenCount(value: number) {
+  if (value < 1000) return String(value)
+  return `${(value / 1000).toFixed(1)}k`
 }
 
 function processStepTitle(tool: string) {
@@ -624,8 +674,10 @@ function processStepTitle(tool: string) {
     planning: '规划检索路径',
     context: '解析对话上下文',
     wiki_search: '搜索 Wiki',
+    wiki_open: '阅读 Wiki 页面',
     wiki_card: '阅读 Wiki 页面',
     table_query: '核验表格证据',
+    evidence_lookup: '核验原文依据',
     web_search: '搜索外部资料',
     web_fetch: '读取网页原文',
     resource_recommend: '查找延伸资源'
@@ -649,8 +701,10 @@ function processStepDetail(step: ToolEvent) {
       planning: '正在分析问题并选择可审计的检索工具。',
       context: '正在结合最近对话补全当前问题。',
       wiki_search: `正在用 ${query} 匹配标题、别名与 Wiki 索引。`,
+      wiki_open: '正在打开高相关页面，只读取面向用户的 Markdown 正文。',
       wiki_card: '正在打开高相关页面，读取 Markdown 正文与页面关系。',
       table_query: '正在定位表格、行列和原始单元格证据。',
+      evidence_lookup: '正在按需回查来源段落，核验当前关键结论。',
       web_search: `正在搜索 ${query} 的外部信息。`,
       web_fetch: '正在读取候选网页的正文段落。',
       resource_recommend: '正在筛选相关学习资料。'
@@ -660,8 +714,10 @@ function processStepDetail(step: ToolEvent) {
 
   const count = extractCount(step.detail)
   if (step.tool === 'wiki_search') return `找到 ${count || step.items?.length || 0} 个候选页面，并保留匹配分与命中原因。`
+  if (step.tool === 'wiki_open') return `已读取 ${count || step.items?.length || 0} 个高相关 Wiki 页面。`
   if (step.tool === 'wiki_card') return `已读取 ${count || step.items?.length || 0} 张高相关 Wiki 页面。`
   if (step.tool === 'table_query') return step.detail || '已定位表格单元格及页码。'
+  if (step.tool === 'evidence_lookup') return step.detail || '已按需回查原文段落。'
   if (step.tool === 'context') return '已结合最近对话解析追问指代。'
   return step.detail || (step.status === 'error' ? '工具执行失败。' : '工具执行完成。')
 }

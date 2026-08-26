@@ -238,10 +238,10 @@ class PaperReviewAgent:
             errors.append(f"invalid page_type: {candidate.page_type}")
         if candidate.candidate_type == "paper_page" and candidate.page_type != "PaperPage":
             errors.append("paper_page candidate must be PaperPage")
-        if candidate.candidate_type == "concept_card" and candidate.page_type != "ConceptPage":
-            errors.append("concept_card candidate must be ConceptPage")
-        if candidate.candidate_type == "method_card" and candidate.page_type != "MethodPage":
-            errors.append("method_card candidate must be MethodPage")
+        if candidate.candidate_type == "concept_card" and candidate.page_type not in {"TopicPage", "ConceptPage"}:
+            errors.append("concept_card candidate must compile to TopicPage")
+        if candidate.candidate_type == "method_card" and candidate.page_type not in {"TopicPage", "MethodPage"}:
+            errors.append("method_card candidate must compile to TopicPage")
         if not sanitize_wiki_text(candidate.title):
             errors.append("title is empty")
         if len(sanitize_wiki_text(candidate.summary)) < 20:
@@ -271,7 +271,12 @@ class PaperReviewAgent:
             # candidate can alias-match a same-named ConceptPage card. Only treat
             # it as a duplicate when the page_type matches; otherwise fall through
             # so distinct knowledge is not merged into the wrong card.
-            if card and str(card.get("page_type") or "") == candidate.page_type:
+            existing_type = str(card.get("page_type") or "") if card else ""
+            compatible_topic = (
+                candidate.page_type == "TopicPage"
+                and existing_type in {"TopicPage", "ConceptPage", "MethodPage"}
+            )
+            if card and (existing_type == candidate.page_type or compatible_topic):
                 return {
                     "existing_card_id": alias_hit["card_id"],
                     "existing_title": card.get("title", alias_hit["alias"]),

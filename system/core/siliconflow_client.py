@@ -20,6 +20,7 @@ from system.core.config import (
     SILICONFLOW_CHAT_MODEL,
     SILICONFLOW_FAST_MODEL,
 )
+from system.agent_runtime.tracing import record_current_retry, set_current_span_usage
 
 
 def _require_api_key(api_key: str, env_name: str = "SILICONFLOW_API_KEY") -> str:
@@ -215,6 +216,7 @@ class SiliconFlowChat:
                 )
                 response.raise_for_status()
                 data = response.json()
+                set_current_span_usage(data.get("usage") or {})
                 return data.get("choices", [{}])[0].get("message", {}) or {}
 
             except requests.exceptions.HTTPError as e:
@@ -223,19 +225,25 @@ class SiliconFlowChat:
                     f"[SiliconFlowChat] Tool call HTTP error "
                     f"(attempt {attempt}/{self.max_retries}): status={status_code}"
                 )
-                if status_code == 429:
-                    time.sleep(self.retry_delay * attempt * 2)
-                elif attempt < self.max_retries:
-                    time.sleep(self.retry_delay * attempt)
-                else:
+                if attempt >= self.max_retries:
                     raise
+                delay = self.retry_delay * attempt * (2 if status_code == 429 else 1)
+                record_current_retry(
+                    name="llm.tool_call", model=self.model, attempt=attempt,
+                    max_attempts=self.max_retries, error=str(e), delay_seconds=delay,
+                )
+                time.sleep(delay)
 
             except requests.exceptions.RequestException as e:
                 print(f"[SiliconFlowChat] Tool call request failed (attempt {attempt}/{self.max_retries}): {e}")
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_delay * attempt)
-                else:
+                if attempt >= self.max_retries:
                     raise
+                delay = self.retry_delay * attempt
+                record_current_retry(
+                    name="llm.tool_call", model=self.model, attempt=attempt,
+                    max_attempts=self.max_retries, error=str(e), delay_seconds=delay,
+                )
+                time.sleep(delay)
 
         return {}
 
@@ -280,6 +288,7 @@ class SiliconFlowChat:
                     try:
                         import json
                         data = json.loads(data_str)
+                        set_current_span_usage(data.get("usage") or {})
                         delta = data.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
                         if content:
@@ -291,22 +300,25 @@ class SiliconFlowChat:
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code if e.response is not None else "N/A"
                 print(f"[SiliconFlowChat] 流式 HTTP 错误 (尝试 {attempt}/{self.max_retries}): 状态码={status_code}")
-                if status_code == 429:
-                    import time
-                    time.sleep(self.retry_delay * attempt * 2)
-                elif attempt < self.max_retries:
-                    import time
-                    time.sleep(self.retry_delay * attempt)
-                else:
+                if attempt >= self.max_retries:
                     raise
+                delay = self.retry_delay * attempt * (2 if status_code == 429 else 1)
+                record_current_retry(
+                    name="llm.stream_invoke", model=self.model, attempt=attempt,
+                    max_attempts=self.max_retries, error=str(e), delay_seconds=delay,
+                )
+                time.sleep(delay)
 
             except requests.exceptions.RequestException as e:
                 print(f"[SiliconFlowChat] 流式请求异常 (尝试 {attempt}/{self.max_retries}): {e}")
-                if attempt < self.max_retries:
-                    import time
-                    time.sleep(self.retry_delay * attempt)
-                else:
+                if attempt >= self.max_retries:
                     raise
+                delay = self.retry_delay * attempt
+                record_current_retry(
+                    name="llm.stream_invoke", model=self.model, attempt=attempt,
+                    max_attempts=self.max_retries, error=str(e), delay_seconds=delay,
+                )
+                time.sleep(delay)
 
     # ---- 内部方法 ----
     def _build_messages(self, prompt: str, history: list = None) -> List[Dict[str, str]]:
@@ -349,6 +361,7 @@ class SiliconFlowChat:
                 )
                 response.raise_for_status()
                 data = response.json()
+                set_current_span_usage(data.get("usage") or {})
                 content = data["choices"][0]["message"]["content"]
                 return content.strip()
 
@@ -358,21 +371,27 @@ class SiliconFlowChat:
                     f"[SiliconFlowChat] HTTP 错误 (尝试 {attempt}/{self.max_retries}): "
                     f"状态码={status_code}"
                 )
-                if status_code == 429:
-                    wait = self.retry_delay * attempt * 2
-                    print(f"[SiliconFlowChat] 触发限流，等待 {wait:.1f}s...")
-                    time.sleep(wait)
-                elif attempt < self.max_retries:
-                    time.sleep(self.retry_delay * attempt)
-                else:
+                if attempt >= self.max_retries:
                     raise
+                wait = self.retry_delay * attempt * (2 if status_code == 429 else 1)
+                if status_code == 429:
+                    print(f"[SiliconFlowChat] 触发限流，等待 {wait:.1f}s...")
+                record_current_retry(
+                    name="llm.invoke", model=self.model, attempt=attempt,
+                    max_attempts=self.max_retries, error=str(e), delay_seconds=wait,
+                )
+                time.sleep(wait)
 
             except requests.exceptions.RequestException as e:
                 print(f"[SiliconFlowChat] 请求异常 (尝试 {attempt}/{self.max_retries}): {e}")
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_delay * attempt)
-                else:
+                if attempt >= self.max_retries:
                     raise
+                delay = self.retry_delay * attempt
+                record_current_retry(
+                    name="llm.invoke", model=self.model, attempt=attempt,
+                    max_attempts=self.max_retries, error=str(e), delay_seconds=delay,
+                )
+                time.sleep(delay)
 
         return ""
 
