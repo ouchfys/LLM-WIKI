@@ -153,6 +153,18 @@ class AgentRunStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_approvals_status ON agent_approvals(status, created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_approvals_revision ON agent_approvals(revision_id);
+
+                CREATE TABLE IF NOT EXISTS agent_run_inputs (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_run_inputs_pending
+                    ON agent_run_inputs(run_id, status, created_at);
                 """
             )
             self._ensure_column(conn, "agent_runs", "lease_owner", "TEXT DEFAULT ''")
@@ -160,6 +172,8 @@ class AgentRunStore:
             self._ensure_column(conn, "agent_runs", "heartbeat_at", "TEXT DEFAULT ''")
             self._ensure_column(conn, "agent_runs", "attempt", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "agent_runs", "resume_from_state", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "agent_runs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "agent_runs", "input_closed", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "agent_approvals", "commit_error", "TEXT DEFAULT ''")
             conn.commit()
 
@@ -211,6 +225,122 @@ class AgentRunStore:
                 (job_id,),
             ).fetchone()
         return self._run_row(row) if row else None
+
+    def request_cancel(self, run_id: str) -> dict[str, Any]:
+        """Stop accepting input immediately; the worker exits at a safe point."""
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+            if not row:
+                raise KeyError(run_id)
+            if row["current_state"] in TERMINAL_STATES | {"FAILED"}:
+                return self._run_row(row)
+            if row["run_type"] != "wiki_chat":
+                raise ValueError("This cancellation endpoint currently supports Wiki chat runs only.")
+            if row["input_closed"]:
+                raise ValueError("The answer is already being saved; wait for completion.")
+            changed = not bool(row["cancel_requested"])
+            conn.execute(
+                "UPDATE agent_runs SET cancel_requested=1, updated_at=? WHERE id=?",
+                (self.now_iso(), run_id),
+            )
+            conn.commit()
+        if changed:
+            self.append_event(run_id, event_type="run.cancel_requested", status="cancelling")
+        return self.get_run(run_id) or {}
+
+    def enqueue_input(self, run_id: str, *, kind: str, content: str, input_id: str) -> dict[str, Any]:
+        if kind not in {"interrupt", "followup", "command"}:
+            raise ValueError("Unsupported input kind")
+        content = content.strip()
+        if not content or len(content) > 8000:
+            raise ValueError("Input must contain 1–8000 characters")
+        if kind == "command" and not (
+            content == "/compact" or content.startswith("/wiki ")
+        ):
+            raise ValueError("Only /wiki <instruction> and /compact can be queued as commands")
+        now = self.now_iso()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM agent_run_inputs WHERE id=?", (input_id,)).fetchone()
+            if existing:
+                if existing["run_id"] != run_id or existing["kind"] != kind or existing["content"] != content:
+                    raise ValueError("Input id already belongs to a different request")
+                return dict(existing)
+            run = conn.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise KeyError(run_id)
+            if run["run_type"] != "wiki_chat" or run["current_state"] != "CHAT_RUNNING" or run["cancel_requested"] or run["input_closed"]:
+                raise ValueError("This run no longer accepts messages; send a new turn.")
+            count = conn.execute(
+                "SELECT COUNT(*) FROM agent_run_inputs WHERE run_id=? AND status='pending'", (run_id,)
+            ).fetchone()[0]
+            if count >= 20:
+                raise ValueError("The queue is full (20 messages)")
+            conn.execute(
+                "INSERT INTO agent_run_inputs (id,run_id,kind,content,status,created_at,updated_at) VALUES (?,?,?,?,'pending',?,?)",
+                (input_id, run_id, kind, content, now, now),
+            )
+            conn.commit()
+        self.append_event(run_id, event_type=f"input.{kind}.queued", status="pending", input_data={"input_id": input_id, "chars": len(content)})
+        return {"id": input_id, "run_id": run_id, "kind": kind, "content": content, "status": "pending"}
+
+    def list_inputs(self, run_id: str = "", *, session_id: str = "") -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            if run_id:
+                rows = conn.execute("SELECT * FROM agent_run_inputs WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT i.* FROM agent_run_inputs i JOIN agent_runs r ON r.id=i.run_id
+                       WHERE r.source_uri=? AND i.status IN ('pending','ready','blocked','running','failed')
+                       ORDER BY i.rowid LIMIT 100""", (f"session:{session_id}",)
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def take_interrupts(self, run_id: str) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute("SELECT cancel_requested,input_closed,current_state FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+            if not run or run["cancel_requested"] or run["input_closed"] or run["current_state"] != "CHAT_RUNNING":
+                return []
+            rows = conn.execute(
+                "SELECT * FROM agent_run_inputs WHERE run_id=? AND kind='interrupt' AND status='pending' ORDER BY rowid", (run_id,)
+            ).fetchall()
+            conn.execute(
+                "UPDATE agent_run_inputs SET status='consumed',updated_at=? WHERE run_id=? AND kind='interrupt' AND status='pending'",
+                (self.now_iso(), run_id),
+            )
+            conn.commit()
+        return [dict(row) for row in rows]
+
+    def close_chat_input(self, run_id: str) -> bool:
+        """Atomic fence: no cancellation/interruption can race answer persistence."""
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """UPDATE agent_runs SET input_closed=1 WHERE id=? AND cancel_requested=0
+                   AND current_state='CHAT_RUNNING' AND NOT EXISTS (
+                       SELECT 1 FROM agent_run_inputs WHERE run_id=? AND kind='interrupt' AND status='pending')""",
+                (run_id, run_id),
+            )
+            conn.commit()
+        return cursor.rowcount == 1
+
+    def update_input(self, run_id: str, input_id: str, status: str) -> dict[str, Any]:
+        # A durable claim prevents two browser tabs executing the same queued write.
+        expected = {"running": "ready", "completed": "running", "failed": "running", "blocked": "ready", "dismissed": "blocked"}.get(status)
+        if not expected:
+            raise ValueError("Unsupported queue transition")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM agent_run_inputs WHERE id=? AND run_id=?", (input_id, run_id)).fetchone()
+            if not row:
+                raise KeyError(input_id)
+            if row["status"] != expected and not (status == "dismissed" and row["status"] == "failed"):
+                raise ValueError(f"Input is {row['status']}, expected {expected}")
+            conn.execute("UPDATE agent_run_inputs SET status=?,updated_at=? WHERE id=?", (status, self.now_iso(), input_id))
+            conn.commit()
+        self.append_event(run_id, event_type=f"input.{status}", status=status, input_data={"input_id": input_id})
+        return {**dict(row), "status": status}
 
     def list_runs(self, *, limit: int = 100, status: str = "") -> list[dict[str, Any]]:
         sql = "SELECT * FROM agent_runs"
@@ -406,6 +536,11 @@ class AgentRunStore:
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (str(uuid.uuid4()), run_id, version, next_state, self.dump_json(context), now),
                 )
+            if next_state in TERMINAL_STATES | {"FAILED"}:
+                conn.execute(
+                    "UPDATE agent_run_inputs SET status=?,updated_at=? WHERE run_id=? AND status='pending'",
+                    ("ready" if next_state == "COMPLETED" else "blocked", now, run_id),
+                )
             conn.commit()
         if next_state != current:
             self.append_event(
@@ -488,11 +623,11 @@ class AgentRunStore:
         run = self.get_run(run_id) or {}
         model_events = [
             item for item in events
-            if item.get("event_type") in {"model.completed", "model.failed"}
+            if item.get("event_type") in {"model.completed", "model.failed", "model.cancelled", "model.interrupted"}
         ]
         tool_events = [
             item for item in events
-            if item.get("event_type") in {"tool.completed", "tool.failed"}
+            if item.get("event_type") in {"tool.completed", "tool.failed", "tool.cancelled", "tool.interrupted"}
         ]
         retry_events = [item for item in events if str(item.get("event_type") or "").endswith(".retry")]
         prompt_tokens = 0
@@ -524,9 +659,13 @@ class AgentRunStore:
             "wall_time_ms": wall_time_ms,
             "model_calls": len(model_events),
             "model_failures": sum(1 for item in model_events if item.get("event_type") == "model.failed"),
+            "model_cancellations": sum(1 for item in model_events if item.get("event_type") == "model.cancelled"),
+            "model_interruptions": sum(1 for item in model_events if item.get("event_type") == "model.interrupted"),
             "model_duration_ms": round(sum(float(item.get("duration_ms") or 0) for item in model_events), 2),
             "tool_calls": len(tool_events),
             "tool_failures": sum(1 for item in tool_events if item.get("event_type") == "tool.failed"),
+            "tool_cancellations": sum(1 for item in tool_events if item.get("event_type") == "tool.cancelled"),
+            "tool_interruptions": sum(1 for item in tool_events if item.get("event_type") == "tool.interrupted"),
             "tool_duration_ms": round(sum(float(item.get("duration_ms") or 0) for item in tool_events), 2),
             "retry_count": len(retry_events),
             "token_usage": {

@@ -3,12 +3,11 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any
-from urllib.parse import quote
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.deps import get_chunk_index, get_wiki_store
 from system.agent_runtime import (
@@ -39,6 +38,56 @@ class ApprovalEditPayload(BaseModel):
 
 class RetryPayload(BaseModel):
     reason: str = "manual retry"
+
+
+class RunInputPayload(BaseModel):
+    kind: Literal["interrupt", "followup", "command"] = "interrupt"
+    content: str = Field(min_length=1, max_length=8000)
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), min_length=1, max_length=100)
+
+
+class RunInputStatePayload(BaseModel):
+    status: Literal["running", "completed", "failed", "blocked", "dismissed"]
+
+
+def _control_error(exc):
+    return HTTPException(status_code=404 if isinstance(exc, KeyError) else 409, detail=str(exc))
+
+
+@router.post("/{run_id}/cancel")
+def cancel_agent_run(run_id: str, wiki: WikiStore = Depends(get_wiki_store)):
+    try:
+        return AgentRunStore(db_path=wiki.db_path).request_cancel(run_id)
+    except (KeyError, ValueError) as exc:
+        raise _control_error(exc) from exc
+
+
+@router.get("/inbox")
+def list_session_inputs(session_id: str, wiki: WikiStore = Depends(get_wiki_store)):
+    return {"items": AgentRunStore(db_path=wiki.db_path).list_inputs(session_id=session_id)}
+
+
+@router.get("/{run_id}/inputs")
+def list_run_inputs(run_id: str, wiki: WikiStore = Depends(get_wiki_store)):
+    return {"items": AgentRunStore(db_path=wiki.db_path).list_inputs(run_id)}
+
+
+@router.post("/{run_id}/inputs")
+def enqueue_run_input(run_id: str, payload: RunInputPayload, wiki: WikiStore = Depends(get_wiki_store)):
+    try:
+        return AgentRunStore(db_path=wiki.db_path).enqueue_input(
+            run_id, kind=payload.kind, content=payload.content, input_id=payload.id,
+        )
+    except (KeyError, ValueError) as exc:
+        raise _control_error(exc) from exc
+
+
+@router.post("/{run_id}/inputs/{input_id}/state")
+def update_run_input(run_id: str, input_id: str, payload: RunInputStatePayload, wiki: WikiStore = Depends(get_wiki_store)):
+    try:
+        return AgentRunStore(db_path=wiki.db_path).update_input(run_id, input_id, payload.status)
+    except (KeyError, ValueError) as exc:
+        raise _control_error(exc) from exc
 
 
 @router.post("/{run_id}/resume")
@@ -228,18 +277,6 @@ def edit_revision(
     }
 
 
-@router.get("/evidence/{element_id}")
-def get_evidence_detail(
-    element_id: str,
-    wiki: WikiStore = Depends(get_wiki_store),
-):
-    _, pipeline = _stores(wiki)
-    detail = _evidence_detail(element_id, pipeline)
-    if not detail:
-        raise HTTPException(status_code=404, detail="Evidence element not found")
-    return detail
-
-
 @router.get("/{run_id}")
 def get_agent_run(
     run_id: str,
@@ -344,18 +381,12 @@ def _approval_detail(
     claim_rows = []
     checks = {str(item.get("claim_id") or item.get("statement") or ""): item for item in verification.get("checks") or []}
     for claim in claims:
-        evidence = [
-            _evidence_detail(str(element_id), pipeline)
-            for element_id in claim.get("evidence_ids") or []
-        ]
-        evidence = [item for item in evidence if item]
         check = checks.get(str(claim.get("id") or "")) or checks.get(str(claim.get("statement") or "")) or {}
         claim_rows.append({
             **claim,
             "action": affected_actions.get(str(claim.get("id") or ""), ""),
             "change": affected_metadata.get(str(claim.get("id") or ""), {}),
             "verification": check,
-            "evidence": evidence,
         })
     affected_claims = [item for item in claim_rows if item.get("action")]
     if not affected_claims:
@@ -542,71 +573,6 @@ def _approval_decision_context(
         "after_summary": after_summary,
         "summary_changed": bool(before_summary and after_summary and before_summary != after_summary),
     }
-
-
-def _evidence_detail(element_id: str, pipeline: PaperWikiPipelineStore) -> dict[str, Any] | None:
-    rows = pipeline.get_evidence([element_id])
-    if not rows:
-        return None
-    item = dict(rows[0])
-    source_packet_id = str(item.get("source_packet_id") or "")
-    packet = pipeline.get_source_packet(source_packet_id) if source_packet_id else None
-    page = int(item.get("page") or 0)
-    page_size = _page_size(pipeline, source_packet_id, page)
-    bbox = item.get("bbox") if isinstance(item.get("bbox"), dict) else {}
-    normalized = _normalize_bbox(bbox, page_size)
-    pdf_ref = str(packet.pdf_storage_uri if packet else "")
-    return {
-        "element_id": element_id,
-        "evidence_kind": item.get("evidence_kind", "element"),
-        "source_packet_id": source_packet_id,
-        "source_title": packet.title if packet else "",
-        "text": item.get("text") or item.get("caption") or "",
-        "page": page,
-        "bbox": bbox,
-        "bbox_normalized": normalized,
-        "page_size": page_size,
-        "table_id": item.get("table_id", ""),
-        "row_index": item.get("row_index"),
-        "column_index": item.get("column_index"),
-        "pdf_storage_uri": pdf_ref,
-        "pdf_url": f"/api/wiki/object?ref={quote(pdf_ref, safe='')}" if pdf_ref else "",
-    }
-
-
-def _page_size(pipeline: PaperWikiPipelineStore, source_packet_id: str, page: int) -> dict[str, float]:
-    if not source_packet_id or page <= 0:
-        return {"width": 1.0, "height": 1.0}
-    payload = pipeline.load_source_document_json(source_packet_id)
-    pages = payload.get("pages") if isinstance(payload, dict) else {}
-    page_data = pages.get(str(page), {}) if isinstance(pages, dict) else {}
-    size = page_data.get("size") if isinstance(page_data, dict) else {}
-    try:
-        return {"width": float(size.get("width") or 1), "height": float(size.get("height") or 1)}
-    except (TypeError, ValueError):
-        return {"width": 1.0, "height": 1.0}
-
-
-def _normalize_bbox(bbox: dict[str, Any], page_size: dict[str, float]) -> dict[str, float]:
-    try:
-        width = max(float(page_size.get("width") or 1), 1.0)
-        height = max(float(page_size.get("height") or 1), 1.0)
-        left = float(bbox.get("l") or 0)
-        right = float(bbox.get("r") or left)
-        top = float(bbox.get("t") or 0)
-        bottom = float(bbox.get("b") or top)
-        x = min(left, right) / width
-        box_width = abs(right - left) / width
-        y = (height - max(top, bottom)) / height
-        box_height = abs(top - bottom) / height
-        return {
-            "x": max(0.0, min(x, 1.0)),
-            "y": max(0.0, min(y, 1.0)),
-            "width": max(0.0, min(box_width, 1.0)),
-            "height": max(0.0, min(box_height, 1.0)),
-        }
-    except (TypeError, ValueError):
-        return {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
 
 
 def _finalize_run_if_decided(

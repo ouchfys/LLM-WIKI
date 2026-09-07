@@ -2,18 +2,14 @@
   <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides">
     <n-message-provider>
     <div class="app-shell">
-      <div class="ambient-light-layer" aria-hidden="true">
-        <div class="ambient-blob ambient-blob-a"></div>
-        <div class="ambient-blob ambient-blob-b"></div>
-      </div>
       <div class="desktop-shell">
         <aside class="app-sidebar">
           <div class="sidebar-top">
             <div class="brand-lockup">
-              <img class="brand-logo" :src="logoUrl" alt="LLM-WIKI" />
+              <img class="brand-logo" :src="logoUrl" alt="PaperWiki" />
               <div class="brand-copy">
-                <strong>LLM-WIKI</strong>
-          <span>Evidence-first Research Wiki</span>
+                <strong>PaperWiki</strong>
+          <span>有据可查的个人知识库</span>
               </div>
             </div>
 
@@ -24,19 +20,20 @@
 
           <section class="sidebar-section">
             <p class="sidebar-label">工作台</p>
-            <nav class="sidebar-nav" aria-label="Primary">
+            <nav class="sidebar-nav" aria-label="主导航">
               <button
                 v-for="item in navItems"
                 :key="item.path"
                 class="sidebar-nav-item"
                 :class="{ active: isActive(item.path) }"
+                :aria-current="isActive(item.path) ? 'page' : undefined"
+                :title="item.hint"
                 type="button"
                 @click="go(item.path)"
               >
                 <span class="nav-dot"></span>
                 <div>
                   <strong>{{ item.label }}</strong>
-                  <span>{{ item.hint }}</span>
                 </div>
               </button>
             </nav>
@@ -51,13 +48,17 @@
                   v-if="recentSessions.length"
                   type="button"
                   class="subtle-action danger"
+                  :disabled="deletingSessions"
                   @click="clearAllSessions"
                 >
-                  清空
+                  清空记录
                 </button>
               </div>
             </div>
 
+            <p v-if="sessionNotice" class="session-notice" :class="{ error: sessionNoticeError }" role="status">
+              {{ sessionNotice }}
+            </p>
             <div v-if="recentSessions.length" class="session-list">
               <div
                 v-for="session in recentSessions"
@@ -96,7 +97,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { darkTheme, NButton, NConfigProvider, NMessageProvider, type GlobalThemeOverrides } from 'naive-ui'
-import { api } from './api'
+import { api, apiErrorMessage } from './api'
 
 type ChatSession = {
   id: string
@@ -107,19 +108,26 @@ type ChatSession = {
 const route = useRoute()
 const router = useRouter()
 const recentSessions = ref<ChatSession[]>([])
+const sessionNotice = ref('')
+const sessionNoticeError = ref(false)
+const deletingSessions = ref(false)
 const logoUrl = new URL('./assets/logo-ui.png', import.meta.url).href
 
 const navItems = [
   { path: '/', label: '对话', hint: '用个人知识库回答问题' },
-  { path: '/capture', label: '采集台', hint: '论文与社媒资料编译入库' },
+  { path: '/capture', label: '资料导入', hint: '论文与社媒资料编译入库' },
   { path: '/vault', label: '知识库', hint: '论文卡片与概念网络' },
-  { path: '/evaluation', label: '评测', hint: 'Benchmark 与失败样例' },
+  { path: '/evaluation', label: '质量评测', hint: '查看回答质量与失败样例' },
   { path: '/reviews', label: '冲突审批', hint: '查看冲突来源与结论对象' },
-  { path: '/daily', label: '推荐', hint: '每日论文与项目线索' }
 ]
 
 const themeOverrides: GlobalThemeOverrides = {
   common: {
+    textColorBase: '#eff1eb',
+    textColor1: '#eff1eb',
+    textColor2: '#c8cec5',
+    textColor3: '#9ea79e',
+    bodyColor: '#0b0908',
     primaryColor: '#9bb8ad',
     primaryColorHover: '#d4e3d8',
     primaryColorPressed: '#8fa99e',
@@ -129,7 +137,7 @@ const themeOverrides: GlobalThemeOverrides = {
     infoColor: '#adcabe',
     borderRadius: '10px',
     borderRadiusSmall: '8px',
-    fontFamily: '"Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif',
+    fontFamily: '"Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif',
     fontWeightStrong: '650'
   },
   Card: {
@@ -142,8 +150,8 @@ const themeOverrides: GlobalThemeOverrides = {
     color: '#11100d',
     colorFocus: '#11100d',
     colorDisabled: '#12100d',
-    textColor: '#f8fafc',
-    placeholderColor: '#64748b',
+    textColor: '#eff1eb',
+    placeholderColor: '#929991',
     border: '1px solid rgba(195, 214, 202, 0.14)',
     borderHover: '1px solid rgba(195, 214, 202, 0.34)',
     borderFocus: '1px solid rgba(195, 214, 202, 0.7)',
@@ -154,7 +162,7 @@ const themeOverrides: GlobalThemeOverrides = {
     peers: {
       InternalSelection: {
         color: '#11100d',
-        textColor: '#f8fafc',
+        textColor: '#eff1eb',
         border: '1px solid rgba(195, 214, 202, 0.14)',
         borderHover: '1px solid rgba(195, 214, 202, 0.34)',
         borderFocus: '1px solid rgba(195, 214, 202, 0.7)'
@@ -163,7 +171,7 @@ const themeOverrides: GlobalThemeOverrides = {
   },
   Tabs: {
     tabTextColorBar: '#94a3b8',
-    tabTextColorActiveBar: '#f8fafc',
+    tabTextColorActiveBar: '#eff1eb',
     tabTextColorHoverBar: '#d4e3d8',
     barColor: '#9bb8ad'
   },
@@ -206,6 +214,8 @@ async function deleteSession(sessionId: string) {
 
   try {
     await api.delete(`/wiki/sessions/${sessionId}`)
+    sessionNoticeError.value = false
+    sessionNotice.value = '已删除该会话及其全部消息。'
     if (activeSessionId.value === sessionId) {
       localStorage.removeItem('wiki_chat_session_id')
       await router.push({
@@ -215,16 +225,22 @@ async function deleteSession(sessionId: string) {
     }
     await loadSessions()
   } catch (error) {
+    sessionNoticeError.value = true
+    sessionNotice.value = apiErrorMessage(error, '删除失败，记录尚未清理，请重试。')
     console.error('[App] failed to delete session:', error)
   }
 }
 
 async function clearAllSessions() {
+  if (deletingSessions.value) return
   const ok = window.confirm('清空所有会话记录？长期记忆、用户画像和个人 Wiki 会保留。')
   if (!ok) return
 
   try {
-    await api.delete('/wiki/sessions')
+    deletingSessions.value = true
+    const { data } = await api.delete<{ deleted: number }>('/wiki/sessions')
+    sessionNoticeError.value = false
+    sessionNotice.value = '已从数据库删除 ' + data.deleted + ' 个会话及其消息。Wiki 和长期记忆已保留。'
     localStorage.removeItem('wiki_chat_session_id')
     recentSessions.value = []
     await router.push({
@@ -232,7 +248,11 @@ async function clearAllSessions() {
       query: { new: String(Date.now()) }
     })
   } catch (error) {
+    sessionNoticeError.value = true
+    sessionNotice.value = apiErrorMessage(error, '清空失败，记录尚未清理，请重试。')
     console.error('[App] failed to clear sessions:', error)
+  } finally {
+    deletingSessions.value = false
   }
 }
 

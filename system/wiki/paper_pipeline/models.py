@@ -15,7 +15,7 @@ class SourceSection(BaseModel):
 
 
 class SourceElement(BaseModel):
-    """Replayable unit extracted from a DoclingDocument."""
+    """Replayable unit extracted from HTML, MinerU, or local PDF text."""
 
     element_id: str
     element_type: str = "text"

@@ -4,7 +4,6 @@ import json
 import mimetypes
 import re
 import shutil
-import threading
 from datetime import datetime, timezone
 from pathlib import Path as _Path
 from typing import Any, Optional
@@ -12,17 +11,19 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import iterate_in_threadpool
 
 from backend.deps import (
     get_chunk_index,
     get_maintenance_llm,
     get_session_store,
-    get_summary_llm,
+    get_summary_llm, get_chat_llm,
     get_web_fetch,
     get_web_search,
     get_wiki_chat,
     get_wiki_store,
 )
+from backend.task_executor import submit_agent_task
 from backend.api.papers import (
     REPO_ROOT as PAPER_REPO_ROOT,
     UPLOAD_DIR as PAPER_UPLOAD_DIR,
@@ -32,7 +33,7 @@ from backend.api.papers import (
     _safe_pdf_name as _safe_paper_pdf_name,
 )
 from system.discovery.xiaohongshu_extractor import XiaohongshuExtractor
-from system.document.docling_parser import DoclingParser
+from system.document.mineru import MinerUParser
 from system.document.source_files import download_images
 from system.storage import get_object_storage, get_storage_layout
 from system.wiki.raw_source_vault import RawSourceVault
@@ -126,17 +127,15 @@ class QueryInsightDistillPayload(BaseModel):
     use_llm: bool = True
 
 
-class SelectionInsightCapturePayload(BaseModel):
+class ConversationWikiPayload(BaseModel):
     session_id: str = ""
-    message_id: str = ""
-    selected_text: str
-    question: str = ""
-    answer: str = ""
-    citations: list[dict[str, Any]] = Field(default_factory=list)
-    resources: list[dict[str, Any]] = Field(default_factory=list)
-    tool_plan: dict[str, Any] = Field(default_factory=dict)
-    trace: dict[str, Any] = Field(default_factory=dict)
+    instruction: str = ""
     auto_merge: bool = True
+    use_llm: bool = True
+
+
+class SessionCompactPayload(BaseModel):
+    keep_recent_turns: int = 2
     use_llm: bool = True
 
 
@@ -163,6 +162,7 @@ class CandidateProcessPayload(BaseModel):
 class WebSourceProcessPayload(BaseModel):
     limit: int = 10
     auto_merge: bool = True
+
 
 
 def _page_type(source_type: str) -> str:
@@ -1176,7 +1176,7 @@ def _ocr_images(local_paths: list[str]) -> tuple[str, str, int, int]:
     if not local_paths:
         return "", "not_needed", 0, 0
 
-    parser = DoclingParser()
+    parser = MinerUParser()
     if not parser.available:
         return "", "pending", 0, len(local_paths)
 
@@ -1185,7 +1185,8 @@ def _ocr_images(local_paths: list[str]) -> tuple[str, str, int, int]:
     for local_rel in local_paths:
         local_path = REPO_ROOT / local_rel
         try:
-            parsed = parser.parse_file(str(local_path))
+            source_key = hashlib.sha256(local_path.read_bytes()).hexdigest()
+            parsed = parser.parse_file(local_path, source_key=source_key)
             extracted = _sanitize_ocr_text(parsed.text or parsed.markdown or "")
             if extracted:
                 texts.append(extracted)
@@ -1592,94 +1593,141 @@ def list_wiki_query_insights(
     return {"items": items, "count": len(items), "status": status.strip()}
 
 
-def _write_selected_query_artifact(
-    payload: SelectionInsightCapturePayload,
-    selected_text: str,
+def _conversation_messages_for_command(messages: list[dict[str, Any]], *, max_chars: int = 30000) -> list[dict[str, Any]]:
+    """Keep the newest useful transcript slice without trusting browser state."""
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for item in reversed(messages):
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        if metadata.get("command") in {"wiki", "compact"} or metadata.get("cancelled"):
+            continue
+        content = sanitize_wiki_text(str(item.get("content") or "")).strip()
+        if not content:
+            continue
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        content = content[: min(5000, remaining)]
+        selected.append({
+            "id": str(item.get("id") or ""),
+            "role": str(item.get("role") or ""),
+            "content": content,
+            "metadata": metadata,
+        })
+        used += len(content)
+    return list(reversed(selected))
+
+
+def _write_conversation_query_artifact(
+    payload: ConversationWikiPayload,
+    messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
-    seed = f"{payload.session_id}\n{payload.message_id}\n{selected_text}"
+    source_messages = [
+        {
+            "id": str(item.get("id") or ""),
+            "role": str(item.get("role") or ""),
+            "content": str(item.get("content") or ""),
+        }
+        for item in messages
+    ]
+    message_ids = [str(item.get("id") or "") for item in source_messages]
+    seed = f"{payload.session_id}\n{payload.instruction}\n{'|'.join(message_ids)}"
     digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
-    title_seed = payload.question or selected_text
-    slug = STORAGE_LAYOUT.slug(title_seed, limit=48) or "selected-insight"
+    slug = STORAGE_LAYOUT.slug(payload.instruction, limit=48) or "conversation-insight"
     query_id = f"{slug}-{digest}"
-    rel_path = _Path("selected") / now.date().isoformat() / f"{query_id}.md"
+    rel_path = _Path("conversation") / now.date().isoformat() / f"{query_id}.md"
     path = STORAGE_LAYOUT.queries_dir / rel_path
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    citation_items = [
-        {
-            "card_id": str(item.get("card_id") or ""),
-            "title": str(item.get("title") or ""),
-            "page_type": str(item.get("page_type") or ""),
-            "summary": str(item.get("summary") or ""),
-            "markdown_path": str(item.get("markdown_path") or ""),
-        }
-        for item in (payload.citations or [])
-        if isinstance(item, dict)
-    ]
+    raw_messages = {str(item.get("id") or ""): item for item in messages}
+    citation_items: list[dict[str, Any]] = []
+    resource_items: list[dict[str, Any]] = []
+    seen_cards: set[str] = set()
+    seen_urls: set[str] = set()
+    for message_id in message_ids:
+        raw = raw_messages.get(message_id) or {}
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        for item in metadata.get("citations") or []:
+            if not isinstance(item, dict):
+                continue
+            card_id = str(item.get("card_id") or "")
+            if not card_id or card_id in seen_cards:
+                continue
+            seen_cards.add(card_id)
+            citation_items.append({
+                "card_id": card_id,
+                "title": str(item.get("title") or ""),
+                "page_type": str(item.get("page_type") or ""),
+                "summary": str(item.get("summary") or "")[:500],
+                "markdown_path": str(item.get("markdown_path") or ""),
+            })
+        for item in metadata.get("resources") or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            resource_items.append({
+                "title": str(item.get("title") or ""),
+                "url": url,
+                "category": str(item.get("category") or ""),
+            })
+    answer_excerpt = next(
+        (
+            str(item.get("content") or "")[:600]
+            for item in reversed(messages)
+            if item.get("role") == "assistant"
+        ),
+        "",
+    )
     artifact = {
         "query_id": query_id,
-        "source_type": "user_selection",
+        "source_type": "conversation_command",
         "session_id": payload.session_id,
-        "message_id": payload.message_id,
-        "question": payload.question,
-        "selected_text": selected_text,
-        "answer_excerpt": selected_text[:600],
+        "message_id": message_ids[-1] if message_ids else "",
+        "instruction": payload.instruction,
+        "question": payload.instruction,
+        "messages": source_messages,
+        "answer_excerpt": answer_excerpt,
         "citations": citation_items,
-        "resources": payload.resources,
-        "tool_plan": payload.tool_plan,
-        "trace_summary": {
-            "tool_observations": [
-                {
-                    "tool": obs.get("tool", ""),
-                    "query": obs.get("query", ""),
-                    "status": obs.get("status", ""),
-                    "summary": obs.get("summary", ""),
-                    "item_count": len(obs.get("items") or []),
-                }
-                for obs in ((payload.trace or {}).get("tool_observations") or [])
-                if isinstance(obs, dict)
-            ],
-        },
+        "resources": resource_items,
     }
     lines = [
         "---",
         f"id: {query_id}",
-        "type: selected_query_insight",
-        "source_type: user_selection",
+        "type: conversation_query_insight",
+        "source_type: conversation_command",
         f"session_id: {payload.session_id}",
-        f"message_id: {payload.message_id}",
+        f"message_ids: {', '.join(message_ids)}",
         f"created: {now.isoformat(timespec='seconds')}",
         "status: archived",
         "---",
         "",
-        "# Selected Wiki Insight",
+        "# Conversation Wiki Command",
         "",
-        "## Question",
+        "## Preservation Instruction",
         "",
-        payload.question.strip() or "User selected a reusable answer fragment.",
+        payload.instruction,
         "",
-        "## Selected Text",
-        "",
-        selected_text,
-        "",
-        "## Citations",
+        "## Source Conversation",
         "",
     ]
+    for item in source_messages:
+        lines.extend([
+            f"### {str(item.get('role') or '').title()} [{item.get('id', '')}]",
+            "",
+            str(item.get("content") or ""),
+            "",
+        ])
+    lines.extend(["## Related Wiki Sources", ""])
     if citation_items:
         for item in citation_items:
             lines.append(f"- {item.get('title', '')} (`{item.get('card_id', '')}`)")
     else:
         lines.append("- none")
-    lines.extend([
-        "",
-        "## Tool Plan",
-        "",
-        "```json",
-        json.dumps(payload.tool_plan or {}, ensure_ascii=False, indent=2),
-        "```",
-        "",
-    ])
+    lines.append("")
     markdown = "\n".join(lines)
     path.write_text(markdown, encoding="utf-8")
     storage = get_object_storage()
@@ -1693,71 +1741,171 @@ def _write_selected_query_artifact(
     return artifact
 
 
-@router.post("/maintenance/query-insights/capture-selection")
-def capture_selected_wiki_insight(
-    payload: SelectionInsightCapturePayload,
+@router.post("/maintenance/query-insights/capture-conversation")
+def capture_conversation_wiki_insight(
+    payload: ConversationWikiPayload,
     store: WikiStore = Depends(get_wiki_store),
+    session_store=Depends(get_session_store),
 ):
-    selected_text = sanitize_wiki_text(payload.selected_text).strip()
-    if len(selected_text) < 20:
-        raise HTTPException(status_code=400, detail="selected_text is too short.")
+    instruction = sanitize_wiki_text(payload.instruction).strip()
+    if len(instruction) < 4:
+        raise HTTPException(status_code=400, detail="Please tell /wiki what should be preserved.")
+    if not payload.session_id or not session_store.get_session(payload.session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    raw_messages = session_store.get_messages(payload.session_id, last_n=120)
+    messages = _conversation_messages_for_command(raw_messages)
+    if not messages:
+        raise HTTPException(status_code=400, detail="The current session has no conversation to preserve.")
 
-    maintenance_store = WikiMaintenanceStore(db_path=store.db_path)
-    artifact = _write_selected_query_artifact(payload, selected_text)
-    insight_id = maintenance_store.add_query_insight(
-        session_id=payload.session_id,
-        message_id=payload.message_id,
-        question=payload.question or "User selected a reusable answer fragment.",
-        answer_excerpt=selected_text[:600],
-        insight=artifact,
-        status="archived",
-    )
-    artifact["insight_id"] = insight_id
-    maintenance_store.update_query_insight(insight_id, insight=artifact)
-
-    item = maintenance_store.get_query_insight(insight_id)
-    if not item:
-        raise HTTPException(status_code=500, detail="Failed to create query insight.")
-
-    distiller = QueryInsightDistiller(
-        db_path=store.db_path,
-        llm=get_summary_llm() if payload.use_llm else None,
-    )
-    distill_result = distiller.distill_one(item)
-    updated = maintenance_store.get_query_insight(insight_id) or {}
-    candidate_id = str(updated.get("candidate_id") or "")
-
-    candidate_result: dict[str, Any] = {}
-    if candidate_id:
-        candidate = maintenance_store.get_candidate(candidate_id)
-        if candidate:
-            candidate_result = MaintenanceCandidateProcessor(
-                db_path=store.db_path,
-                llm=get_maintenance_llm() if payload.use_llm else None,
-            ).process_one(candidate, auto_merge=payload.auto_merge)
-
-    validation = WikiValidator(db_path=store.db_path).validate_all(check_storage=False)
-    indices = WikiIndexGenerator(db_path=store.db_path).generate_all(upload=True)
-    result_card_id = str((candidate_result.get("merge") or {}).get("result_card_id") or "")
-    return {
-        "ok": True,
-        "insight_id": insight_id,
-        "artifact_uri": artifact.get("artifact_uri", ""),
-        "distill": distill_result,
-        "candidate_id": candidate_id,
-        "result_card_id": result_card_id,
-        "candidate": candidate_result,
-        "validation": {
-            "ok": validation.get("ok", False),
-            "summary": validation.get("summary", {}),
-            "run_id": validation.get("run_id", ""),
+    runtime = AgentRunStore(db_path=store.db_path)
+    run = runtime.create_run(
+        run_type="conversation_wiki",
+        source_uri=f"session:{payload.session_id}",
+        approval_mode="auto",
+        context={
+            "session_id": payload.session_id,
+            "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+            "source_message_count": len(messages),
         },
-        "indices": {
-            "ok": indices.get("ok", False),
-            "card_count": indices.get("card_count", 0),
-            "artifact_count": indices.get("artifact_count", 0),
-        },
-    }
+    )
+    run_id = str(run["id"])
+    runtime.transition(run_id, "CHAT_RUNNING", reason="/wiki command accepted")
+    recorder = TraceRecorder(runtime, run_id)
+    try:
+        with recorder.bind():
+            with recorder.span(
+                "conversation.context.select",
+                kind="tool",
+                tool_name="conversation_context",
+                input_data={"message_count": len(raw_messages), "instruction_chars": len(instruction)},
+            ) as span:
+                artifact = _write_conversation_query_artifact(payload, messages)
+                span["output"] = {"selected_message_count": len(messages), "artifact_uri": artifact.get("artifact_uri", "")}
+
+            maintenance_store = WikiMaintenanceStore(db_path=store.db_path)
+            insight_id = maintenance_store.add_query_insight(
+                session_id=payload.session_id,
+                message_id=str(messages[-1].get("id") or ""),
+                question=instruction,
+                answer_excerpt=str(artifact.get("answer_excerpt") or "")[:600],
+                insight=artifact,
+                status="archived",
+            )
+            artifact["insight_id"] = insight_id
+            maintenance_store.update_query_insight(insight_id, insight=artifact)
+            item = maintenance_store.get_query_insight(insight_id)
+            if not item:
+                raise RuntimeError("Failed to create conversation insight.")
+
+            distill_llm = get_chat_llm() if payload.use_llm else None
+            with recorder.span(
+                "conversation.distill",
+                kind="model",
+                model=str(getattr(distill_llm, "model", "") or getattr(distill_llm, "model_name", "")),
+                input_data={"instruction_chars": len(instruction), "source_message_count": len(messages)},
+            ) as span:
+                distill_result = QueryInsightDistiller(
+                    db_path=store.db_path,
+                    llm=distill_llm,
+                ).distill_one(item)
+                span["output"] = {
+                    "status": distill_result.get("status", ""),
+                    "candidate_type": distill_result.get("candidate_type", ""),
+                    "title": distill_result.get("title", ""),
+                }
+
+            updated = maintenance_store.get_query_insight(insight_id) or {}
+            candidate_id = str(updated.get("candidate_id") or "")
+            candidate_result: dict[str, Any] = {}
+            if candidate_id:
+                candidate = maintenance_store.get_candidate(candidate_id)
+                if candidate:
+                    with recorder.span(
+                        "wiki.merge",
+                        kind="tool",
+                        tool_name="wiki_write",
+                        input_data={"candidate_id": candidate_id, "auto_merge": payload.auto_merge},
+                    ) as span:
+                        candidate_result = MaintenanceCandidateProcessor(
+                            db_path=store.db_path,
+                            llm=get_maintenance_llm() if payload.use_llm else None,
+                        ).process_one(candidate, auto_merge=payload.auto_merge)
+                        span["output"] = {
+                            "status": candidate_result.get("status", ""),
+                            "action": (candidate_result.get("merge") or {}).get("action", ""),
+                        }
+
+            merge_result = candidate_result.get("merge") if isinstance(candidate_result.get("merge"), dict) else {}
+            result_card_id = str(merge_result.get("result_card_id") or merge_result.get("target_card_id") or "")
+            card = store.get_card(result_card_id) if result_card_id else None
+            merged = candidate_result.get("status") == "merged"
+            title = str((card or {}).get("title") or distill_result.get("title") or "对话洞见")
+
+            with recorder.span("wiki.validate", kind="tool", tool_name="wiki_validate") as span:
+                validation = WikiValidator(db_path=store.db_path).validate_all(check_storage=False)
+                span["output"] = {"ok": validation.get("ok", False), "summary": validation.get("summary", {})}
+            indices = WikiIndexGenerator(db_path=store.db_path).generate_all(upload=True)
+
+        answer = (
+            f"已沉淀到 Wiki：《{title}》。我根据你的要求选择了相关对话，并保留了对话来源。"
+            if merged
+            else f"已整理成 Wiki 候选：《{title}》，但尚未写入正式页面。"
+        )
+        runtime.transition(
+            run_id,
+            "COMPLETED",
+            result={"card_id": result_card_id, "candidate_id": candidate_id, "merged": merged},
+            reason="conversation insight persisted",
+            expected_state="CHAT_RUNNING",
+        )
+        trace = {
+            "tool_observations": [
+                {"tool": "conversation_context", "status": "done", "summary": f"从当前会话选择了 {len(messages)} 条消息"},
+                {"tool": "wiki_write", "status": "done" if merged else "error", "summary": answer},
+            ],
+            "runtime": runtime.summarize_trace(run_id),
+        }
+        citation = {
+            "card_id": result_card_id,
+            "title": title,
+            "page_type": str((card or {}).get("page_type") or "SourceNote"),
+            "summary": str((card or {}).get("summary") or ""),
+            "markdown_path": str((card or {}).get("markdown_path") or ""),
+        } if card else None
+        session_store.save_message(
+            payload.session_id,
+            "user",
+            f"/wiki {instruction}",
+            metadata={"mode": "command", "command": "wiki"},
+        )
+        session_store.save_message(
+            payload.session_id,
+            "assistant",
+            answer,
+            metadata={
+                "mode": "command",
+                "command": "wiki",
+                "citations": [citation] if citation else [],
+                "trace": trace,
+            },
+        )
+        return {
+            "ok": True,
+            "answer": answer,
+            "insight_id": insight_id,
+            "artifact_uri": artifact.get("artifact_uri", ""),
+            "distill": distill_result,
+            "candidate_id": candidate_id,
+            "result_card_id": result_card_id,
+            "card": citation,
+            "candidate": candidate_result,
+            "validation": {"ok": validation.get("ok", False), "summary": validation.get("summary", {})},
+            "indices": {"ok": indices.get("ok", False), "card_count": indices.get("card_count", 0)},
+            "trace": trace,
+        }
+    except Exception as exc:
+        runtime.mark_failed(run_id, str(exc) or exc.__class__.__name__)
+        raise HTTPException(status_code=500, detail=f"Conversation Wiki command failed: {exc}") from exc
 
 
 @router.post("/maintenance/query-insights/distill")
@@ -1765,7 +1913,7 @@ def distill_wiki_query_insights(
     payload: QueryInsightDistillPayload,
     store: WikiStore = Depends(get_wiki_store),
 ):
-    llm = get_summary_llm() if payload.use_llm else None
+    llm = get_chat_llm() if payload.use_llm else None
     result = QueryInsightDistiller(db_path=store.db_path, llm=llm).distill_pending(
         limit=max(1, min(payload.limit, 50))
     )
@@ -1960,7 +2108,11 @@ def create_wiki_ingestion_job(
         "agent_run_id": run["id"],
         "approval_mode": run["approval_mode"],
     })
-    threading.Thread(
+    dispatch = submit_agent_task(
+        run_id=str(run["id"]),
+        db_path=jobs.db_path,
+        job_id=str(job["id"]),
+        task_name="paper_ingestion",
         target=_run_paper_ingestion_job,
         kwargs={
             "db_path": jobs.db_path,
@@ -1971,8 +2123,7 @@ def create_wiki_ingestion_job(
             "run_id": run["id"],
             "approval_mode": run["approval_mode"],
         },
-        daemon=True,
-    ).start()
+    )
     job = jobs.get_job(job["id"]) or job
     return {
         "ok": True,
@@ -1980,6 +2131,7 @@ def create_wiki_ingestion_job(
         "agent_run_id": run["id"],
         "job": job,
         "run": run,
+        "dispatch": dispatch,
     }
 
 
@@ -2047,6 +2199,121 @@ def get_chat_session_messages(session_id: str, store=Depends(get_session_store))
     return {"session": session, "items": items}
 
 
+@router.post("/sessions/{session_id}/compact")
+def compact_chat_session(
+    session_id: str,
+    payload: SessionCompactPayload,
+    session_store=Depends(get_session_store),
+    wiki_store: WikiStore = Depends(get_wiki_store),
+):
+    from system.conversation.context_budget import ContextBudget
+    from system.conversation.context_compaction import summarize_records
+
+    budget = ContextBudget()
+    session = session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    settings = dict(session.get("settings") or {})
+    previous_summary = str(settings.get("context_summary") or "").strip()
+    previous_cutoff = int(settings.get("compacted_through_message_id") or 0)
+    raw_messages = session_store.get_context_messages(session_id)
+    active_messages = [
+        item for item in raw_messages
+        if int(item.get("id") or 0) > previous_cutoff
+        and (item.get("metadata") or {}).get("command") != "compact"
+        and not (item.get("metadata") or {}).get("cancelled")
+    ]
+    keep_turns = max(0, min(int(payload.keep_recent_turns), 6))
+    desired_keep = keep_turns * 2
+    # Even a short session can be compacted, while longer sessions keep a
+    # couple of recent turns verbatim for pronoun and follow-up resolution.
+    keep_messages = min(desired_keep, max(0, len(active_messages) - 2))
+    to_compact = active_messages[:-keep_messages] if keep_messages else active_messages
+
+    runtime = AgentRunStore(db_path=wiki_store.db_path)
+    run = runtime.create_run(
+        run_type="context_compaction",
+        source_uri=f"session:{session_id}",
+        approval_mode="auto",
+        context={
+            "session_id": session_id,
+            "previous_cutoff": previous_cutoff,
+            "message_count": len(to_compact),
+            "keep_recent_turns": keep_turns,
+        },
+    )
+    run_id = str(run["id"])
+    runtime.transition(run_id, "CHAT_RUNNING", reason="/compact command accepted")
+    recorder = TraceRecorder(runtime, run_id)
+    try:
+        if not to_compact:
+            answer = "当前没有新的对话需要整理；上次的上下文摘要仍然有效。"
+            summary = previous_summary
+            cutoff = previous_cutoff
+        else:
+            llm = get_chat_llm() if payload.use_llm else None
+            with recorder.bind():
+                with recorder.span("context.compact", kind="model" if llm else "memory",
+                                   input_data={"message_count": len(to_compact),
+                                               "token_counter": budget.counter.mode}) as span:
+                    summary = summarize_records(to_compact, previous_summary, budget, llm)
+                    span["output"] = {"summary_tokens": budget.counter.count(summary)}
+            if not summary:
+                raise RuntimeError("Context compaction returned an empty summary.")
+            cutoff = max(int(item.get("id") or 0) for item in to_compact)
+            if not session_store.commit_context_summary(session_id, summary, cutoff, previous_cutoff, previous_summary):
+                raise RuntimeError("Session was deleted or its context changed during compaction; retry if needed.")
+            answer = (
+                f"已整理 {len(to_compact)} 条较早消息为上下文摘要，"
+                f"保留 {len(active_messages) - len(to_compact)} 条最近消息原文。"
+                "原始对话仍然保留，不会写入 Wiki。"
+            )
+
+        runtime.transition(
+            run_id,
+            "COMPLETED",
+            result={
+                "compacted_message_count": len(to_compact),
+                "compacted_through_message_id": cutoff,
+                "summary_chars": len(summary),
+            },
+            reason="context summary persisted",
+            expected_state="CHAT_RUNNING",
+        )
+        trace = {
+            "tool_observations": [{
+                "tool": "context_compact",
+                "status": "done",
+                "summary": answer,
+            }],
+            "runtime": runtime.summarize_trace(run_id),
+        }
+        session_store.save_message(
+            session_id,
+            "user",
+            "/compact",
+            metadata={"mode": "command", "command": "compact"},
+        )
+        session_store.save_message(
+            session_id,
+            "assistant",
+            answer,
+            metadata={"mode": "command", "command": "compact", "trace": trace},
+        )
+        return {
+            "ok": True,
+            "answer": answer,
+            "summary": summary,
+            "compacted_message_count": len(to_compact),
+            "compacted_through_message_id": cutoff,
+            "retained_recent_message_count": len(active_messages) - len(to_compact),
+            "trace": trace,
+        }
+    except Exception as exc:
+        runtime.mark_failed(run_id, str(exc) or exc.__class__.__name__)
+        raise HTTPException(status_code=500, detail=f"Context compaction failed: {exc}") from exc
+
+
 @router.delete("/sessions/{session_id}")
 def delete_chat_session(session_id: str, store=Depends(get_session_store)):
     deleted = store.delete_session(session_id)
@@ -2067,12 +2334,16 @@ def chat_with_wiki(
     chat_service: WikiChatService = Depends(get_wiki_chat),
 ):
     if payload.stream:
-        def _stream():
-            for chunk in chat_service.chat_stream(
+        async def _stream():
+            stream = chat_service.chat_stream(
                 payload.message,
                 session_id=payload.session_id,
-            ):
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            )
+            try:
+                async for chunk in iterate_in_threadpool(stream):
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            finally:
+                stream.close()
 
         return StreamingResponse(
             _stream(),

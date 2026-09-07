@@ -55,7 +55,7 @@ class TraceRecorder:
             with self.activate_span(state):
                 yield state
         except BaseException as exc:
-            self.finish_span(state, status="failed", error=str(exc) or exc.__class__.__name__)
+            self.finish_span(state, status=getattr(exc, "trace_status", "failed"), error=str(exc) or exc.__class__.__name__)
             raise
         else:
             status = str(state.get("status") or "completed").lower()
@@ -132,13 +132,14 @@ class TraceRecorder:
             return {}
         state["finished"] = True
         failed = str(status).lower() in {"error", "failed"}
-        state["status"] = "failed" if failed else "completed"
+        outcome = str(status).lower() if status in {"cancelled", "interrupted"} else ("failed" if failed else "completed")
+        state["status"] = outcome
         state["error"] = error or str(state.get("error") or "")
         return self.store.append_event(
             self.run_id,
-            event_type=f"{state.get('kind', 'node')}.{'failed' if failed else 'completed'}",
+            event_type=f"{state.get('kind', 'node')}.{outcome}",
             node_name=str(state.get("name") or ""),
-            status="failed" if failed else "completed",
+            status=outcome,
             trace_id=self.trace_id,
             span_id=str(state.get("span_id") or ""),
             parent_span_id=str(state.get("parent_span_id") or ""),

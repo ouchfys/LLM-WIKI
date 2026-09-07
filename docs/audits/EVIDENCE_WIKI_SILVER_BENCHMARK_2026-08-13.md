@@ -7,7 +7,7 @@
 - Semantic Verifier：140 条；
 - Table QA：100 条；
 - 人工标注：0 条；
-- 数据来源：当前 26 篇论文的持久化 Docling element 与 table cell；
+- 数据来源：冻结的 26 篇论文持久化 element 与 table cell；
 - 数据集：`test/evaluation/datasets/evidence_wiki_silver_v1/`。
 
 它是 `LLM-generated and independently adjudicated silver benchmark`，不是人工 golden benchmark，也不是公开通用 NLI/Table QA 榜单。
@@ -16,7 +16,7 @@
 
 ### Semantic Verifier
 
-从 26 个 source packets 中选择 35 个不同的真实 Docling evidence spans，每个 span 生成四种 claim，共 140 条：
+从 26 个 source packets 中选择 35 个不同的真实 evidence spans，每个 span 生成四种 claim，共 140 条：
 
 1. `entailed`：证据直接蕴含；
 2. `contradicted_relation`：反转关系、比较、存在性或结论；
@@ -35,7 +35,7 @@
 
 ### Table QA
 
-100 条期望答案不由 LLM 标注，而是直接从持久化 Docling table cells 确定：
+100 条期望答案不由 LLM 标注，而是直接从持久化 table cells 确定：
 
 | 类型 | 数量 |
 |---|---:|
@@ -88,9 +88,9 @@
 | 精确单元格 | 88.33% |
 | 单表最大值 | 75.00% |
 | 单表最小值 | 70.00% |
-| 跨论文比较 | 10.00% |
+| 跨论文精确表格比较（`table_query` 子集） | 10.00% |
 
-结果说明当前系统已经能可靠处理大部分精确单元格问题，但跨论文比较仍是明确短板。失败主要发生在 SQL planner 没有同时保留两个目标 cell、复杂/缺失 caption 导致找错表，以及 fallback cell ranking 无法完成聚合或比较。
+结果说明当前底层表格工具已经能处理大部分精确单元格问题，但不能把异构论文表格默认视为可直接计算的数据集。跨论文子集失败主要发生在 SQL planner 没有同时保留两个目标 cell、复杂/缺失 caption 导致找错表，以及 fallback cell ranking 无法完成聚合或比较。该 10% 指标只衡量 `table_query` 对跨论文精确表格任务的处理能力，不衡量 Wiki Agent 搜索并阅读多张页面后进行定性论文比较的能力。
 
 评测以 3 workers 运行，期间 SiliconFlow 返回过 429。客户端完成了重试，未产生未处理异常；但部分规划失败会进入系统设计中的 table-resolver fallback。因此这里的 76%衡量的是当前部署链路在三并发条件下的端到端表现，而不是排除供应商限流后的模型能力上界。
 

@@ -1,16 +1,11 @@
 <template>
   <section class="capture-page">
-    <header class="capture-header">
-      <div class="capture-intro">
-        <p class="eyebrow">KNOWLEDGE INGESTION</p>
-        <h1>资料编译</h1>
-        <p>上传原始资料，系统会保留证据坐标，并把可验证结论编译进 Markdown Wiki。</p>
-      </div>
+    <PageHeader title="资料导入" description="导入论文与社媒资料，提炼要点并保留原文来源。">
       <div class="capture-mode">
-        <button type="button" :class="{ active: activeMode === 'paper' }" @click="activeMode = 'paper'">论文 PDF</button>
-        <button type="button" :class="{ active: activeMode === 'xhs' }" @click="activeMode = 'xhs'">小红书笔记</button>
+        <button type="button" :aria-pressed="activeMode === 'paper'" :class="{ active: activeMode === 'paper' }" @click="activeMode = 'paper'">论文 PDF</button>
+        <button type="button" :aria-pressed="activeMode === 'xhs'" :class="{ active: activeMode === 'xhs' }" @click="activeMode = 'xhs'">小红书资料</button>
       </div>
-    </header>
+    </PageHeader>
 
     <div class="capture-layout">
       <section v-show="activeMode === 'paper'" class="capture-panel paper-panel">
@@ -18,25 +13,25 @@
           <div>
             <span class="capture-icon">PDF</span>
             <div>
-              <h2>论文证据编译</h2>
-              <p>只需选择文件，不需要维护项目目录。</p>
+              <h2>导入论文</h2>
+              <p>选择 PDF，自动整理成可检索、可引用的知识页。</p>
             </div>
           </div>
-          <span class="system-badge">Evidence-first Wiki</span>
+
         </div>
 
         <ol class="compiler-flow" aria-label="论文编译流程">
           <li>
             <span>01</span>
-            <div><strong>结构化证据</strong><small>Docling 保留段落、表格、页码与 bbox</small></div>
+            <div><strong>读取原文</strong><small>提取正文、表格与页码</small></div>
           </li>
           <li>
             <span>02</span>
-            <div><strong>Wiki Patch</strong><small>Resolver 定位页面，Compiler 生成 claim-aware diff</small></div>
+            <div><strong>整理知识</strong><small>提炼观点，关联已有知识</small></div>
           </li>
           <li>
             <span>03</span>
-            <div><strong>验证与提交</strong><small>Verifier 回读原文，高风险变更进入审批</small></div>
+            <div><strong>核对来源</strong><small>核验后入库，观点冲突由你确认</small></div>
           </li>
         </ol>
 
@@ -49,23 +44,23 @@
           />
           <div class="file-row">
             <label class="file-label" :class="{ selected: selectedFile }">
-              <input type="file" accept="application/pdf" hidden @change="onFileChange" />
+              <input type="file" accept="application/pdf" aria-label="选择论文 PDF" class="file-input" @change="onFileChange" />
               <span class="file-mark">PDF</span>
               <span class="file-copy">
                 <strong>{{ selectedFile ? selectedFile.name : '选择一篇 PDF' }}</strong>
-                <small>{{ selectedFile ? formatSize(selectedFile.size) : '文件会复制到受管存储，并保留原始版本' }}</small>
+                <small>{{ selectedFile ? formatSize(selectedFile.size) : '保留原始文件，方便随时查阅' }}</small>
               </span>
               <span class="file-action">{{ selectedFile ? '重新选择' : '浏览文件' }}</span>
             </label>
             <n-button type="primary" size="large" :loading="uploading" :disabled="!selectedFile || paperBusy" @click="uploadPaper">
-              开始编译
+              开始导入
             </n-button>
           </div>
         </div>
 
         <div class="policy-note">
           <span class="policy-dot"></span>
-          <p><strong>默认自动编译。</strong>新建、补充和增加来源会自动提交；只有新论文与已有结论发生冲突时，任务才会停在审批中心。</p>
+          <p><strong>自动整理入库。</strong>与已有知识出现观点冲突时，会请你在冲突审批页确认。</p>
         </div>
         <n-alert v-if="paperBusy" type="info" class="import-tip" :bordered="false">
           正在后台编译。耗时取决于页数、表格数量和是否需要 OCR，你可以离开本页，任务不会中断。
@@ -75,7 +70,7 @@
         <section class="job-panel">
           <div class="paper-impact-head">
             <div>
-              <strong>最近编译任务</strong>
+              <strong>最近导入</strong>
               <span>{{ ingestionJobs.length ? `显示最近 ${Math.min(ingestionJobs.length, 6)} 条` : '上传后可在这里追踪状态' }}</span>
             </div>
             <button type="button" @click="loadIngestionJobs">刷新状态</button>
@@ -98,7 +93,7 @@
           </div>
           <div v-else class="job-empty">
             <span>00</span>
-            <p><strong>还没有编译任务</strong><small>选择 PDF 后，解析、验证和提交进度会显示在这里。</small></p>
+            <p><strong>还没有导入记录</strong><small>选择 PDF 后，解析、验证和提交进度会显示在这里。</small></p>
           </div>
         </section>
 
@@ -127,11 +122,11 @@
           <div>
             <span class="capture-icon">XHS</span>
             <div>
-              <h2>小红书笔记</h2>
+              <h2>小红书资料</h2>
               <p>保存链接、分享文案与图片 OCR，形成可检索的资料页。</p>
             </div>
           </div>
-          <span class="system-badge">Lightweight capture</span>
+
         </div>
 
         <n-input
@@ -147,8 +142,8 @@
         <n-alert v-if="xhsNotice" type="success" closable @close="xhsNotice = ''">{{ xhsNotice }}</n-alert>
 
         <div class="xhs-route-note">
-          <strong>与论文编译分流</strong>
-          <span>小红书笔记作为直接来源页保存，不生成论文 claim，也不会伪造 PDF 级证据坐标。</span>
+          <strong>用于收集什么？</strong>
+          <span>收藏面经、学习经验或技术分享，保存后可以在知识库中检索和提问。</span>
         </div>
       </section>
     </div>
@@ -159,6 +154,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { NAlert, NButton, NInput } from 'naive-ui'
 import { api } from '../api'
+import PageHeader from '../components/PageHeader.vue'
 
 const activeMode = ref<'paper' | 'xhs'>('paper')
 
@@ -353,14 +349,14 @@ function formatStage(stage: string) {
   const normalized = String(stage || '').toLowerCase()
   const labels: Record<string, string> = {
     queued: '任务排队',
-    docling_extracting: 'Docling 证据提取',
+    docling_extracting: '论文结构解析',
     extracting: '证据提取',
-    distilling: '结论蒸馏',
+    distilling: '提炼结论',
     verifying: '证据验证',
-    compiling_proposal: '生成 Wiki Patch',
+    compiling_proposal: '生成 整理知识',
     awaiting_approval: '风险审批',
-    committing: '提交 Revision',
-    reindexing: '重建 Resolver 索引',
+    committing: '保存知识',
+    reindexing: '更新检索索引',
     done: 'Wiki 已更新'
   }
   return labels[normalized] || stage || '准备中'
@@ -391,43 +387,6 @@ onBeforeUnmount(stopJobPolling)
   margin: 0 auto;
   display: grid;
   gap: 16px;
-}
-
-.capture-header,
-.capture-panel {
-  border: 1px solid var(--line);
-  background: rgba(21, 19, 15, 0.88);
-  box-shadow: 0 22px 54px rgba(8, 7, 6, 0.28);
-}
-
-.capture-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 28px;
-  min-height: 148px;
-  padding: 28px 30px 32px;
-  border-radius: 18px;
-  background:
-    radial-gradient(circle at 92% 12%, rgba(155, 184, 173, 0.12), transparent 34%),
-    rgba(21, 19, 15, 0.9);
-}
-
-.capture-header h1 {
-  margin: 2px 0 8px;
-  color: #fff;
-  font-size: clamp(32px, 4vw, 48px);
-  line-height: 1.02;
-  letter-spacing: -0.045em;
-  text-wrap: balance;
-}
-
-.capture-intro > p:last-child {
-  max-width: 630px;
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 14px;
-  line-height: 1.75;
 }
 
 .capture-mode {
@@ -479,8 +438,10 @@ onBeforeUnmount(stopJobPolling)
 .capture-panel {
   display: grid;
   gap: 18px;
-  padding: 26px;
-  border-radius: 18px;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--panel);
 }
 
 .panel-head {
@@ -499,7 +460,7 @@ onBeforeUnmount(stopJobPolling)
 .panel-head h2 {
   margin: 0;
   color: #fff;
-  font-size: 23px;
+  font-size: 20px;
   letter-spacing: -0.025em;
 }
 
@@ -510,19 +471,7 @@ onBeforeUnmount(stopJobPolling)
   line-height: 1.5;
 }
 
-.system-badge {
-  flex: 0 0 auto;
-  padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: rgba(155, 184, 173, 0.08);
-  color: #bfd0c8;
-  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
+
 
 .capture-icon {
   width: 46px;
@@ -581,17 +530,14 @@ onBeforeUnmount(stopJobPolling)
 
 .compiler-flow small {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.55;
 }
 
 .upload-card {
   display: grid;
   gap: 10px;
-  padding: 18px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: rgba(11, 9, 8, 0.48);
+  padding: 0;
 }
 
 .field-label {
@@ -615,7 +561,8 @@ onBeforeUnmount(stopJobPolling)
 
 .file-label {
   min-width: 0;
-  min-height: 74px;
+  position: relative;
+  min-height: 92px;
   display: grid;
   grid-template-columns: 42px minmax(0, 1fr) auto;
   align-items: center;
@@ -944,10 +891,6 @@ onBeforeUnmount(stopJobPolling)
 }
 
 @media (max-width: 860px) {
-  .capture-header {
-    display: grid;
-    padding: 24px;
-  }
 
   .compiler-flow,
   .file-row,
@@ -969,30 +912,18 @@ onBeforeUnmount(stopJobPolling)
 }
 
 @media (max-width: 560px) {
-  .capture-header,
-  .capture-panel {
-    padding: 18px;
-    border-radius: 14px;
-  }
-
-  .panel-head {
-    align-items: flex-start;
-  }
-
-  .system-badge {
-    display: none;
-  }
-
-  .file-label {
-    grid-template-columns: 38px minmax(0, 1fr);
-  }
-
-  .file-action {
-    display: none;
-  }
-
-  .job-title-row {
-    align-items: flex-start;
-  }
+  .capture-panel { padding: 18px; }
+  .panel-head { align-items: flex-start; }
+  .file-label { grid-template-columns: 38px minmax(0, 1fr); }
+  .file-action { display: none; }
+  .job-title-row { align-items: flex-start; }
 }
+
+.file-input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.job-panel { padding: 20px 0 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; background: transparent; }
+.job-row { padding: 12px 0; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; }
+.job-list { gap: 0; }
+.compiler-flow { border-radius: 8px; }
+.compiler-flow li { background: var(--panel-muted); }
+.capture-page { gap: 24px; }
 </style>

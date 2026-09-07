@@ -1,13 +1,8 @@
 <template>
   <section class="review-page">
-    <header class="review-hero">
-      <div>
-        <span>HUMAN-IN-THE-LOOP</span>
-        <h1>知识冲突审批</h1>
-        <p>只处理跨来源冲突：明确告诉你哪篇新论文、哪条新结论与哪条已有知识不一致。</p>
-      </div>
-      <button type="button" @click="() => loadApprovals(true)">刷新</button>
-    </header>
+    <PageHeader title="冲突审批" description="对照新旧来源，决定如何保存不一致的观点。">
+      <button class="ui-button" type="button" @click="() => loadApprovals(true)">刷新</button>
+    </PageHeader>
 
     <div class="review-grid">
       <aside class="queue-panel">
@@ -171,6 +166,7 @@
 </template>
 
 <script setup lang="ts">
+import PageHeader from '../components/PageHeader.vue'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { NButton, NInput, NModal, useMessage } from 'naive-ui'
 import { api } from '../api'
@@ -249,8 +245,8 @@ const approveLabel = computed(() => conflictPairs.value.some(pair => pair.relati
 const rejectLabel = computed(() => '保留原结论')
 const flowStates = ['EXTRACTING', 'DISTILLING', 'VERIFYING', 'COMPILING_PROPOSAL', 'AWAITING_APPROVAL', 'COMMITTING', 'COMMIT_FAILED', 'REINDEXING', 'COMPLETED']
 const labels: Record<string, string> = {
-  EXTRACTING: 'Docling', DISTILLING: 'Claims', VERIFYING: 'Verifier', COMPILING_PROPOSAL: 'Proposal',
-  AWAITING_APPROVAL: '审批', COMMITTING: 'Commit', COMMIT_FAILED: '重试', REINDEXING: 'Index', COMPLETED: '完成'
+  EXTRACTING: '解析', DISTILLING: '提炼', VERIFYING: '核验', COMPILING_PROPOSAL: '生成更新',
+  AWAITING_APPROVAL: '审批', COMMITTING: '保存', COMMIT_FAILED: '重试', REINDEXING: '索引', COMPLETED: '完成'
 }
 const visibleStates = computed(() => {
   const current = String(selected.value?.run?.current_state || 'AWAITING_APPROVAL')
@@ -377,19 +373,16 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
 </script>
 
 <style scoped>
-.review-page { min-height: 100%; padding: 24px; color: #e8ece9; }
+.review-page { min-height: 100%; padding: 0; max-width: 1240px; margin: 0 auto; color: #e8ece9; }
 .review-hero { display: flex; justify-content: space-between; align-items: end; gap: 20px; margin-bottom: 20px; }
-.review-hero span { color: #89a198; letter-spacing: .16em; font-size: 11px; }
-.review-hero h1 { margin: 5px 0; font-size: clamp(25px, 3vw, 38px); }
-.review-hero p { margin: 0; color: #81908a; }
-.review-hero button, .decision-actions button { border: 1px solid rgba(195,214,202,.16); border-radius: 9px; background: #161813; color: #cbd5d1; padding: 8px 12px; cursor: pointer; transition: border-color .2s ease, background .2s ease, transform .2s ease; }
-.review-hero button:hover, .decision-actions button:hover { border-color: rgba(195,214,202,.34); background: #1b1e19; }
-.review-hero button:active, .decision-actions button:active { transform: translateY(1px); }
-.review-hero button:focus-visible, .decision-actions button:focus-visible, .queue-row:focus-visible { outline: 2px solid #a7c0b6; outline-offset: 2px; }
-.review-grid { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: calc(100vh - 140px); border: 1px solid rgba(195,214,202,.12); border-radius: 16px; overflow: hidden; background: #10110e; }
+.ui-button, .decision-actions button { border: 1px solid rgba(195,214,202,.16); border-radius: 9px; background: #161813; color: #cbd5d1; padding: 8px 12px; cursor: pointer; transition: border-color .2s ease, background .2s ease, transform .2s ease; }
+.ui-button:hover, .decision-actions button:hover { border-color: rgba(195,214,202,.34); background: #1b1e19; }
+.ui-button:active, .decision-actions button:active { transform: translateY(1px); }
+.ui-button:focus-visible, .decision-actions button:focus-visible, .queue-row:focus-visible { outline: 2px solid #a7c0b6; outline-offset: 2px; }
+.review-grid { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: calc(100dvh - 220px); border: 1px solid rgba(195,214,202,.12); border-radius: 16px; overflow: hidden; background: #10110e; }
 .queue-panel { padding: 15px; background: #0d0e0c; overflow: auto; }
 .queue-panel { border-right: 1px solid rgba(195,214,202,.1); }
-.proposal-panel { padding: 18px; overflow: auto; max-height: calc(100vh - 140px); }
+.proposal-panel { padding: 18px; overflow: auto; max-height: calc(100dvh - 220px); }
 .panel-head, .section-head, .proposal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .panel-head { margin-bottom: 12px; }
 .panel-head small, .section-head small { color: #718079; }
@@ -409,7 +402,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
 .state-node { min-width: 68px; display: grid; place-items: center; gap: 5px; color: #4f5d57; position: relative; }
 .state-node:not(:last-child)::after { content: ''; width: 28px; height: 1px; background: #303a35; position: absolute; right: -16px; top: 9px; }
 .state-node.done { color: #8eb7a7; }.state-node.current { color: #f2b84b; }.state-node small { font-size: 10px; }
-.decision-brief { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, .8fr); gap: 18px 28px; margin-top: 20px; padding: 18px; border: 1px solid rgba(155,184,173,.16); border-radius: 13px; background: #141711; }
+.decision-brief { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, .8fr); gap: 18px 28px; margin-top: 20px; padding: 18px; border: 1px solid rgba(155,184,173,.16); border-radius: 13px; background: #141711; }
 .decision-brief-copy span, .recommendation span, .summary-columns span { color: #86a096; font-size: 10px; letter-spacing: .13em; text-transform: uppercase; }
 .decision-brief-copy h3 { margin: 5px 0 7px; font-size: 18px; }
 .decision-brief-copy p { max-width: 64ch; margin: 0; color: #9ca8a3; line-height: 1.65; }
@@ -462,5 +455,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
 .editor-note { color: #95a49e; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 @media (max-width: 1180px) { .review-grid { grid-template-columns: 210px 1fr; }.proposal-head { align-items: flex-start; flex-direction: column; }.decision-actions { width: 100%; flex-wrap: wrap; } }
 @media (max-width: 860px) { .decision-brief { grid-template-columns: 1fr; }.decision-hint { grid-column: auto; }.summary-columns { grid-template-columns: 1fr; } }
-@media (max-width: 760px) { .review-page { padding: 14px; }.review-grid { grid-template-columns: 1fr; }.queue-panel { border-right: 0; }.impact-grid { grid-template-columns: 1fr; }.recommendation { align-items: flex-start; flex-direction: column; }.conflict-pair { grid-template-columns: 1fr; }.conflict-relation { grid-auto-flow: column; border: 0; border-top: 1px solid rgba(195,214,202,.08); border-bottom: 1px solid rgba(195,214,202,.08); padding: 8px; }.conflict-pair footer { grid-column: auto; } }
+@media (max-width: 760px) { .review-grid { grid-template-columns: 1fr; }.queue-panel { border-right: 0; }.impact-grid { grid-template-columns: 1fr; }.recommendation { align-items: flex-start; flex-direction: column; }.conflict-pair { grid-template-columns: 1fr; }.conflict-relation { grid-auto-flow: column; border: 0; border-top: 1px solid rgba(195,214,202,.08); border-bottom: 1px solid rgba(195,214,202,.08); padding: 8px; }.conflict-pair footer { grid-column: auto; } }
+@media (max-width: 1320px) { .decision-brief { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .proposal-panel { max-height: none; padding: 16px; } .queue-panel { border-bottom: 1px solid var(--line); } }
 </style>

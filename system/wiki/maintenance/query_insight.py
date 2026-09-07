@@ -58,15 +58,54 @@ __PAYLOAD__
 """
 
 
-SELECTION_ROUTING_PROMPT = """\
-You route a user-selected answer fragment into a personal research wiki.
+CONVERSATION_INSIGHT_PROMPT = """\
+You compile a user-directed discussion into one durable personal Wiki insight.
+The user has explicitly said what should be preserved. Find only the messages
+that support that instruction and discard detours, repetitions, rejected ideas,
+and command acknowledgements.
+
+Return strict JSON only. Do not write markdown.
+
+Return this shape:
+{
+  "status": "candidate_ready",
+  "candidate_type": "source_note",
+  "title": "",
+  "aliases": [],
+  "summary": "",
+  "knowledge_kind": "user_idea|discussion_conclusion|source_backed_conclusion|open_question",
+  "selected_message_ids": [],
+  "content_json": {
+    "main_points": [],
+    "open_questions": []
+  },
+  "related_topics": [],
+  "reason": ""
+}
+
+Rules:
+- Follow the user's preservation instruction exactly, including exclusions.
+- Never turn an AI suggestion into a paper-proven fact.
+- Use source_backed_conclusion only when the transcript contains explicit Wiki
+  citations; otherwise use user_idea, discussion_conclusion, or open_question.
+- selected_message_ids MUST come from the supplied transcript.
+- Keep the result concise and reusable. Write the knowledge content in Chinese.
+- Do not include the /wiki command itself as knowledge.
+
+Input:
+__PAYLOAD__
+"""
+
+
+INSIGHT_ROUTING_PROMPT = """\
+You route a user-directed discussion insight into a personal research wiki.
 Decide whether it should UPDATE an existing wiki page or CREATE a new page.
 
 Return strict JSON only. Do not write markdown.
 
-You are given the user's question, their selected text, and a list of candidate
+You are given the user's instruction, the compiled insight, and a list of candidate
 existing wiki pages (each with id, title, page_type, summary). Choose update
-only when the selection genuinely belongs to one of the candidate pages; prefer
+only when the insight genuinely belongs to one of the candidate pages; prefer
 create when it is a distinct concept or no candidate fits.
 
 Return this shape:
@@ -113,9 +152,10 @@ class QueryInsightDistiller:
     def distill_one(self, item: dict[str, Any]) -> dict[str, Any]:
         insight_id = item.get("id", "")
         artifact = item.get("insight") or {}
-        candidate = self._llm_candidate(artifact) if self.llm else self._deterministic_candidate(artifact)
-        if candidate.get("status") != "candidate_ready" and artifact.get("source_type") == "user_selection":
-            candidate = self._user_selection_candidate(artifact)
+        if artifact.get("source_type") == "conversation_command":
+            candidate = self._conversation_candidate(artifact)
+        else:
+            candidate = self._llm_candidate(artifact) if self.llm else self._deterministic_candidate(artifact)
         status = "candidate_ready" if candidate.get("status") == "candidate_ready" else "skipped"
         next_insight = dict(artifact)
         next_insight["distilled_candidate"] = candidate
@@ -162,9 +202,6 @@ class QueryInsightDistiller:
         return self._deterministic_candidate(artifact)
 
     def _deterministic_candidate(self, artifact: dict[str, Any]) -> dict[str, Any]:
-        if artifact.get("source_type") == "user_selection":
-            return self._user_selection_candidate(artifact)
-
         question = str(artifact.get("question") or "").strip()
         answer = str(artifact.get("answer_excerpt") or "").strip()
         citations = artifact.get("citations") if isinstance(artifact.get("citations"), list) else []
@@ -197,119 +234,156 @@ class QueryInsightDistiller:
             "reason": "archived answer cites wiki cards and contains reusable explanation",
         }
 
-    def _user_selection_candidate(self, artifact: dict[str, Any]) -> dict[str, Any]:
-        question = str(artifact.get("question") or "").strip()
-        selected_text = str(artifact.get("selected_text") or artifact.get("answer_excerpt") or "").strip()
-        title = self._selection_title(question=question, selected_text=selected_text)
-        related_topics = self._related_topics_from_text(" ".join([question, selected_text]))
-        evidence = [
-            {
-                "source": "user_selection",
-                "query_id": artifact.get("query_id", ""),
-                "artifact_uri": artifact.get("artifact_uri", ""),
-                "text": selected_text[:1200],
-            }
-        ]
+    def _conversation_candidate(self, artifact: dict[str, Any]) -> dict[str, Any]:
+        candidate: dict[str, Any] = {}
+        if self.llm:
+            prompt = CONVERSATION_INSIGHT_PROMPT.replace(
+                "__PAYLOAD__",
+                json.dumps(self._compact_artifact(artifact), ensure_ascii=False, indent=2),
+            )
+            try:
+                raw = self.llm.invoke(prompt, temperature=0.0, max_tokens=1800)
+                parsed = json.loads(self._extract_json(raw))
+                if isinstance(parsed, dict):
+                    candidate = parsed
+            except Exception as exc:
+                print(f"[QueryInsightDistiller] conversation distill failed: {exc}")
 
-        # Knowledge reflux: prefer updating an existing Markdown page over
-        # spawning yet another low-signal "selected fragment" card. With an LLM,
-        # let it decide update-vs-create against recalled candidate pages;
-        # otherwise fall back to deterministic title/alias matching.
+        if str(candidate.get("status") or "") != "candidate_ready":
+            candidate = self._deterministic_conversation_candidate(artifact)
+
+        candidate["candidate_type"] = "source_note"
+        normalized = self._normalize_candidate(candidate, artifact)
+        content = normalized.get("content_json") if isinstance(normalized.get("content_json"), dict) else {}
+        ordered_message_ids = [
+            str(item.get("id"))
+            for item in artifact.get("messages") or []
+            if isinstance(item, dict) and item.get("id") is not None
+        ]
+        allowed_message_ids = set(ordered_message_ids)
+        selected_message_ids = [
+            str(value) for value in candidate.get("selected_message_ids") or []
+            if str(value) in allowed_message_ids
+        ]
+        if not selected_message_ids:
+            selected_message_ids = ordered_message_ids
+
+        knowledge_kind = str(candidate.get("knowledge_kind") or "discussion_conclusion")
+        if knowledge_kind not in {
+            "user_idea", "discussion_conclusion", "source_backed_conclusion", "open_question",
+        }:
+            knowledge_kind = "discussion_conclusion"
+        citations = artifact.get("citations") if isinstance(artifact.get("citations"), list) else []
+        if knowledge_kind == "source_backed_conclusion" and not citations:
+            knowledge_kind = "discussion_conclusion"
+        content.update({
+            "source_type": "conversation_insight",
+            "knowledge_kind": knowledge_kind,
+            "conversation_instruction": str(artifact.get("instruction") or "")[:800],
+            "source_session_id": str(artifact.get("session_id") or ""),
+            "source_message_ids": selected_message_ids,
+            "related_sources": citations[:12],
+        })
+        normalized["content_json"] = content
+        normalized["candidate_type"] = "source_note"
+
+        main_points = content.get("main_points") or content.get("key_idea") or normalized.get("summary") or ""
+        routing_text = "\n".join([
+            str(normalized.get("summary") or ""),
+            json.dumps(main_points, ensure_ascii=False) if not isinstance(main_points, str) else main_points,
+        ]).strip()
+        related_topics = [str(item) for item in normalized.get("related_topics") or [] if str(item).strip()]
         if self.llm:
             target = self._resolve_target_card_llm(
-                title=title,
-                question=question,
-                selected_text=selected_text,
+                title=str(normalized.get("title") or ""),
+                question=str(artifact.get("instruction") or ""),
+                insight_text=routing_text,
                 related_topics=related_topics,
             )
         else:
             target = self._resolve_target_card(
-                title=title,
-                question=question,
-                selected_text=selected_text,
+                title=str(normalized.get("title") or ""),
+                question=str(artifact.get("instruction") or ""),
+                insight_text=routing_text,
                 related_topics=related_topics,
             )
-        if target:
-            return self._user_selection_update_candidate(
-                target=target,
-                question=question,
-                selected_text=selected_text,
-                evidence=evidence,
-                artifact=artifact,
-            )
+        if not target:
+            return normalized
+        return self._conversation_update_candidate(
+            target=target,
+            artifact=artifact,
+            summary=str(normalized.get("summary") or ""),
+            content=content,
+            related_topics=related_topics,
+        )
 
+    def _deterministic_conversation_candidate(self, artifact: dict[str, Any]) -> dict[str, Any]:
+        instruction = str(artifact.get("instruction") or artifact.get("question") or "").strip()
+        messages = [item for item in artifact.get("messages") or [] if isinstance(item, dict)]
+        assistant_texts = [
+            str(item.get("content") or "").strip()
+            for item in messages if item.get("role") == "assistant" and str(item.get("content") or "").strip()
+        ]
+        body = assistant_texts[-1] if assistant_texts else instruction
+        title = self._insight_title(instruction, body)
         return {
             "status": "candidate_ready",
-            "candidate_type": "source_note" if len(selected_text) < 180 else "concept_card",
+            "candidate_type": "source_note",
             "title": title,
             "aliases": [title] if title else [],
-            "summary": selected_text[:320] or question[:320],
-            "content_json": {
-                "schema_version": "query-insight-v1",
-                "source_type": "user_selection",
-                "question": question,
-                "notes": selected_text,
-                "evidence": evidence,
-                "source_query_id": artifact.get("query_id", ""),
-                "artifact_uri": artifact.get("artifact_uri", ""),
-            },
-            "related_topics": related_topics,
-            "reason": "user explicitly selected this answer fragment for wiki feedback",
+            "summary": body[:320] or instruction[:320],
+            "knowledge_kind": "discussion_conclusion",
+            "selected_message_ids": [str(item.get("id")) for item in messages if item.get("id") is not None],
+            "content_json": {"main_points": [body[:1600]] if body else []},
+            "related_topics": self._related_topics_from_text(f"{instruction} {body}"),
+            "reason": "explicit /wiki command with deterministic fallback",
         }
 
-    def _user_selection_update_candidate(
+    def _conversation_update_candidate(
         self,
         *,
         target: dict[str, Any],
-        question: str,
-        selected_text: str,
-        evidence: list[dict[str, Any]],
         artifact: dict[str, Any],
+        summary: str,
+        content: dict[str, Any],
+        related_topics: list[str],
     ) -> dict[str, Any]:
-        """Build a card_update candidate targeting an existing wiki page.
-
-        The shape matches what MaintenanceCandidateProcessor._review expects for
-        a card_update: top-level target_card_id, changes(dict), evidence_basis(list).
-        """
-        note_lines = []
-        if question:
-            note_lines.append(f"Q: {question}")
-        note_lines.append(selected_text)
-        appended_note = "\n\n".join(line for line in note_lines if line).strip()
+        points = content.get("main_points")
+        if not isinstance(points, list):
+            points = [str(points)] if str(points or "").strip() else []
+        insight_text = summary.strip() or "\n".join(str(item) for item in points if str(item).strip())
+        source_ref = f"conversation://{artifact.get('session_id', '')}"
+        changes: dict[str, Any] = {
+            "content_json": {"conversation_insights": [insight_text] if insight_text else []},
+            "related_topics": related_topics,
+        }
+        open_questions = content.get("open_questions")
+        if isinstance(open_questions, list) and open_questions:
+            changes["content_json"]["open_questions"] = open_questions
         return {
             "status": "candidate_ready",
             "candidate_type": "card_update",
             "target_card_id": target["id"],
             "title": target.get("title", ""),
-            "summary": selected_text[:320] or question[:320],
+            "summary": summary,
             "risk": "low",
-            "review_notes": f"Appended from a user-selected answer (query {artifact.get('query_id', '')}).".strip(),
-            "evidence_basis": [
-                {
-                    "fact": selected_text[:600],
-                    "source": "user_selection",
-                    "query_id": artifact.get("query_id", ""),
-                    "artifact_uri": artifact.get("artifact_uri", ""),
-                }
-            ],
-            "changes": {
-                "content_json": {
-                    "maintenance_notes": [appended_note] if appended_note else [],
-                },
-            },
+            "review_notes": "Appended from an explicit /wiki conversation command.",
+            "evidence_basis": [{
+                "fact": insight_text[:600],
+                "source": "conversation_command",
+                "source_url": source_ref,
+                "message_ids": content.get("source_message_ids") or [],
+            }],
+            "changes": changes,
             "content_json": {
-                "schema_version": "query-insight-v1",
-                "source_type": "user_selection_update",
-                "question": question,
-                "notes": selected_text,
-                "evidence": evidence,
+                **content,
+                "source_type": "conversation_insight_update",
                 "target_card_id": target["id"],
                 "match_reason": target.get("match_reason", ""),
-                "source_query_id": artifact.get("query_id", ""),
                 "artifact_uri": artifact.get("artifact_uri", ""),
             },
-            "related_topics": [target.get("title", "")] if target.get("title") else [],
-            "reason": f"user selection maps to existing wiki page via {target.get('match_reason', 'match')}",
+            "related_topics": related_topics,
+            "reason": f"explicit /wiki insight maps to existing page via {target.get('match_reason', 'match')}",
         }
 
     def _recall_candidate_cards(
@@ -317,12 +391,12 @@ class QueryInsightDistiller:
         *,
         title: str,
         question: str,
-        selected_text: str,
+        insight_text: str,
         related_topics: list[str],
         limit: int = 8,
     ) -> list[dict[str, Any]]:
-        """Recall existing wiki pages that might host this selection."""
-        terms = [t for t in [title, question, selected_text[:120], *related_topics[:5]] if t]
+        """Recall existing Wiki pages that might host a distilled insight."""
+        terms = [t for t in [title, question, insight_text[:120], *related_topics[:5]] if t]
         cards: list[dict[str, Any]] = []
         seen: set[str] = set()
         for term in terms:
@@ -346,7 +420,7 @@ class QueryInsightDistiller:
         *,
         title: str,
         question: str,
-        selected_text: str,
+        insight_text: str,
         related_topics: list[str],
     ) -> dict[str, Any] | None:
         """LLM decides update-vs-create against recalled candidate pages.
@@ -358,7 +432,7 @@ class QueryInsightDistiller:
         candidates = self._recall_candidate_cards(
             title=title,
             question=question,
-            selected_text=selected_text,
+            insight_text=insight_text,
             related_topics=related_topics,
         )
         if not candidates:
@@ -366,21 +440,21 @@ class QueryInsightDistiller:
 
         payload = {
             "question": question,
-            "selected_text": selected_text[:1200],
+            "insight_text": insight_text[:1200],
             "candidate_pages": candidates,
         }
-        prompt = SELECTION_ROUTING_PROMPT.replace(
+        prompt = INSIGHT_ROUTING_PROMPT.replace(
             "__PAYLOAD__", json.dumps(payload, ensure_ascii=False, indent=2)
         )
         try:
             raw = self.llm.invoke(prompt, temperature=0.0, max_tokens=400)
             decision = json.loads(self._extract_json(raw))
         except Exception as exc:
-            print(f"[QueryInsightDistiller] selection routing LLM failed: {exc}")
+            print(f"[QueryInsightDistiller] insight routing LLM failed: {exc}")
             return self._resolve_target_card(
                 title=title,
                 question=question,
-                selected_text=selected_text,
+                insight_text=insight_text,
                 related_topics=related_topics,
             )
 
@@ -404,18 +478,18 @@ class QueryInsightDistiller:
         *,
         title: str,
         question: str,
-        selected_text: str,
+        insight_text: str,
         related_topics: list[str],
     ) -> dict[str, Any] | None:
-        """Find the existing wiki page this selection should update, or None.
+        """Find the existing Wiki page this insight should update, or None.
 
         Conservative on purpose: only returns a target on a strong signal. We
         search the wiki for candidate pages, then accept one only when its title
         (or a known alias) appears as a whole phrase inside the user's question
-        or selected text. Fuzzy/semantic ranking is deferred to a later
+        or distilled insight. Fuzzy/semantic ranking is deferred to a later
         LLM-assisted pass so we never silently merge into a loosely-related page.
         """
-        haystack = f"{question}\n{selected_text}".lower()
+        haystack = f"{question}\n{insight_text}".lower()
         if not haystack.strip():
             return None
 
@@ -434,8 +508,8 @@ class QueryInsightDistiller:
                 }
 
         # Otherwise, search the wiki and accept a candidate whose title appears
-        # verbatim in what the user actually selected/asked.
-        search_terms = [t for t in [title, question, selected_text[:120], *related_topics[:4]] if t]
+        # verbatim in the explicit instruction or distilled insight.
+        search_terms = [t for t in [title, question, insight_text[:120], *related_topics[:4]] if t]
         seen_cards: set[str] = set()
         for term in search_terms:
             for card in self.wiki_store.search_cards(term, limit=5):
@@ -449,7 +523,7 @@ class QueryInsightDistiller:
                         "id": cid,
                         "title": card_title,
                         "page_type": card.get("page_type", ""),
-                        "match_reason": "title appears in user selection",
+                        "match_reason": "title appears in the requested insight",
                     }
         return None
 
@@ -475,7 +549,7 @@ class QueryInsightDistiller:
 
     @staticmethod
     def _compact_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
-        return {
+        compact = {
             "query_id": artifact.get("query_id", ""),
             "question": artifact.get("question", ""),
             "answer_excerpt": artifact.get("answer_excerpt", ""),
@@ -483,6 +557,13 @@ class QueryInsightDistiller:
             "resources": artifact.get("resources", []),
             "trace_summary": artifact.get("trace_summary", {}),
         }
+        if artifact.get("source_type") == "conversation_command":
+            compact.update({
+                "source_type": "conversation_command",
+                "instruction": artifact.get("instruction", ""),
+                "messages": artifact.get("messages", []),
+            })
+        return compact
 
     @staticmethod
     def _extract_json(text: str) -> str:
@@ -494,13 +575,13 @@ class QueryInsightDistiller:
         return text
 
     @staticmethod
-    def _selection_title(question: str, selected_text: str) -> str:
-        basis = (question or selected_text or "User selected insight").strip()
+    def _insight_title(question: str, insight_text: str) -> str:
+        basis = (question or insight_text or "Conversation insight").strip()
         basis = " ".join(basis.replace("\n", " ").split())
         basis = basis.strip(" ?？。；;，,")
         if len(basis) <= 64:
-            return basis or "User selected insight"
-        return basis[:64].rstrip(" ?？。；;，,") or "User selected insight"
+            return basis or "Conversation insight"
+        return basis[:64].rstrip(" ?？。；;，,") or "Conversation insight"
 
     @staticmethod
     def _related_topics_from_text(text: str) -> list[str]:

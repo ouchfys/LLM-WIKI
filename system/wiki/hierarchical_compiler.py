@@ -173,7 +173,7 @@ class HierarchicalWikiCompiler:
             "verifier_result": claim.verifier_result,
             "verifier_reason": claim.verifier_reason,
             "entailment_score": max(0.0, min(float(claim.entailment_score), 1.0)),
-            "semantic_verification_required": bool(packet.docling_json),
+            "semantic_verification_required": bool(packet.elements),
             "source_packet_ids": [packet.source_id],
             "candidate_id": candidate.id,
             "supersedes_claim_id": "",

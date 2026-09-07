@@ -11,7 +11,6 @@ import json
 import re
 import urllib.request
 import urllib.error
-import urllib.parse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -109,107 +108,61 @@ class ManualSourceAdapter(SourceAdapter):
 
 
 class ArxivAdapter(SourceAdapter):
-    """Search arXiv API for paper metadata. No full-text download."""
+    """Compatibility adapter backed by the shared, rate-limited arXiv client."""
 
-    BASE_URL = "http://export.arxiv.org/api/query"
+    def __init__(self, sort_by: str = "relevance", client=None):
+        from system.discovery.arxiv_service import ArxivClient
 
-    def __init__(self, sort_by: str = "relevance"):
         self.sort_by = sort_by
+        self.client = client or ArxivClient()
 
     def search(self, query: str, limit: int = 10) -> List[SourceItem]:
         query = (query or "").strip()
         if not query:
             return []
-
-        params = urllib.parse.urlencode({
-            "search_query": f"all:{query}",
-            "start": 0,
-            "max_results": limit,
-            "sortBy": self.sort_by,
-            "sortOrder": "descending",
-        })
-        url = f"{self.BASE_URL}?{params}"
-
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "PersonalResearchAgent/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                content = resp.read().decode("utf-8", errors="ignore")
+            page = self.client.search(
+                query,
+                max_results=limit,
+                sort_by=self.sort_by,
+                sort_order="descending",
+            )
         except Exception as e:
             print(f"[ArxivAdapter] Search failed: {e}")
             return []
-
-        return self._parse_response(content)
+        return [self._to_source_item(paper) for paper in page.papers]
 
     def fetch_detail(self, source_id: str) -> Optional[SourceItem]:
-        arxiv_id = source_id
-        if arxiv_id.startswith("arxiv:"):
-            arxiv_id = arxiv_id[6:]
-        params = urllib.parse.urlencode({"id_list": arxiv_id, "max_results": 1})
-        url = f"{self.BASE_URL}?{params}"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "PersonalResearchAgent/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                content = resp.read().decode("utf-8", errors="ignore")
+            paper = self.client.get_paper(source_id)
         except Exception as e:
             print(f"[ArxivAdapter] Fetch detail failed: {e}")
             return None
-
-        items = self._parse_response(content)
-        return items[0] if items else None
-
-    def _parse_response(self, xml_content: str) -> List[SourceItem]:
-        items = []
-        try:
-            root = ET.fromstring(xml_content)
-            ns = {"atom": "http://www.w3.org/2005/Atom",
-                   "arxiv": "http://arxiv.org/schemas/atom"}
-            for entry in root.findall("atom:entry", ns):
-                title_el = entry.find("atom:title", ns)
-                summary_el = entry.find("atom:summary", ns)
-                id_el = entry.find("atom:id", ns)
-
-                title = self._clean_text(title_el.text) if title_el is not None else "Untitled"
-                summary = self._clean_text(summary_el.text) if summary_el is not None else ""
-                arxiv_url = id_el.text.strip() if id_el is not None else ""
-                arxiv_id = arxiv_url.split("/abs/")[-1] if "/abs/" in arxiv_url else arxiv_url
-
-                authors = []
-                for author_el in entry.findall("atom:author", ns):
-                    name_el = author_el.find("atom:name", ns)
-                    if name_el is not None and name_el.text:
-                        authors.append(name_el.text.strip())
-
-                published_el = entry.find("atom:published", ns)
-                year = None
-                if published_el is not None and published_el.text:
-                    try:
-                        year = int(published_el.text[:4])
-                    except ValueError:
-                        pass
-
-                items.append(SourceItem(
-                    id=f"arxiv:{arxiv_id}",
-                    title=title,
-                    source_type="paper",
-                    summary=summary[:800],
-                    authors=authors,
-                    year=year,
-                    venue="arXiv",
-                    url=arxiv_url,
-                    citation_count=None,
-                    source_level="primary",
-                    raw_metadata={"arxiv_id": arxiv_id},
-                ))
-        except ET.ParseError as e:
-            print(f"[ArxivAdapter] XML parse error: {e}")
-
-        return items
+        return self._to_source_item(paper) if paper else None
 
     @staticmethod
-    def _clean_text(text: str) -> str:
-        text = (text or "").strip()
-        text = re.sub(r"\s+", " ", text)
-        return text
+    def _to_source_item(paper) -> SourceItem:
+        return SourceItem(
+            id=f"arxiv:{paper.arxiv_id}",
+            title=paper.title,
+            source_type="paper",
+            summary=paper.abstract[:800],
+            authors=paper.authors,
+            year=paper.year,
+            venue="arXiv",
+            url=paper.abs_url,
+            citation_count=None,
+            source_level="primary",
+            raw_metadata={
+                "arxiv_id": paper.arxiv_id,
+                "pdf_url": paper.pdf_url,
+                "categories": paper.categories,
+                "primary_category": paper.primary_category,
+                "published": paper.published,
+                "updated": paper.updated,
+                "doi": paper.doi,
+            },
+        )
 
 
 class RssFeedAdapter(SourceAdapter):

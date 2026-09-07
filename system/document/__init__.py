@@ -1,7 +1,6 @@
-"""
-Docling unified document parsing layer.
+"""Lightweight, parser-neutral document ingestion adapters."""
 
-Docling is an internal parser, not a separate product surface.
-It provides the shared parsing capability for PDFs, images, and future
-document formats, feeding into the Wiki compiler.
-"""
+from system.document.models import ParsedDocument
+from system.document.parser_router import PaperParserRouter
+
+__all__ = ["ParsedDocument", "PaperParserRouter"]

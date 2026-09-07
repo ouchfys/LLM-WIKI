@@ -357,16 +357,16 @@ class PaperWikiPipelineStore:
         return source_id
 
     def replace_source_evidence(self, packet: SourcePacket) -> None:
-        """Persist lossless Docling JSON as an object and its projection in SQLite."""
-        raw_docling = self.dump_json(packet.docling_json)
-        raw_bytes = raw_docling.encode("utf-8")
-        docling_hash = hashlib.sha256(raw_bytes).hexdigest() if packet.docling_json else ""
-        docling_uri = ""
+        """Persist an optional parser artifact and its queryable projection."""
+        raw_document = self.dump_json(packet.docling_json)
+        raw_bytes = raw_document.encode("utf-8")
+        document_hash = hashlib.sha256(raw_bytes).hexdigest() if packet.docling_json else ""
+        document_uri = ""
         if packet.docling_json:
-            key = get_storage_layout().docling_json_key(packet.source_id, packet.source_hash or docling_hash)
-            docling_uri = get_object_storage().write_text(
+            key = get_storage_layout().source_document_key(packet.source_id, packet.source_hash or document_hash)
+            document_uri = get_object_storage().write_text(
                 key,
-                raw_docling,
+                raw_document,
                 content_type="application/json; charset=utf-8",
             )
         with closing(self._connect()) as conn:
@@ -384,10 +384,14 @@ class PaperWikiPipelineStore:
                 """,
                 (
                     str(uuid.uuid4()), packet.source_id, packet.source_hash, packet.parser_used,
-                    str(packet.metadata.get("docling_version") or ""),
-                    self.dump_json({"docling_mode": packet.metadata.get("docling_mode"), "json_export_available": packet.metadata.get("json_export_available")}),
+                    str(packet.metadata.get("model_version") or packet.metadata.get("arxiv_id") or ""),
+                    self.dump_json({
+                        "parser_attempts": packet.metadata.get("parser_attempts") or [],
+                        "quality_gate": packet.metadata.get("quality_gate") or {},
+                        "degraded": bool(packet.metadata.get("degraded")),
+                    }),
                     packet.pdf_storage_uri or packet.raw_source_path,
-                    "{}", docling_uri, docling_hash, len(raw_bytes), self.now_iso(),
+                    "{}", document_uri, document_hash, len(raw_bytes), self.now_iso(),
                 ),
             )
             for element in packet.elements:
@@ -425,7 +429,7 @@ class PaperWikiPipelineStore:
             conn.commit()
 
     def load_source_document_json(self, source_packet_id: str) -> dict[str, Any]:
-        """Load the lossless document from object storage, with legacy DB fallback."""
+        """Load the optional parser artifact, with legacy DB compatibility."""
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """SELECT docling_json, docling_json_uri, docling_json_hash
@@ -443,7 +447,7 @@ class PaperWikiPipelineStore:
         raw = get_object_storage().read_text(uri)
         expected_hash = str(row["docling_json_hash"] or "")
         if expected_hash and hashlib.sha256(raw.encode("utf-8")).hexdigest() != expected_hash:
-            raise ValueError(f"Docling artifact checksum mismatch for source {source_packet_id}.")
+            raise ValueError(f"Parser artifact checksum mismatch for source {source_packet_id}.")
         payload = self.load_json(raw)
         return payload if isinstance(payload, dict) else {}
 
@@ -597,10 +601,8 @@ class PaperWikiPipelineStore:
         # retain a freshly generated ID inside packet_json even though the row
         # was updated by source_hash.
         data["source_id"] = source_packet_id
-        if not data.get("docling_json") and row["source_document_id"] and str(row["source_document_parser"] or "").startswith("docling"):
-            # The lossless document stays in object storage to avoid placing a
-            # multi-megabyte payload in the operational SQLite database.
-            # A marker preserves the semantic distinction from fallback data.
+        if not data.get("docling_json") and row["source_document_id"] and row["docling_json_uri"]:
+            # Large legacy payloads remain external to operational SQLite.
             data["docling_json"] = {
                 "persisted_source_document_id": str(row["source_document_id"]),
                 "storage_uri": str(row["docling_json_uri"] or ""),
@@ -1142,7 +1144,7 @@ def model_json(model: Any) -> str:
 
 
 def packet_json(packet: SourcePacket) -> str:
-    """Serialize packet metadata without duplicating the large raw Docling JSON.
+    """Serialize packet metadata without duplicating a large parser artifact.
 
     The lossless artifact lives in object storage; packet_json keeps the
     normalized elements/tables required by pipeline replay.

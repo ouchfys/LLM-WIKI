@@ -94,7 +94,7 @@ def main() -> None:
     manifest["teacher_adjudicator_disagreements"] = changes
     manifest["splits"]["verifier"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     manifest["splits"]["verifier"]["label_source"] = (
-        "teacher-generated cases independently relabeled by a second model over persisted Docling spans"
+        "teacher-generated cases independently relabeled by a second model over persisted evidence spans"
     )
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"ok": True, "cases": len(rows), "label_changes": changes, "model": args.model}, ensure_ascii=False))

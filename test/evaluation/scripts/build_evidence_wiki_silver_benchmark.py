@@ -1,4 +1,4 @@
-"""Build a frozen, zero-human silver benchmark from persisted Docling evidence.
+"""Build a frozen, zero-human silver benchmark from persisted evidence.
 
 The verifier split is authored by an independent teacher model from raw evidence
 spans.  The table split is derived deterministically from persisted table cells,
@@ -95,13 +95,13 @@ def main() -> None:
                 "count": len(verifier_cases),
                 "file": verifier_path.name,
                 "sha256": _sha256(verifier_path),
-                "label_source": "independent teacher model over persisted Docling spans",
+                "label_source": "independent teacher model over persisted evidence spans",
             },
             "table_qa": {
                 "count": len(table_cases),
                 "file": table_path.name,
                 "sha256": _sha256(table_path),
-                "label_source": "deterministic values and cell IDs from persisted Docling tables",
+                "label_source": "deterministic values and cell IDs from persisted tables",
             },
         },
         "limitations": [
@@ -395,7 +395,7 @@ def _table_case(
         "expected_row_labels": [str(cell["row_label"]) for cell in expected_cells],
         "expected_column_labels": [str(cell["column_label"]) for cell in expected_cells],
         "expected_pages": [int(cell["page"] or 0) for cell in expected_cells],
-        "label_source": "deterministic persisted Docling table cells",
+        "label_source": "deterministic persisted table cells",
         "human_reviewed": False,
     }
 

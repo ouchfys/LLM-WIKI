@@ -97,7 +97,7 @@ def _incoming_claim(
         "page_start": 5,
         "confidence": 0.98,
         "verifier_result": "entailed",
-        "verifier_reason": "The persisted Docling span explicitly states the exploration limitation.",
+        "verifier_reason": "The persisted source span explicitly states the exploration limitation.",
         "entailment_score": 1.0,
         "semantic_verification_required": True,
         "source_packet_ids": [source_packet_id],
@@ -136,7 +136,7 @@ def create_scenario(db_path: str) -> dict[str, Any]:
 
     evidence = pipeline.find_evidence(source_packet_id, text=EVIDENCE_QUERY, limit=1)
     if not evidence:
-        raise RuntimeError("The persisted Docling evidence for the GRPO limitation was not found.")
+        raise RuntimeError("The persisted evidence for the GRPO limitation was not found.")
     evidence_id = str(evidence[0].get("id") or "")
     evidence_text = str(evidence[0].get("text") or evidence[0].get("caption") or "").strip()
     if not evidence_id or "unsampled" not in evidence_text.lower():
@@ -222,7 +222,7 @@ def create_scenario(db_path: str) -> dict[str, Any]:
     )
     run_id = str(run["id"])
     for state, reason in (
-        ("EXTRACTING", "reused persisted Docling evidence"),
+        ("EXTRACTING", "reused persisted source evidence"),
         ("DISTILLING", "distilled the GRPO exploration limitation"),
         ("VERIFYING", "re-read the persisted source span"),
         ("COMPILING_PROPOSAL", "compiled a claim-aware Markdown patch"),

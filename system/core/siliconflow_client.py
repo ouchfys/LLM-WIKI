@@ -14,6 +14,9 @@ import requests
 from typing import List, Dict, Optional, Tuple, Any, Iterator
 
 from system.core.config import (
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_CHAT_MODEL,
+    DEEPSEEK_CHAT_URL,
     SILICONFLOW_API_KEY,
     SILICONFLOW_CHAT_URL,
     SILICONFLOW_BASE_URL,
@@ -21,6 +24,7 @@ from system.core.config import (
     SILICONFLOW_FAST_MODEL,
 )
 from system.agent_runtime.tracing import record_current_retry, set_current_span_usage
+from system.agent_runtime.control import check_run_control
 
 
 def _require_api_key(api_key: str, env_name: str = "SILICONFLOW_API_KEY") -> str:
@@ -56,6 +60,7 @@ class SiliconFlowChat:
         retry_delay: float = 2.0,
         temperature: float = 0.1,
         max_tokens: int = 4096,
+        thinking_parameter_style: str = "siliconflow",
     ):
         self.api_key = _require_api_key(api_key or SILICONFLOW_API_KEY)
         self.model = model or SILICONFLOW_CHAT_MODEL
@@ -64,13 +69,14 @@ class SiliconFlowChat:
         self.retry_delay = retry_delay
         self.default_temperature = temperature
         self.default_max_tokens = max_tokens
+        self.thinking_parameter_style = thinking_parameter_style
 
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
 
-        print(f"[SiliconFlowChat] 初始化完成 | 模型: {self.model}")
+        print(f"[{self.__class__.__name__}] 初始化完成 | 模型: {self.model}")
 
     # ---- 兼容 ChatGLM3 的 chat 接口 ----
     def chat(
@@ -200,13 +206,13 @@ class SiliconFlowChat:
             "stream": False,
             "tools": tools,
             "tool_choice": tool_choice,
-            # SiliconFlow reasoning models can spend the whole completion budget
-            # on hidden reasoning and return an empty tool-call message. Native
-            # function calling is a structured-output path, so disable thinking.
-            "enable_thinking": False,
         }
+        # Tool routing is a structured-output path. Disable hidden reasoning to
+        # reduce latency and avoid provider-specific CoT continuation rules.
+        self._set_thinking(payload, False)
 
         for attempt in range(1, self.max_retries + 1):
+            check_run_control()
             try:
                 response = requests.post(
                     self.base_url,
@@ -257,6 +263,7 @@ class SiliconFlowChat:
         messages: List[Dict[str, str]],
         temperature: float = None,
         max_tokens: int = None,
+        enable_thinking: Optional[bool] = None,
     ):
         payload = {
             "model": self.model,
@@ -265,8 +272,11 @@ class SiliconFlowChat:
             "max_tokens": max_tokens or self.default_max_tokens,
             "stream": True,
         }
+        self._set_thinking(payload, enable_thinking)
 
         for attempt in range(1, self.max_retries + 1):
+            check_run_control()
+            response = None
             try:
                 response = requests.post(
                     self.base_url,
@@ -280,6 +290,7 @@ class SiliconFlowChat:
                 response.encoding = "utf-8"
 
                 for line in response.iter_lines(decode_unicode=True):
+                    check_run_control(force=False)
                     if not line or not line.startswith("data: "):
                         continue
                     data_str = line[6:]
@@ -320,7 +331,20 @@ class SiliconFlowChat:
                 )
                 time.sleep(delay)
 
+            finally:
+                if response is not None:
+                    response.close()
+
     # ---- 内部方法 ----
+    def _set_thinking(self, payload: Dict[str, Any], enabled: Optional[bool]) -> None:
+        """Set the correct thinking switch for the selected API provider."""
+        if enabled is None:
+            return
+        if self.thinking_parameter_style == "deepseek":
+            payload["thinking"] = {"type": "enabled" if enabled else "disabled"}
+        else:
+            payload["enable_thinking"] = enabled
+
     def _build_messages(self, prompt: str, history: list = None) -> List[Dict[str, str]]:
         """将 ChatGLM3 格式的 history 转换为 OpenAI 格式的 messages"""
         messages = []
@@ -348,10 +372,10 @@ class SiliconFlowChat:
         }
         if response_format:
             payload["response_format"] = response_format
-        if enable_thinking is not None:
-            payload["enable_thinking"] = enable_thinking
+        self._set_thinking(payload, enable_thinking)
 
         for attempt in range(1, self.max_retries + 1):
+            check_run_control()
             try:
                 response = requests.post(
                     self.base_url,
@@ -394,6 +418,19 @@ class SiliconFlowChat:
                 time.sleep(delay)
 
         return ""
+
+
+class DeepSeekChat(SiliconFlowChat):
+    """DeepSeek official OpenAI-compatible Chat Completions client."""
+
+    def __init__(self, **kwargs):
+        api_key = kwargs.pop("api_key", None) or _require_api_key(
+            DEEPSEEK_API_KEY, "DEEPSEEK_API_KEY"
+        )
+        kwargs.setdefault("model", DEEPSEEK_CHAT_MODEL)
+        kwargs.setdefault("base_url", DEEPSEEK_CHAT_URL)
+        kwargs.setdefault("thinking_parameter_style", "deepseek")
+        super().__init__(api_key=api_key, **kwargs)
 
 
 # ===========================================================
@@ -479,6 +516,7 @@ class SiliconFlowEmbeddings:
         }
 
         for attempt in range(1, self.max_retries + 1):
+            check_run_control()
             try:
                 response = requests.post(
                     self.base_url,

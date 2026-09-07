@@ -38,6 +38,8 @@ SYSTEM_CONTENT_KEYS = {
     "evidence_updates", "merge_history", "affected_claims", "compiler",
     "import_impact", "claims", "markdown_status", "review_status_text",
     "evidence", "links",
+    "conversation_instruction", "source_session_id", "source_message_ids",
+    "related_sources",
 }
 
 INTERNAL_SECTION_HEADINGS = {
@@ -45,6 +47,7 @@ INTERNAL_SECTION_HEADINGS = {
     "merge history", "affected claims", "compiler", "import impact",
     "review status", "schema version", "compile status", "markdown status",
     "compiler model", "pipeline", "parser used", "review status text",
+    "sources", "source packet id", "source packet ids",
 }
 
 
@@ -230,7 +233,7 @@ class MarkdownVault:
         body = [f"# {title}", ""]
         if summary:
             # Summaries are prose fields, not nested Markdown documents. A
-            # Docling abstract can begin with ``##`` and would otherwise close
+            # Parser abstracts can begin with ``##`` and would otherwise close
             # the Summary section during deterministic reindexing.
             inline_summary = re.sub(r"\s+", " ", summary).strip()
             inline_summary = re.sub(r"^#{1,6}\s*", "", inline_summary)
@@ -364,6 +367,8 @@ class MarkdownVault:
                 ("explanation", "Explanation"),
                 ("examples", "Examples"),
                 ("related_concepts", "Related Concepts"),
+                ("conversation_insights", "Conversation Insights"),
+                ("open_questions", "Open Questions"),
             ],
             "TopicPage": [
                 ("definition", "Definition"),
@@ -374,6 +379,8 @@ class MarkdownVault:
                 ("key_takeaways", "Key Takeaways"),
                 ("examples", "Examples"),
                 ("related_concepts", "Related Topics"),
+                ("conversation_insights", "Conversation Insights"),
+                ("open_questions", "Open Questions"),
             ],
             "MethodPage": [
                 ("definition", "Definition"),
@@ -387,6 +394,8 @@ class MarkdownVault:
                 ("when_to_use", "When To Use"),
                 ("steps", "Steps"),
                 ("comparison_to_alternatives", "Comparison To Alternatives"),
+                ("conversation_insights", "Conversation Insights"),
+                ("open_questions", "Open Questions"),
             ],
             "ComparePage": [
                 ("item_a", "Item A"),
@@ -398,6 +407,12 @@ class MarkdownVault:
                 ("ideal_answer", "Ideal Answer"),
                 ("key_points", "Key Points"),
                 ("common_mistakes", "Common Mistakes"),
+            ],
+            "SourceNote": [
+                ("knowledge_kind", "Knowledge Type"),
+                ("main_points", "Main Points"),
+                ("open_questions", "Open Questions"),
+                ("notes", "Notes"),
             ],
             "MistakeNote": [
                 ("mistake", "Mistake"),
@@ -526,7 +541,8 @@ def readable_markdown(markdown: str) -> str:
     for line in body.replace("\r\n", "\n").splitlines():
         heading = re.match(r"^##\s+(.+?)\s*$", line)
         if heading:
-            skipping = heading.group(1).strip().lower() in INTERNAL_SECTION_HEADINGS
+            name = re.sub(r"[_\s-]+", " ", heading.group(1).strip().lower())
+            skipping = name in INTERNAL_SECTION_HEADINGS
             if skipping:
                 continue
         if not skipping:

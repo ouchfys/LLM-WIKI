@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import threading
 import uuid
 from pathlib import Path
 from typing import Any
 
 from backend.deps import get_session_store
+from backend.task_executor import submit_agent_task
 from system.agent_runtime import AgentRunStore
 from system.wiki.ingestion_jobs import IngestionJobStore
 
@@ -24,7 +24,8 @@ def recover_agent_runs(db_path: str = "") -> list[dict[str, Any]]:
         try:
             dispatched.append(
                 dispatch_agent_run_resume(
-                    str(run["id"]), db_path=resolved, reason="startup recovery"
+                    str(run["id"]), db_path=resolved, reason="startup recovery",
+                    record_deferred=False,
                 )
             )
         except Exception as exc:
@@ -41,6 +42,7 @@ def dispatch_agent_run_resume(
     *,
     db_path: str = "",
     reason: str = "manual resume",
+    record_deferred: bool = True,
 ) -> dict[str, Any]:
     resolved = db_path or get_session_store().db_path
     runtime = AgentRunStore(db_path=resolved)
@@ -71,31 +73,76 @@ def dispatch_agent_run_resume(
             raise ValueError("Run has no replayable paper-ingestion source context.")
         if not Path(pdf_path).exists():
             raise ValueError(f"Immutable ingestion source no longer exists: {pdf_path}")
-        runtime.restart_run(run_id, reason=reason)
-        owner = f"recovery-{uuid.uuid4()}"
-        if not runtime.acquire_lease(run_id, owner, ttl_seconds=90):
-            raise ValueError("Another worker acquired the run before recovery dispatch.")
-        IngestionJobStore(db_path=resolved).update_job(
-            job_id, status="queued", stage="recovering", progress=0.0, error=""
-        )
-        target = _resume_ingestion
+        target = _prepare_and_resume_ingestion
         kwargs = {
             "run_id": run_id, "db_path": resolved, "job_id": job_id,
             "pdf_path": pdf_path, "source_url": str(context.get("source_url") or ""),
             "pipeline": str(context.get("pipeline") or "wiki_compile"),
             "approval_mode": str(run.get("approval_mode") or "manual"),
-            "lease_owner": owner,
+            "reason": reason,
         }
         mode = "source_replay"
 
-    runtime.append_event(
-        run_id, event_type="recovery.dispatched", node_name=state,
-        status="queued", input_data={"reason": reason, "mode": mode},
+    dispatch = submit_agent_task(
+        run_id=run_id,
+        db_path=resolved,
+        job_id=str(run.get("ingestion_job_id") or ""),
+        task_name=f"recovery_{mode}",
+        target=target,
+        kwargs=kwargs,
+        record_deferred=record_deferred,
     )
-    threading.Thread(
-        target=target, kwargs=kwargs, name=f"agent-recovery-{run_id[:8]}", daemon=True
-    ).start()
-    return {"ok": True, "run_id": run_id, "mode": mode, "state": state}
+    if dispatch.get("status") == "scheduled":
+        runtime.append_event(
+            run_id, event_type="recovery.dispatched", node_name=state,
+            status="queued", input_data={"reason": reason, "mode": mode},
+        )
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "mode": mode,
+        "state": state,
+        "dispatch": dispatch,
+    }
+
+
+def _prepare_and_resume_ingestion(
+    *,
+    run_id: str,
+    db_path: str,
+    job_id: str,
+    pdf_path: str,
+    source_url: str,
+    pipeline: str,
+    approval_mode: str,
+    reason: str,
+) -> None:
+    runtime = AgentRunStore(db_path=db_path)
+    run = runtime.get_run(run_id) or {}
+    if str(run.get("current_state") or "") != "QUEUED":
+        runtime.restart_run(run_id, reason=reason)
+    owner = f"recovery-{uuid.uuid4()}"
+    if not runtime.acquire_lease(run_id, owner, ttl_seconds=90):
+        runtime.append_event(
+            run_id,
+            event_type="recovery.lease_busy",
+            node_name="QUEUED",
+            status="deferred",
+        )
+        return
+    IngestionJobStore(db_path=db_path).update_job(
+        job_id, status="queued", stage="recovering", progress=0.0, error=""
+    )
+    _resume_ingestion(
+        run_id=run_id,
+        db_path=db_path,
+        job_id=job_id,
+        pdf_path=pdf_path,
+        source_url=source_url,
+        pipeline=pipeline,
+        approval_mode=approval_mode,
+        lease_owner=owner,
+    )
 
 
 def _resume_ingestion(**kwargs: Any) -> None:

@@ -9,7 +9,6 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from system.document.docling_evidence import normalize_docling_document
 from system.storage import object_storage as object_storage_module
 from system.storage.object_storage import ObjectStorage
 from system.wiki.evidence_verifier import EvidenceVerifier
@@ -29,49 +28,6 @@ from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 from system.wiki.revision import RevisionRejectedError, WikiRevisionManager
 from system.wiki.table_qa import ReadOnlyTableEngine, TableQuestionAnswerer, TableResolver
 from system.wiki.wiki_store import WikiStore
-
-
-DOCLING_FIXTURE = {
-    "texts": [
-        {
-            "self_ref": "#/texts/0",
-            "label": "section_header",
-            "text": "Experiments",
-            "level": 1,
-            "prov": [{"page_no": 4, "bbox": {"l": 20, "t": 30, "r": 300, "b": 50}}],
-        },
-        {
-            "self_ref": "#/texts/1",
-            "label": "text",
-            "text": "Model A reaches 91.2 on GSM8K.",
-            "prov": [{"page_no": 4, "bbox": {"l": 20, "t": 60, "r": 400, "b": 90}}],
-        },
-        {
-            "self_ref": "#/texts/2",
-            "label": "caption",
-            "text": "Table 2: Main results",
-            "prov": [{"page_no": 4, "bbox": {"l": 20, "t": 100, "r": 300, "b": 120}}],
-        },
-    ],
-    "tables": [
-        {
-            "self_ref": "#/tables/0",
-            "label": "table",
-            "captions": [{"$ref": "#/texts/2"}],
-            "prov": [{"page_no": 4, "bbox": {"l": 20, "t": 130, "r": 500, "b": 300}}],
-            "data": {
-                "num_rows": 2,
-                "num_cols": 2,
-                "table_cells": [
-                    {"start_row_offset_idx": 0, "end_row_offset_idx": 1, "start_col_offset_idx": 0, "end_col_offset_idx": 1, "text": "Model", "column_header": True},
-                    {"start_row_offset_idx": 0, "end_row_offset_idx": 1, "start_col_offset_idx": 1, "end_col_offset_idx": 2, "text": "GSM8K", "column_header": True},
-                    {"start_row_offset_idx": 1, "end_row_offset_idx": 2, "start_col_offset_idx": 0, "end_col_offset_idx": 1, "text": "Model A", "row_header": True},
-                    {"start_row_offset_idx": 1, "end_row_offset_idx": 2, "start_col_offset_idx": 1, "end_col_offset_idx": 2, "text": "91.2"},
-                ],
-            },
-        }
-    ],
-}
 
 
 class FakeSemanticLLM:
@@ -98,19 +54,57 @@ def _storage() -> None:
 
 
 def _packet(source_id: str = "packet-1") -> SourcePacket:
-    elements, tables = normalize_docling_document(DOCLING_FIXTURE, source_key="fixture-hash")
+    elements = [
+        SourceElement(
+            element_id="ev-heading",
+            element_type="heading",
+            text="Experiments",
+            page=4,
+            bbox={"l": 20, "t": 30, "r": 300, "b": 50},
+            heading_path=["Experiments"],
+            reading_order=0,
+            docling_ref="section-4",
+        ),
+        SourceElement(
+            element_id="ev-result",
+            text="Model A reaches 91.2 on GSM8K.",
+            page=4,
+            bbox={"l": 20, "t": 60, "r": 400, "b": 90},
+            heading_path=["Experiments"],
+            reading_order=1,
+            docling_ref="paragraph-4-1",
+        ),
+    ]
+    table = SourceTable(
+        table_id="tbl-results",
+        element_id="ev-table",
+        caption="Table 2: Main results",
+        section_path=["Experiments"],
+        page=4,
+        bbox={"l": 20, "t": 130, "r": 500, "b": 300},
+        headers=[["Model", "GSM8K"]],
+        rows=[["Model A", "91.2"]],
+        markdown="| Model | GSM8K |\n| --- | --- |\n| Model A | 91.2 |",
+        docling_ref="table-2",
+        cells=[
+            {"cell_id": "ev-cell-00", "table_id": "tbl-results", "row_index": 0, "column_index": 0, "text": "Model", "column_header": True, "page": 4},
+            {"cell_id": "ev-cell-01", "table_id": "tbl-results", "row_index": 0, "column_index": 1, "text": "GSM8K", "column_header": True, "page": 4},
+            {"cell_id": "ev-cell-10", "table_id": "tbl-results", "row_index": 1, "column_index": 0, "text": "Model A", "row_header": True, "page": 4},
+            {"cell_id": "ev-cell-11", "table_id": "tbl-results", "row_index": 1, "column_index": 1, "text": "91.2", "page": 4},
+        ],
+    )
     return SourcePacket(
         source_id=source_id,
         title="Evidence Paper",
         source_hash="fixture-hash",
-        parser_used="docling-local",
-        docling_json=DOCLING_FIXTURE,
-        elements=[SourceElement(**item) for item in elements],
-        tables=[SourceTable(**item) for item in tables],
+        parser_used="structured-test-parser",
+        docling_json={"format": "test-parser"},
+        elements=elements,
+        tables=[table],
     )
 
 
-def test_docling_evidence_keeps_table_cells_page_bbox_and_headers() -> None:
+def test_structured_evidence_keeps_table_cells_page_bbox_and_headers() -> None:
     packet = _packet()
     assert packet.elements[1].page == 4
     assert packet.elements[1].bbox["l"] == 20.0
@@ -183,7 +177,7 @@ def test_source_hash_upsert_keeps_relational_source_id_authoritative() -> None:
         assert restored.docling_json.get("persisted_source_document_id")
 
 
-def test_verifier_keeps_long_docling_tail_and_normalizes_number_words() -> None:
+def test_verifier_keeps_long_parser_tail_and_normalizes_number_words() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         store = PaperWikiPipelineStore(db_path=str(Path(tmp) / "long-evidence.db"))
         long_text = ("architecture context " * 50) + "The model trained for eight days. TAIL_EVIDENCE"
@@ -191,8 +185,8 @@ def test_verifier_keeps_long_docling_tail_and_normalizes_number_words() -> None:
             source_id="long-packet",
             title="Long Evidence",
             source_hash="long-hash",
-            parser_used="docling-local",
-            docling_json={"texts": []},
+            parser_used="mineru-vlm",
+            docling_json={"format": "mineru-markdown"},
             elements=[SourceElement(
                 element_id="long-element",
                 text=long_text,
@@ -391,7 +385,7 @@ def test_recompile_replaces_claims_from_previous_parser_for_same_source() -> Non
             evidence="Model A reaches 91.2 on GSM8K.",
             evidence_ids=[paragraph.element_id],
             verifier_result="entailed",
-            verifier_reason="verified after Docling reparse",
+            verifier_reason="verified after structured reparse",
             entailment_score=0.99,
         )],
     )
@@ -554,9 +548,13 @@ def test_table_resolver_and_readonly_duckdb_cross_paper_query() -> None:
         second.title = "Second Evidence Paper"
         second.source_hash = "fixture-hash-b"
         # IDs must be unique across source documents.
-        elements, tables = normalize_docling_document(DOCLING_FIXTURE, source_key="fixture-hash-b")
-        second.elements = [SourceElement(**item) for item in elements]
-        second.tables = [SourceTable(**item) for item in tables]
+        for index, element in enumerate(second.elements):
+            element.element_id = f"paper-b-element-{index}"
+        second.tables[0].table_id = "paper-b-table"
+        second.tables[0].element_id = "paper-b-table-element"
+        for index, cell in enumerate(second.tables[0].cells):
+            cell.table_id = "paper-b-table"
+            cell.cell_id = f"paper-b-cell-{index}"
         store.upsert_source_packet(first)
         store.upsert_source_packet(second)
 

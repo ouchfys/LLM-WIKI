@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 from backend.deps import get_learning_profile, get_session_store
 from system.memory.learning_profile import LearningProfileStore
-from system.memory.session_store import SessionStore
+from system.conversation.session_store import SessionStore
 
 
 router = APIRouter()

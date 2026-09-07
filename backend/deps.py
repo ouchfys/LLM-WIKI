@@ -1,7 +1,7 @@
 from functools import lru_cache
 
 from system.memory.learning_profile import LearningProfileStore
-from system.memory.session_store import SessionStore
+from system.conversation.session_store import SessionStore
 from system.recommender.monthly_reads import MonthlyReadingStore
 from system.recommender.profile_builder import ProfileBuilder
 from system.recommender.item_scorer import ProfileAwareRecommender
@@ -17,6 +17,7 @@ from system.search.resource_recommender import LearningResourceRecommender
 from system.search.web_fetch import WebFetchTool
 from system.search.web_search import WebSearchTool
 from system.core.config import (
+    DEEPSEEK_CHAT_MODEL,
     SILICONFLOW_FAST_MODEL,
     SILICONFLOW_MAINTENANCE_FAST_MODEL,
     SILICONFLOW_MAINTENANCE_MODEL,
@@ -33,8 +34,9 @@ from system.core.config import (
 )
 
 try:
-    from system.core.siliconflow_client import SiliconFlowChat, SiliconFlowEmbeddings
+    from system.core.siliconflow_client import DeepSeekChat, SiliconFlowChat, SiliconFlowEmbeddings
 except Exception:
+    DeepSeekChat = None
     SiliconFlowChat = None
     SiliconFlowEmbeddings = None
 
@@ -70,11 +72,11 @@ def get_paper_index() -> PaperIndexStore:
 
 @lru_cache(maxsize=1)
 def get_chat_llm():
-    """主力模型: Wiki Chat / 面试评估 / 论文发现排序"""
-    if SiliconFlowChat is None:
+    """DeepSeek official model for Wiki tool use, table QA, and final answers."""
+    if DeepSeekChat is None:
         return None
     try:
-        return SiliconFlowChat()
+        return DeepSeekChat(model=DEEPSEEK_CHAT_MODEL)
     except Exception as exc:
         print(f"[deps] Chat LLM unavailable: {exc}")
         return None

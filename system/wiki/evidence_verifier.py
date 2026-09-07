@@ -51,7 +51,7 @@ Return strict JSON only:
 CLAIM:
 {claim}
 
-SOURCE EVIDENCE (persisted Docling spans/cells):
+SOURCE EVIDENCE (persisted parser spans/cells):
 {evidence}
 """
 
@@ -203,7 +203,7 @@ class EvidenceVerifier:
         return {
             "id": item.get("id", ""),
             "kind": item.get("evidence_kind", "element"),
-            # Docling often stores an entire abstract or table note as one text
+            # A parser may store an entire abstract or table note as one text
             # element. A 500-character preview silently removed the tail that
             # contained the exact evidence, causing systematic false rejects.
             "text": str(item.get("text") or "")[:2400],
@@ -247,7 +247,7 @@ _NUMBER_WORDS = {
 
 def _numeric_tokens(value: str) -> set[str]:
     normalized = (value or "").lower().replace("−", "-").replace("﹣", "-")
-    # Docling may serialize a PDF number as `50 . 3 %`; normalize layout
+    # Layout parsers may serialize a PDF number as `50 . 3 %`; normalize layout
     # whitespace before comparing it with the claim's `50.3%`.
     normalized = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", normalized)
     normalized = re.sub(r"(?<=\d)\s+%", "%", normalized)

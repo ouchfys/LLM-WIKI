@@ -48,8 +48,8 @@ class ProfileSignalExtractor:
                 signals.append({"signal_type": "interest", "key": "topic", "value": topic, "weight": "1.2"})
 
         preference_rules = [
-            ("language_preference", "中文", ("中文回答", "中文", "用中文")),
-            ("language_preference", "英文", ("英文回答", "英文", "english")),
+            ("language_preference", "中文", ("中文回答", "用中文")),
+            ("language_preference", "英文", ("英文回答", "用英文", "answer in english")),
             ("answer_length", "short", ("简短", "短一点", "精炼", "直接说结论")),
             ("answer_length", "long", ("详细", "展开", "讲细一点", "详细一点")),
             ("answer_style", "conclusion_first", ("结论先行", "先说结论", "先给结论")),
@@ -57,9 +57,15 @@ class ProfileSignalExtractor:
             ("explanation_style", "simplified", ("通俗", "简单一点", "白话一点")),
             ("citation_preference", "inline", ("带引用", "给出处", "标注来源")),
         ]
-        for key, value, hints in preference_rules:
-            if any(hint in lowered for hint in hints):
-                preferences.append({"key": key, "value": value})
+        # A one-turn request must not silently become a cross-session preference.
+        for clause in re.split(r"[。；;！!\n]", lowered):
+            if not any(marker in clause for marker in ("以后", "今后", "默认", "记住我的偏好", "始终", "always", "from now on")):
+                continue
+            if any(marker in clause for marker in ("这次", "本次", "不要", "不用", "不再", "don't", "do not")):
+                continue
+            for key, value, hints in preference_rules:
+                if any(hint in clause for hint in hints):
+                    preferences.append({"key": key, "value": value})
 
         for card in cards[:3]:
             title = (card.get("title") or "").strip()

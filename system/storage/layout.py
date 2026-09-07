@@ -2,9 +2,9 @@
 
 All durable user artifacts live under STORAGE_ROOT_PREFIX in object storage:
 
-    users/admin/sources/   immutable or near-raw source artifacts
-    users/admin/wiki/      LLM/agent compiled Markdown knowledge pages
-    users/admin/queries/   generated query artifacts, indexes, and lint runs
+    users/{tenant}/sources/   immutable or near-raw source artifacts
+    users/{tenant}/wiki/      LLM/agent compiled Markdown knowledge pages
+    users/{tenant}/queries/   generated query artifacts, indexes, and lint runs
 
 Local paths with the same first-level names are developer caches only.
 """
@@ -53,10 +53,14 @@ class StorageLayout:
     def paper_original_key(self, filename: str) -> str:
         return f"sources/papers/originals/{self.safe_filename(filename or 'paper.pdf')}"
 
-    def docling_json_key(self, source_id: str, content_hash: str = "") -> str:
-        """Stable object key for a paper's lossless Docling document."""
+    def source_document_key(self, source_id: str, content_hash: str = "") -> str:
+        """Stable object key for an optional parser artifact."""
         identity = self.slug(content_hash or source_id) or "unknown"
-        return f"sources/papers/docling/{identity}/document.json"
+        return f"sources/papers/parser-artifacts/{identity}/document.json"
+
+    def docling_json_key(self, source_id: str, content_hash: str = "") -> str:
+        """Compatibility alias for migrations created before parser routing."""
+        return self.source_document_key(source_id, content_hash)
 
     def query_artifact_path(self, category: str, name: str, suffix: str = ".md") -> Path:
         safe_suffix = suffix if suffix.startswith(".") else f".{suffix}"

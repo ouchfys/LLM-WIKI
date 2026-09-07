@@ -52,7 +52,7 @@ def _display_path(path: Path) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Batch ingest the paper test corpus with the four-agent pipeline.')
+    parser = argparse.ArgumentParser(description='Batch ingest the paper test corpus with the Wiki compiler workflow.')
     parser.add_argument('--corpus-dir', default=str(DEFAULT_CORPUS))
     parser.add_argument('--limit', type=int, default=0)
     parser.add_argument('--pattern', default='*.pdf')

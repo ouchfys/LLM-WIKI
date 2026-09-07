@@ -1,6 +1,19 @@
 import sqlite3
+import pytest
 
-from system.wiki.wiki_chat import AgentToolCall, WikiChatService
+
+@pytest.fixture(autouse=True)
+def isolated_knowledge_storage(tmp_path, monkeypatch):
+    from system.wiki import wiki_store, markdown_vault
+    from system.storage.object_storage import ObjectStorage
+    storage = ObjectStorage()
+    storage.backend = "local"
+    storage.repo_root = tmp_path
+    monkeypatch.setattr(markdown_vault, "get_object_storage", lambda: storage)
+    monkeypatch.setattr(wiki_store, "MarkdownVault", lambda: markdown_vault.MarkdownVault(str(tmp_path / "wiki")))
+
+
+from system.wiki.wiki_chat import AgentToolCall, AgentToolObservation, WikiChatService
 from system.wiki.wiki_resolver import WikiResolver, lookup_terms, normalize_lookup
 from system.wiki.wiki_store import WikiStore
 
@@ -175,6 +188,81 @@ def test_agent_exposes_clean_page_and_on_demand_evidence_tools():
     assert {"wiki_search", "wiki_open", "table_query", "evidence_lookup"} <= native_names
     assert {"wiki_search", "wiki_open", "table_query", "evidence_lookup"} <= fallback_names
     assert "wiki_card" not in native_names
+
+
+def test_qualitative_paper_comparison_does_not_use_table_query():
+    service = WikiChatService(object(), wiki_resolver=object())
+    observations = [
+        AgentToolObservation(
+            tool="wiki_search",
+            query="比较 Minerva 和 Self-Consistency 的核心创新",
+            status="done",
+            items=[{"card_id": "minerva"}, {"card_id": "self-consistency"}],
+        ),
+        AgentToolObservation(
+            tool="wiki_open",
+            query="比较 Minerva 和 Self-Consistency 的核心创新",
+            status="done",
+            items=[{"id": "minerva"}, {"id": "self-consistency"}],
+        ),
+    ]
+
+    calls = service._apply_query_tool_policy(
+        [AgentToolCall(name="table_query", arguments={"query": "比较两篇论文"})],
+        message="比较 Minerva 和 Self-Consistency 的核心创新",
+        effective_query="比较 Minerva 和 Self-Consistency 的核心创新",
+        observations=observations,
+        limit=6,
+    )
+
+    assert calls == []
+
+
+def test_exact_cross_paper_metric_query_is_wiki_first_then_table():
+    service = WikiChatService(object(), wiki_resolver=object())
+    query = "两种方法在 GSM8K 上分别是多少，差几个百分点？"
+    proposed = [AgentToolCall(name="table_query", arguments={"query": query})]
+
+    first = service._apply_query_tool_policy(
+        proposed,
+        message=query,
+        effective_query=query,
+        observations=[],
+        limit=6,
+    )
+    assert [call.name for call in first] == ["wiki_search"]
+
+    searched = [AgentToolObservation(
+        tool="wiki_search",
+        query=query,
+        status="done",
+        items=[{"card_id": "paper-a"}, {"card_id": "paper-b"}],
+    )]
+    second = service._apply_query_tool_policy(
+        proposed,
+        message=query,
+        effective_query=query,
+        observations=searched,
+        limit=6,
+    )
+    assert [call.name for call in second] == ["wiki_open"]
+    assert second[0].arguments["card_ids"] == ["paper-a", "paper-b"]
+
+    opened = searched + [AgentToolObservation(
+        tool="wiki_open",
+        query=query,
+        status="done",
+        items=[{"id": "paper-a"}, {"id": "paper-b"}],
+    )]
+    third = service._apply_query_tool_policy(
+        proposed,
+        message=query,
+        effective_query=query,
+        observations=opened,
+        limit=6,
+    )
+    assert [call.name for call in third] == ["table_query"]
+    assert third[0].arguments["card_ids"] == ["paper-a", "paper-b"]
 
 
 def test_opened_page_exposes_bounded_bidirectional_wiki_links(tmp_path):

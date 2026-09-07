@@ -1,7 +1,6 @@
 import hashlib
 import re
 import shutil
-import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -10,10 +9,10 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from backend.deps import get_merge_llm, get_paper_index, get_review_llm, get_summary_llm, get_wiki_store, get_chunk_index
-from system.paper_index.parser import PaperIndexParser
+from backend.task_executor import submit_agent_task
 from system.paper_index.store import PaperIndexStore
 from system.discovery.source_adapters import ArxivAdapter
-from system.document.docling_parser import DoclingParser, ParsedDocument
+from system.document.parser_router import PaperParserRouter
 from system.storage import get_object_storage, get_storage_layout
 from system.wiki.wiki_builder import WikiBuilder, sanitize_wiki_text
 from system.wiki.paper_pipeline import run_paper_pipeline
@@ -91,36 +90,25 @@ def _resolve_data_pdf(path_value: str) -> Path:
     return resolved
 
 
-def _parse_pdf_with_fallback(pdf_path: Path, use_docling: bool = True) -> dict:
-    """Parse a PDF with Docling if available, otherwise fallback to PaperIndexParser.
-
-    Returns a dict with keys: title, summary, metadata, blocks, parser_used.
-    """
-    docling_parser = DoclingParser() if use_docling else None
-
-    if docling_parser and docling_parser.available:
-        try:
-            doc: ParsedDocument = docling_parser.parse_file(str(pdf_path))
-            blocks = doc.pages_or_items
-            if not blocks:
-                # Docling succeeded but produced no blocks — chunk markdown
-                blocks = _chunk_markdown_to_blocks(doc.markdown, str(pdf_path))
-            return {
-                "title": doc.title,
-                "summary": _make_summary(doc.text or doc.markdown),
-                "metadata": doc.metadata,
-                "blocks": blocks,
-                "markdown": doc.markdown,
-                "parser_used": doc.parser or (doc.metadata or {}).get("parser") or "docling-remote",
-            }
-        except Exception as exc:
-            print(f"[papers] Docling parse failed, falling back to PaperIndexParser: {exc}")
-
-    # Fallback to PaperIndexParser
-    fallback = PaperIndexParser().parse_pdf(str(pdf_path))
-    fallback["parser_used"] = "PaperIndexParser"
-    fallback.setdefault("markdown", "")
-    return fallback
+def _parse_pdf_with_fallback(
+    pdf_path: Path,
+    *,
+    source_url: str = "",
+    use_precision_parser: bool = True,
+) -> dict:
+    """Parse through the shared HTML/MinerU router or force local degradation."""
+    router = PaperParserRouter()
+    if not use_precision_parser:
+        parsed = router.parse_local_fallback(pdf_path, source_key=_file_sha256(pdf_path))
+    else:
+        parsed = router.parse(
+            pdf_path,
+            source_url=source_url,
+            source_key=_file_sha256(pdf_path),
+        )
+    result = parsed.as_pipeline_dict()
+    result["summary"] = _make_summary(parsed.text or parsed.markdown)
+    return result
 
 
 def _make_summary(text: str, max_len: int = 600) -> str:
@@ -131,7 +119,7 @@ def _make_summary(text: str, max_len: int = 600) -> str:
 
 
 def _chunk_markdown_to_blocks(markdown: str, source_path: str) -> list:
-    """Chunk markdown text into block-like dicts when Docling gives no pages."""
+    """Chunk parser Markdown into block-like records."""
     import re
     blocks = []
     paragraphs = re.split(r"\n\s*\n", markdown)
@@ -158,7 +146,7 @@ def _index_pdf(
     source_url: str,
     store: PaperIndexStore,
     wiki_store: WikiStore,
-    use_docling: bool = True,
+    use_precision_parser: bool = True,
     use_llm_compile: bool = True,
 ) -> dict:
     source_urls = [source_url] if source_url else [f"file://{pdf_path.resolve().as_posix()}"]
@@ -174,7 +162,11 @@ def _index_pdf(
             ),
         )
 
-    parsed = _parse_pdf_with_fallback(pdf_path, use_docling=use_docling)
+    parsed = _parse_pdf_with_fallback(
+        pdf_path,
+        source_url=source_url,
+        use_precision_parser=use_precision_parser,
+    )
     parser_used = parsed.pop("parser_used", "unknown")
     parsed_pdf_title = parsed.get("title", "")
     if quick_pdf_abstract and len(quick_pdf_abstract) > len(sanitize_wiki_text(parsed.get("summary", ""))):
@@ -689,7 +681,7 @@ def _run_pdf_pipeline(
             stage_callback=stage_callback,
         ))
     if normalized_pipeline in {"paperindex", "fallback", "basic_fallback"}:
-        return _index_pdf(pdf_path, source_url, store, wiki_store, use_docling=False, use_llm_compile=False)
+        return _index_pdf(pdf_path, source_url, store, wiki_store, use_precision_parser=False, use_llm_compile=False)
     return _index_pdf(pdf_path, source_url, store, wiki_store)
 
 
@@ -753,7 +745,7 @@ def _run_ingestion_job(
         return
     trace = TraceRecorder(runs, run_id)
     normalized_pipeline = (pipeline or "").strip().lower()
-    initial_stage = "indexing" if normalized_pipeline in {"paperindex", "fallback", "basic_fallback"} else "docling_extracting"
+    initial_stage = "indexing" if normalized_pipeline in {"paperindex", "fallback", "basic_fallback"} else "extracting"
     jobs.merge_metadata(job_id, {"runner_version": "agent-state-v1", "runner_pipeline": normalized_pipeline, "agent_run_id": run_id, "approval_mode": approval_mode})
     jobs.update_job(job_id, status="running", stage=initial_stage, progress=0.12)
     try:
@@ -984,7 +976,11 @@ def create_ingestion_job(
         },
     )
     jobs.merge_metadata(job["id"], {"agent_run_id": run["id"], "approval_mode": run["approval_mode"]})
-    threading.Thread(
+    dispatch = submit_agent_task(
+        run_id=str(run["id"]),
+        db_path=jobs.db_path,
+        job_id=str(job["id"]),
+        task_name="paper_ingestion",
         target=_run_ingestion_job,
         kwargs={
             "db_path": jobs.db_path,
@@ -995,10 +991,16 @@ def create_ingestion_job(
             "run_id": run["id"],
             "approval_mode": run["approval_mode"],
         },
-        daemon=True,
-    ).start()
+    )
     job = jobs.get_job(job["id"]) or job
-    return {"ok": True, "job_id": job["id"], "agent_run_id": run["id"], "job": job, "run": run}
+    return {
+        "ok": True,
+        "job_id": job["id"],
+        "agent_run_id": run["id"],
+        "job": job,
+        "run": run,
+        "dispatch": dispatch,
+    }
 
 
 @router.get("/ingest/jobs")

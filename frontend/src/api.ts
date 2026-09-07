@@ -5,6 +5,14 @@ export const api = axios.create({
   timeout: 20000
 })
 
+export function apiErrorMessage(error: unknown, fallback: string): string {
+  if (axios.isAxiosError<{ detail?: unknown }>(error)) {
+    const detail = error.response?.data?.detail
+    if (typeof detail === 'string') return detail
+  }
+  return fallback
+}
+
 export interface ReadingItem {
   id: string
   title: string

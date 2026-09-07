@@ -6,9 +6,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from system.document.docling_parser import DoclingParser, ParsedDocument
-from system.document.docling_evidence import normalize_docling_document
-from system.paper_index.parser import PaperIndexParser
+from system.document.evidence import elements_from_blocks
+from system.document.parser_router import PaperParserRouter
 from system.storage import get_object_storage, get_storage_layout
 from system.wiki.paper_pipeline.models import SourceElement, SourcePacket, SourceSection, SourceTable
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
@@ -28,7 +27,7 @@ def extract_paper_source(
             cached
             and cached.elements
             and cached.blocks
-            and str(cached.parser_used).lower().startswith("docling")
+            and cached.parser_used in {"arxiv-html", "mineru-vlm", "pymupdf-fallback"}
         ):
             cached.metadata = {
                 **cached.metadata,
@@ -36,17 +35,18 @@ def extract_paper_source(
                 "extraction_cache_source": cached.source_id,
             }
             return cached
-    parsed = _parse_pdf(pdf_path)
+    parsed = _parse_pdf(pdf_path, source_url=source_url, source_key=source_hash)
     title = sanitize_wiki_text(parsed.get("title") or pdf_path.stem).strip() or pdf_path.stem
     summary = sanitize_wiki_text(parsed.get("summary") or "")
     if not summary:
         summary = _quick_pdf_abstract(pdf_path)
     metadata = parsed.get("metadata") or {}
     blocks = parsed.get("blocks") or []
-    docling_json = parsed.get("docling_json") if isinstance(parsed.get("docling_json"), dict) else {}
-    normalized_elements, normalized_tables = normalize_docling_document(docling_json, source_key=source_hash)
+    source_document = parsed.get("source_document") if isinstance(parsed.get("source_document"), dict) else {}
+    normalized_elements = parsed.get("elements") if isinstance(parsed.get("elements"), list) else []
+    normalized_tables = parsed.get("tables") if isinstance(parsed.get("tables"), list) else []
     if not normalized_elements:
-        normalized_elements = _elements_from_blocks(blocks, source_hash)
+        normalized_elements = elements_from_blocks(blocks, source_hash)
     else:
         blocks = _blocks_from_elements(normalized_elements, str(pdf_path))
     raw_markdown = parsed.get("markdown") or _paper_markdown_from_blocks(title, summary, blocks)
@@ -89,7 +89,9 @@ def extract_paper_source(
         source_hash=source_hash,
         sections=_sections_from_blocks(normalized_elements or blocks, title, summary, raw_markdown),
         blocks=blocks,
-        docling_json=docling_json,
+        # Compatibility name in the persisted model; the payload is now
+        # parser-neutral and intentionally small.
+        docling_json=source_document,
         elements=[SourceElement(**item) for item in normalized_elements],
         tables=[SourceTable(**item) for item in normalized_tables],
     )
@@ -98,33 +100,11 @@ def extract_paper_source(
     return packet
 
 
-def _parse_pdf(pdf_path: Path) -> dict[str, Any]:
-    docling_parser = DoclingParser()
-    if docling_parser.available:
-        try:
-            doc: ParsedDocument = docling_parser.parse_file(str(pdf_path))
-            blocks = doc.pages_or_items or _chunk_markdown_to_blocks(doc.markdown, str(pdf_path))
-            return {
-                "title": doc.title or pdf_path.stem,
-                "summary": _make_summary(doc.text or doc.markdown),
-                "metadata": doc.metadata or {},
-                "blocks": blocks,
-                "markdown": doc.markdown or "",
-                "docling_json": doc.document_json or {},
-                "tables": doc.tables or [],
-                "parser_used": doc.parser or (doc.metadata or {}).get("parser") or "docling-remote",
-            }
-        except Exception as exc:
-            print(f"[paper_pipeline.extractor] Docling failed, fallback parser used: {exc}")
-
-    fallback = PaperIndexParser().parse_pdf(str(pdf_path))
-    fallback["parser_used"] = "PaperIndexParser"
-    fallback.setdefault("markdown", "")
-    fallback.setdefault("metadata", {})
-    fallback.setdefault("blocks", [])
-    fallback.setdefault("docling_json", {})
-    fallback.setdefault("tables", [])
-    return fallback
+def _parse_pdf(pdf_path: Path, *, source_url: str = "", source_key: str = "") -> dict[str, Any]:
+    parsed = PaperParserRouter().parse(pdf_path, source_url=source_url, source_key=source_key)
+    result = parsed.as_pipeline_dict()
+    result["summary"] = _make_summary(parsed.text or parsed.markdown)
+    return result
 
 
 def _sections_from_blocks(
@@ -274,32 +254,6 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _elements_from_blocks(blocks: list[dict[str, Any]], source_key: str) -> list[dict[str, Any]]:
-    """Give fallback parser blocks stable IDs without fabricating bbox data."""
-    from system.document.docling_evidence import stable_evidence_id
-
-    elements: list[dict[str, Any]] = []
-    for index, block in enumerate(blocks):
-        text = sanitize_wiki_text(str(block.get("text") or ""))
-        if not text:
-            continue
-        ref = str((block.get("metadata") or {}).get("docling_ref") or f"fallback/{index}")
-        elements.append({
-            "element_id": stable_evidence_id(source_key, str(block.get("block_type") or "text"), ref, index),
-            "element_type": str(block.get("block_type") or "text"),
-            "text": text,
-            "caption": str(block.get("caption") or ""),
-            "page": int(block.get("page") or 0),
-            "bbox": (block.get("metadata") or {}).get("bbox") or {},
-            "heading_path": [str(block.get("section") or "Body")],
-            "parent_id": "",
-            "reading_order": index,
-            "docling_ref": ref,
-            "metadata": dict(block.get("metadata") or {}),
-        })
-    return elements
-
-
 def _blocks_from_elements(elements: list[dict[str, Any]], source_path: str) -> list[dict[str, Any]]:
     blocks = []
     for element in elements:
@@ -317,7 +271,7 @@ def _blocks_from_elements(elements: list[dict[str, Any]], source_path: str) -> l
                 "evidence_id": str(element.get("element_id") or ""),
                 "bbox": element.get("bbox") or {},
                 "heading_path": heading_path,
-                "docling_ref": str(element.get("docling_ref") or ""),
+                "source_ref": str(element.get("docling_ref") or ""),
             },
         })
     return blocks

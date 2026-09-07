@@ -7,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.api import agent_runs, monthly_reads, papers, profile, wiki
 from backend.agent_recovery import recover_agent_runs
 from backend.deps import get_wiki_embeddings, get_wiki_store
+from backend.task_executor import shutdown_task_executor, task_executor_snapshot
+from backend.web_frontend import mount_frontend
 
 
 @asynccontextmanager
@@ -52,6 +54,7 @@ async def lifespan(_: FastAPI):
         stop_indexer.set()
         recovery_thread.join(timeout=2)
         index_thread.join(timeout=2)
+        shutdown_task_executor(wait=False)
 
 
 app = FastAPI(
@@ -80,4 +83,7 @@ app.include_router(profile.router, prefix="/api/profile", tags=["profile"])
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "agent_tasks": task_executor_snapshot()}
+
+
+mount_frontend(app)

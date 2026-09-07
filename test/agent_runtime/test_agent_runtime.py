@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 from backend.api import agent_runs as agent_runs_api
 from backend.api import papers as papers_api
 from backend.api import wiki as wiki_api
-from backend.api.agent_runs import ApprovalDecisionPayload, RetryPayload, _normalize_bbox
+from backend.api.agent_runs import ApprovalDecisionPayload, RetryPayload
 from system.agent_runtime import AgentRunStore, InvalidStateTransition, TraceRecorder
 from system.core.llm_call import invoke_structured
 from system.storage import object_storage as object_storage_module
@@ -212,19 +212,6 @@ def test_commit_rejects_a_stale_human_approval() -> None:
         with pytest.raises(ValueError, match="Stale proposal"):
             manager.commit_proposal(str(stale["revision_id"]))
         assert wiki.get_card("page-1")["summary"] == "v2"
-
-
-def test_docling_bbox_is_converted_to_pdf_overlay_coordinates() -> None:
-    normalized = _normalize_bbox(
-        {"l": 20, "t": 300, "r": 120, "b": 250},
-        {"width": 500, "height": 800},
-    )
-    assert normalized == {
-        "x": 0.04,
-        "y": 0.625,
-        "width": 0.2,
-        "height": 0.0625,
-    }
 
 
 def test_manual_link_only_effects_are_owned_by_paper_proposal() -> None:
@@ -472,13 +459,13 @@ def test_expired_worker_lease_becomes_recoverable_and_restarts_from_source() -> 
         assert restarted["context"]["resume_from_state"] == "EXTRACTING"
 
 
-def test_whole_docling_table_is_resolvable_numeric_evidence() -> None:
+def test_whole_parser_table_is_resolvable_numeric_evidence() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         store = PaperWikiPipelineStore(db_path=str(Path(tmp) / "table-evidence.db"))
         packet = SourcePacket(
             source_id="source-table", title="Minerva", source_hash="hash-table",
-            parser_used="docling-remote", blocks=[{"text": "Table 3 results"}],
-            elements=[], docling_json={"name": "DoclingDocument"},
+            parser_used="mineru-vlm", blocks=[{"text": "Table 3 results"}],
+            elements=[], docling_json={"format": "mineru-markdown"},
             tables=[SourceTable(
                 table_id="table-3", element_id="table-element-3", page=8,
                 caption="Table 3: majority voting uses k = 256 samples for MATH.",
@@ -579,7 +566,7 @@ def test_identical_pdf_is_reported_as_already_ingested(monkeypatch) -> None:
             source_id="source-existing",
             title="Existing paper",
             source_hash=papers_api._file_sha256(pdf),
-            parser_used="docling",
+            parser_used="arxiv-html",
         )
         PaperWikiPipelineStore(db_path=db_path).upsert_source_packet(packet)
         result = papers_api._existing_pdf_ingestion(pdf, db_path)

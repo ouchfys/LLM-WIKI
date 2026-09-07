@@ -1,12 +1,8 @@
 <template>
   <section class="evaluation-page">
-    <header class="eval-header">
-      <div>
-        <p class="eyebrow">EVALUATION</p>
-        <h1>Agentic Wiki Benchmark</h1>
-      </div>
+    <PageHeader title="质量评测" description="查看回答质量、引用依据与检索表现，定位需要改进的样例。">
       <div class="run-picker">
-        <span>Run</span>
+        <span>评测记录</span>
         <n-select
           v-model:value="selectedRunId"
           :options="runOptions"
@@ -15,14 +11,14 @@
           @update:value="selectRun"
         />
       </div>
-    </header>
+    </PageHeader>
 
     <n-spin :show="loadingRun">
       <div class="eval-layout">
         <aside class="run-list">
           <div class="panel-head">
-            <span>Runs</span>
-            <button type="button" @click="loadRuns">Refresh</button>
+            <span>历史记录</span>
+            <button type="button" @click="loadRuns">刷新</button>
           </div>
           <button
             v-for="run in runs"
@@ -33,11 +29,11 @@
             @click="selectRun(run.id)"
           >
             <strong>{{ run.id }}</strong>
-            <span>{{ run.case_count }} cases · {{ scoreText(run.overall_final_score) }}</span>
+            <span>{{ run.case_count }} 个样例 · {{ scoreText(run.overall_final_score) }}</span>
           </button>
         </aside>
 
-        <main class="eval-main">
+        <div class="eval-main">
           <section class="metric-grid">
             <article v-for="metric in metrics" :key="metric.key" class="metric-card">
               <span>{{ metric.label }}</span>
@@ -47,19 +43,19 @@
 
           <section class="split-panel">
             <div class="panel-head">
-              <span>Per-Source Split</span>
+              <span>各来源表现</span>
               <small>{{ splitMetrics.length }}</small>
             </div>
             <div class="split-table-wrap">
               <table class="eval-table">
                 <thead>
                   <tr>
-                    <th>Source</th>
-                    <th>Cases</th>
-                    <th>Score</th>
-                    <th>Confidence</th>
-                    <th>Grounding</th>
-                    <th>Top1</th>
+                    <th>来源</th>
+                    <th>样例数</th>
+                    <th>综合得分</th>
+                    <th>置信度</th>
+                    <th>引用依据</th>
+                    <th>首位命中</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -78,12 +74,12 @@
 
           <section class="case-panel">
             <div class="panel-head">
-              <span>Benchmark Cases</span>
+              <span>评测样例</span>
               <div class="case-actions">
-                <button type="button" :class="{ active: lowOnly }" @click="toggleLowOnly">
-                  Lowest
+                <button type="button" :aria-pressed="lowOnly" :class="{ active: lowOnly }" @click="toggleLowOnly">
+                  低分优先
                 </button>
-                <button type="button" @click="loadCases">Reload</button>
+                <button type="button" @click="loadCases">刷新</button>
               </div>
             </div>
             <div class="case-table-wrap">
@@ -91,13 +87,13 @@
                 <thead>
                   <tr>
                     <th>ID</th>
-                    <th>Query</th>
-                    <th>Source</th>
-                    <th>Score</th>
-                    <th>Conf.</th>
-                    <th>Top1</th>
-                    <th>Web</th>
-                    <th>Bucket</th>
+                    <th>问题</th>
+                    <th>来源</th>
+                    <th>综合得分</th>
+                    <th>置信度</th>
+                    <th>首位命中</th>
+                    <th>联网</th>
+                    <th>问题类型</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -107,41 +103,41 @@
                     :class="{ weak: item.final_score < 0.85 }"
                     @click="openCase(item)"
                   >
-                    <td>{{ item.id }}</td>
+                    <td><button class="case-open" type="button" @click.stop="openCase(item)">{{ item.id }}</button></td>
                     <td>{{ item.query }}</td>
                     <td>{{ item.expected_source }}</td>
                     <td>{{ scoreText(item.final_score) }}</td>
                     <td>{{ scoreText(item.answer_confidence) }}</td>
                     <td>
                       <n-tag size="small" :color="tagColor(item.top1_hit)">
-                        {{ item.top1_hit ? 'hit' : 'miss' }}
+                        {{ item.top1_hit ? '命中' : '未命中' }}
                       </n-tag>
                     </td>
-                    <td>{{ item.web_used ? 'yes' : 'no' }}</td>
-                    <td>{{ item.failure_bucket }}</td>
+                    <td>{{ item.web_used ? '是' : '否' }}</td>
+                    <td>{{ failureLabel(item.failure_bucket) }}</td>
                   </tr>
                 </tbody>
               </table>
-              <n-empty v-if="!cases.length && !loadingRun" description="No evaluation cases" />
+              <n-empty v-if="!cases.length && !loadingRun" description="暂无评测样例" />
             </div>
           </section>
-        </main>
+        </div>
       </div>
     </n-spin>
 
-    <n-drawer v-model:show="caseDrawerVisible" :width="760" placement="right">
+    <n-drawer v-model:show="caseDrawerVisible" width="min(760px, 100vw)" placement="right">
       <n-drawer-content v-if="selectedCase" :title="selectedCase.id" closable>
         <div class="case-detail">
           <section>
-            <span class="detail-label">Query</span>
+            <span class="detail-label">问题</span>
             <p>{{ selectedCase.query }}</p>
           </section>
           <section>
-            <span class="detail-label">Answer</span>
-            <pre>{{ selectedCase.answer || 'No answer recorded.' }}</pre>
+            <span class="detail-label">回答</span>
+            <pre>{{ selectedCase.answer || '暂无回答记录' }}</pre>
           </section>
           <section>
-            <span class="detail-label">Citations</span>
+            <span class="detail-label">引用来源</span>
             <div v-if="citations.length" class="citation-list">
               <article v-for="citation in citations" :key="citation.card_id || citation.title">
                 <strong>{{ citation.title || citation.card_id }}</strong>
@@ -149,10 +145,10 @@
                 <p>{{ citation.summary }}</p>
               </article>
             </div>
-            <p v-else class="muted">No citations recorded.</p>
+            <p v-else class="muted">暂无引用记录</p>
           </section>
           <section>
-            <span class="detail-label">Tool Plan</span>
+            <span class="detail-label">工具调用</span>
             <div v-if="toolPlan?.tools?.length" class="tool-list">
               <article v-for="tool in toolPlan.tools" :key="tool.name + tool.query">
                 <strong>{{ tool.name }}</strong>
@@ -160,10 +156,10 @@
                 <p>{{ tool.reason }}</p>
               </article>
             </div>
-            <pre v-else>{{ selectedCase.tool_plan || 'No tool plan recorded.' }}</pre>
+            <pre v-else>{{ selectedCase.tool_plan || '暂无工具调用记录' }}</pre>
           </section>
           <section>
-            <span class="detail-label">Reviewer</span>
+            <span class="detail-label">评审说明</span>
             <p>{{ selectedCase.reviewer_reason || '-' }}</p>
           </section>
         </div>
@@ -173,6 +169,7 @@
 </template>
 
 <script setup lang="ts">
+import PageHeader from '../components/PageHeader.vue'
 import { computed, onMounted, ref } from 'vue'
 import { NDrawer, NDrawerContent, NEmpty, NSelect, NSpin, NTag } from 'naive-ui'
 import { api } from '../api'
@@ -253,12 +250,12 @@ const lowOnly = ref(false)
 const runOptions = computed(() => runs.value.map((run) => ({ label: run.id, value: run.id })))
 
 const metrics = computed(() => [
-  { key: 'final', label: 'Final Score', value: scoreText(summary.value.overall_final_score) },
-  { key: 'confidence', label: 'Answer Confidence', value: scoreText(summary.value.overall_answer_confidence) },
-  { key: 'grounding', label: 'Citation Grounding', value: scoreText(summary.value.overall_citation_grounding) },
-  { key: 'retrieval', label: 'Retrieval Hit', value: scoreText(summary.value.retrieval_hit_rate) },
-  { key: 'top1', label: 'Top1 Hit', value: scoreText(summary.value.top1_hit_rate) },
-  { key: 'latency', label: 'Mean Citations', value: scoreText(summary.value.mean_citations_per_answer) }
+  { key: 'final', label: '综合得分', value: scoreText(summary.value.overall_final_score) },
+  { key: 'confidence', label: '回答置信度', value: scoreText(summary.value.overall_answer_confidence) },
+  { key: 'grounding', label: '引用依据', value: scoreText(summary.value.overall_citation_grounding) },
+  { key: 'retrieval', label: '检索命中率', value: scoreText(summary.value.retrieval_hit_rate) },
+  { key: 'top1', label: '首位命中率', value: scoreText(summary.value.top1_hit_rate) },
+  { key: 'latency', label: '平均引用数', value: scoreText(summary.value.mean_citations_per_answer) }
 ])
 
 const citations = computed<Citation[]>(() => {
@@ -331,6 +328,11 @@ async function toggleLowOnly() {
   await loadCases()
 }
 
+function failureLabel(value: string) {
+  const labels: Record<string, string> = { ok: '正常', weak_top1: '首位检索偏差', low_confidence: '置信度偏低', answer_quality: '回答质量' }
+  return labels[value] || value
+}
+
 function openCase(item: EvaluationCase) {
   selectedCase.value = item
   caseDrawerVisible.value = true
@@ -342,43 +344,19 @@ onMounted(loadRuns)
 <style scoped>
 .evaluation-page {
   min-height: 100%;
-  padding: 22px;
+  padding: 0;
+  max-width: 1240px;
+  margin: 0 auto;
+  container-type: inline-size;
+  container-name: evaluation;
   color: var(--text);
-}
-
-.eval-header {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 20px;
-  min-height: 116px;
-  margin-bottom: 18px;
-  padding: 24px;
-  border: 1px solid rgba(125, 211, 252, 0.16);
-  border-radius: 16px;
-  background:
-    linear-gradient(115deg, rgba(56, 189, 248, 0.13), transparent 38%),
-    linear-gradient(180deg, rgba(15, 23, 42, 0.86), rgba(3, 7, 18, 0.92));
-}
-
-.eyebrow {
-  margin: 0 0 8px;
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.14em;
-}
-
-.eval-header h1 {
-  margin: 0;
-  font-size: 28px;
-  line-height: 1.15;
 }
 
 .run-picker {
   display: grid;
   gap: 7px;
-  width: min(420px, 44vw);
+  width: min(360px, 100%);
+  min-width: 260px;
 }
 
 .run-picker span,
@@ -391,16 +369,16 @@ onMounted(loadRuns)
 
 .eval-layout {
   display: grid;
-  grid-template-columns: 272px minmax(0, 1fr);
+  grid-template-columns: 210px minmax(0, 1fr);
   gap: 16px;
 }
 
 .run-list,
 .split-panel,
 .case-panel {
-  border: 1px solid rgba(125, 211, 252, 0.14);
+  border: 1px solid var(--line);
   border-radius: 14px;
-  background: rgba(7, 17, 31, 0.78);
+  background: var(--panel);
 }
 
 .run-list {
@@ -418,14 +396,14 @@ onMounted(loadRuns)
   justify-content: space-between;
   gap: 12px;
   padding: 4px 2px 12px;
-  font-weight: 800;
+  font-weight: 600;
 }
 
 .panel-head button,
 .case-actions button {
-  border: 1px solid rgba(125, 211, 252, 0.16);
+  border: 1px solid var(--line);
   border-radius: 9px;
-  background: rgba(15, 23, 42, 0.72);
+  background: var(--panel);
   color: var(--text-soft);
   cursor: pointer;
   padding: 7px 10px;
@@ -438,7 +416,7 @@ onMounted(loadRuns)
 
 .case-actions button.active,
 .panel-head button:hover {
-  border-color: rgba(56, 189, 248, 0.46);
+  border-color: var(--accent);
   color: var(--text);
 }
 
@@ -457,8 +435,8 @@ onMounted(loadRuns)
 
 .run-row.active,
 .run-row:hover {
-  border-color: rgba(56, 189, 248, 0.28);
-  background: rgba(56, 189, 248, 0.11);
+  border-color: var(--line-strong);
+  background: var(--accent-soft);
 }
 
 .run-row strong {
@@ -479,18 +457,16 @@ onMounted(loadRuns)
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(120px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 
 .metric-card {
   min-height: 88px;
   padding: 16px;
-  border: 1px solid rgba(125, 211, 252, 0.14);
+  border: 1px solid var(--line);
   border-radius: 14px;
-  background:
-    linear-gradient(180deg, rgba(56, 189, 248, 0.08), transparent),
-    rgba(11, 18, 32, 0.9);
+  background: var(--panel);
 }
 
 .metric-card span {
@@ -523,6 +499,8 @@ onMounted(loadRuns)
   width: 100%;
   border-collapse: collapse;
   table-layout: fixed;
+  min-width: 660px;
+  font-variant-numeric: tabular-nums;
 }
 
 .eval-table th,
@@ -548,20 +526,22 @@ onMounted(loadRuns)
 
 .eval-table td:first-child,
 .eval-table th:first-child {
-  width: 118px;
+  width: 40%;
 }
 
-.eval-table td:nth-child(3),
-.eval-table th:nth-child(3) {
-  width: 210px;
-}
+.cases-table { min-width: 1100px; }
+.cases-table th:first-child, .cases-table td:first-child { width: 110px; }
+.cases-table th:nth-child(2) { width: 300px; }
+.cases-table th:nth-child(3) { width: 230px; }
+.case-open { border: 0; padding: 0; background: transparent; color: var(--accent); text-align: left; cursor: pointer; }
+.case-open:hover { text-decoration: underline; }
 
 .cases-table tbody tr {
   cursor: pointer;
 }
 
 .cases-table tbody tr:hover {
-  background: rgba(56, 189, 248, 0.08);
+  background: var(--accent-soft);
 }
 
 .cases-table tbody tr.weak {
@@ -577,7 +557,7 @@ onMounted(loadRuns)
   display: block;
   margin-bottom: 8px;
   font-size: 11px;
-  font-weight: 800;
+  font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
@@ -593,9 +573,9 @@ onMounted(loadRuns)
   max-height: 360px;
   overflow: auto;
   padding: 14px;
-  border: 1px solid rgba(125, 211, 252, 0.14);
+  border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(3, 7, 18, 0.72);
+  background: var(--panel);
   white-space: pre-wrap;
 }
 
@@ -608,9 +588,9 @@ onMounted(loadRuns)
 .citation-list article,
 .tool-list article {
   padding: 12px;
-  border: 1px solid rgba(125, 211, 252, 0.14);
+  border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(15, 23, 42, 0.66);
+  background: var(--panel);
 }
 
 .citation-list strong,
@@ -633,37 +613,34 @@ onMounted(loadRuns)
   font-size: 13px;
 }
 
-@media (max-width: 1180px) {
+@container evaluation (max-width: 1100px) {
   .eval-layout {
     grid-template-columns: 1fr;
   }
 
   .run-list {
     max-height: none;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .metric-grid {
-    grid-template-columns: repeat(3, minmax(120px, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 760px) {
-  .evaluation-page {
-    padding: 14px;
-  }
 
-  .eval-header {
-    display: grid;
-    align-items: start;
-  }
 
   .run-picker {
     width: 100%;
   }
 
   .metric-grid {
-    grid-template-columns: repeat(2, minmax(120px, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+.run-list { min-width: 0; }
+.run-list .panel-head { margin-bottom: 0; }
+.metric-card strong { font-variant-numeric: tabular-nums; }
+.eval-table td { overflow-wrap: anywhere; }
 </style>

@@ -24,6 +24,7 @@
             v-model="query"
             class="library-search"
             type="search"
+            aria-label="搜索知识库"
             placeholder="搜索论文、概念、方法或关键词"
             @keyup.enter="loadCards"
           />
@@ -89,52 +90,8 @@
               </div>
             </header>
 
-            <section v-if="importImpact" class="paper-pipeline">
-              <div class="pipeline-head">
-                <div>
-                  <span>导入流水线</span>
-                  <h2>导入影响</h2>
-                </div>
-                <small>{{ impactSummary }}</small>
-              </div>
-              <p class="pipeline-meta">
-                创建 {{ uniqueImpact.created.length }}
-                · 更新 {{ uniqueImpact.updated.length }}
-                · 关联 {{ uniqueImpact.linked.length }}
-                · 退回 {{ uniqueImpact.rejected.length }}
-              </p>
-              <ul v-if="impactRows.length" class="impact-list">
-                <li v-for="row in impactRows" :key="row.key">
-                  <b>{{ row.kind }}</b>
-                  <button v-if="row.cardId" type="button" @click.stop="selectCardById(row.cardId)">
-                    {{ row.title }}
-                  </button>
-                  <span v-else>{{ row.title }}</span>
-                </li>
-              </ul>
-            </section>
-
-            <section v-if="showSummarySection" class="wiki-section">
-              <h2>摘要</h2>
-              <div v-html="linkifiedText(selectedSummary)"></div>
-            </section>
-
-            <section v-for="section in compiledSections" :key="section.key" class="wiki-section">
-              <h2>{{ section.title }}</h2>
-              <div v-html="section.html"></div>
-            </section>
-
-            <section v-if="imagePreviewSources.length" class="wiki-section">
-              <h2>图片</h2>
-              <div class="image-strip">
-                <a v-for="url in imagePreviewSources" :key="url" :href="normalUrl(url)" target="_blank" rel="noreferrer">
-                  <img :src="normalUrl(url)" :alt="selectedCard.title" />
-                </a>
-              </div>
-            </section>
-
-            <section class="reader-detail-section">
-              <h2>详情</h2>
+            <details class="reader-detail-section">
+              <summary>关联与来源 <span>查看证据与相关知识</span></summary>
               <div class="detail-stack">
                 <section class="trace-card">
                   <div class="trace-head">
@@ -164,8 +121,11 @@
                   <dl class="source-facts">
                     <div><dt>类型</dt><dd>{{ typeLabel(selectedCard.page_type) }}</dd></div>
                     <div><dt>层级</dt><dd>{{ sourceLevelLabel(selectedCard.source_level) }}</dd></div>
-                    <div><dt>Markdown</dt><dd class="source-path" :title="selectedCard.markdown_path || firstSourceLabel || '尚未记录'">{{ selectedCard.markdown_path || firstSourceLabel || '尚未记录' }}</dd></div>
                   </dl>
+                  <details class="source-technical">
+                    <summary>存储位置</summary>
+                    <p>{{ selectedCard.markdown_path || firstSourceLabel || '尚未记录' }}</p>
+                  </details>
                   <ul v-if="showSourceTrace && selectedCard.source_urls?.length" class="source-link-list">
                     <li v-for="url in selectedCard.source_urls" :key="url">
                       <a :href="normalUrl(url)" target="_blank" rel="noreferrer">{{ readableUrl(url) }}</a>
@@ -179,7 +139,46 @@
                   </ul>
                 </section>
               </div>
+            </details>
+
+            <details v-if="importImpact" class="paper-pipeline">
+              <summary>导入影响 <span>{{ impactSummary }}</span></summary>
+              <p class="pipeline-meta">
+                创建 {{ uniqueImpact.created.length }}
+                · 更新 {{ uniqueImpact.updated.length }}
+                · 关联 {{ uniqueImpact.linked.length }}
+                · 退回 {{ uniqueImpact.rejected.length }}
+              </p>
+              <ul v-if="impactRows.length" class="impact-list">
+                <li v-for="row in impactRows" :key="row.key">
+                  <b>{{ row.kind }}</b>
+                  <button v-if="row.cardId" type="button" @click.stop="selectCardById(row.cardId)">
+                    {{ row.title }}
+                  </button>
+                  <span v-else>{{ row.title }}</span>
+                </li>
+              </ul>
+            </details>
+
+            <section v-if="showSummarySection" class="wiki-section">
+              <h2>摘要</h2>
+              <div v-html="linkifiedText(selectedSummary)"></div>
             </section>
+
+            <section v-for="section in compiledSections" :key="section.key" class="wiki-section">
+              <h2>{{ section.title }}</h2>
+              <div v-html="section.html"></div>
+            </section>
+
+            <section v-if="imagePreviewSources.length" class="wiki-section">
+              <h2>图片</h2>
+              <div class="image-strip">
+                <a v-for="url in imagePreviewSources" :key="url" :href="normalUrl(url)" target="_blank" rel="noreferrer">
+                  <img :src="normalUrl(url)" :alt="selectedCard.title" />
+                </a>
+              </div>
+            </section>
+
           </article>
 
           <div v-else class="reader-empty">
@@ -219,8 +218,11 @@
               <div><dt>类型</dt><dd>{{ typeLabel(selectedCard.page_type) }}</dd></div>
               <div><dt>层级</dt><dd>{{ sourceLevelLabel(selectedCard.source_level) }}</dd></div>
               <div><dt>来源数</dt><dd>{{ selectedSourceCount }}</dd></div>
-              <div><dt>Markdown</dt><dd class="source-path" :title="selectedCard.markdown_path || firstSourceLabel || '尚未记录'">{{ selectedCard.markdown_path || firstSourceLabel || '尚未记录' }}</dd></div>
             </dl>
+                  <details class="source-technical">
+                    <summary>存储位置</summary>
+                    <p>{{ selectedCard.markdown_path || firstSourceLabel || '尚未记录' }}</p>
+                  </details>
             <ul v-if="showSourceTrace && selectedCard.source_urls?.length" class="source-link-list">
               <li v-for="url in selectedCard.source_urls" :key="url">
                 <a :href="normalUrl(url)" target="_blank" rel="noreferrer">{{ readableUrl(url) }}</a>
@@ -255,6 +257,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { NModal, NTag } from 'naive-ui'
 import { api, type WikiCard } from '../api'
+import { isReaderContentField, hasReaderContent } from '../lib/wikiContent'
 
 type LibraryGroup = { key: string; label: string; items: WikiCard[] }
 type AliasItem = { card_id: string; title: string; alias: string; normalized_alias: string; page_type: string }
@@ -279,6 +282,7 @@ const libraryGroups = computed<LibraryGroup[]>(() => {
     { key: 'concepts', label: '概念', items: [] },
     { key: 'methods', label: '方法', items: [] },
     { key: 'interviews', label: '面经', items: [] },
+    { key: 'insights', label: '我的洞见', items: [] },
     { key: 'sources', label: '资料', items: [] }
   ]
   for (const card of allCards.value) {
@@ -291,7 +295,7 @@ const selectedSummary = computed(() => selectedCard.value ? cleanText(selectedCa
 const hasProblemSection = computed(() => hasContent(selectedCard.value?.content_json?.problem))
 const selectedSourceType = computed(() => String(selectedCard.value?.content_json?.source_type || '').toLowerCase())
 const showSummarySection = computed(() =>
-  Boolean(selectedSummary.value && !hasProblemSection.value && selectedSourceType.value !== 'user_selection')
+  Boolean(selectedSummary.value && !hasProblemSection.value)
 )
 const importImpact = computed(() => {
   const value = selectedCard.value?.content_json?.import_impact
@@ -318,11 +322,15 @@ const impactRows = computed(() => [
 const compiledSections = computed(() => {
   if (!selectedCard.value) return []
   const content = selectedCard.value.content_json || {}
-  const order = ['problem', 'definition', 'question_context', 'content', 'core_points', 'interview_questions', 'answer_frame', 'learning_value', 'key_idea', 'method', 'mechanism', 'results', 'findings', 'key_points', 'limitations', 'key_takeaways', 'interview_notes', 'notes']
+  const order = ['problem', 'definition', 'question_context', 'knowledge_kind', 'main_points', 'conversation_insights', 'open_questions', 'content', 'core_points', 'interview_questions', 'answer_frame', 'learning_value', 'key_idea', 'method', 'mechanism', 'results', 'findings', 'key_points', 'limitations', 'key_takeaways', 'interview_notes', 'notes']
   return Object.entries(content)
     .filter(([key, value]) => shouldRenderContentField(key, value))
     .sort(([a], [b]) => orderIndex(a, order) - orderIndex(b, order))
-    .map(([key, value]) => ({ key, title: sectionTitle(key), html: valueToHtml(value) }))
+    .map(([key, value]) => ({
+      key,
+      title: sectionTitle(key),
+      html: key === 'knowledge_kind' ? valueToHtml(knowledgeKindLabel(String(value))) : valueToHtml(value)
+    }))
     .filter((section) => section.html)
 })
 
@@ -349,9 +357,7 @@ const imagePreviewSources = computed(() => {
 })
 
 const sourceEvidence = computed(() => (cardLinks.value?.sources || []).slice(0, 8))
-const showSourceTrace = computed(() => {
-  return selectedSourceType.value !== 'user_selection'
-})
+const showSourceTrace = computed(() => true)
 const firstSourceLabel = computed(() => {
   const source = selectedCard.value?.source_urls?.[0]
   return source ? readableUrl(source) : ''
@@ -585,6 +591,7 @@ function isAsciiWord(char: string) {
 function cardGroup(card: WikiCard) {
   const sourceType = String(card.content_json?.source_type || '').toLowerCase()
   const urls = (card.source_urls || []).join(' ').toLowerCase()
+  if (sourceType.startsWith('conversation_insight')) return 'insights'
   if (card.page_type === 'PaperPage' || sourceType.includes('paper') || /arxiv|\.pdf|doi\.org/.test(urls)) return 'papers'
   if (card.page_type === 'ConceptPage') return 'concepts'
   if (card.page_type === 'MethodPage') return 'methods'
@@ -610,12 +617,21 @@ function typeLabel(value: string) {
     ComparePage: '对比',
     InterviewQA: '面经',
     MistakeNote: '错题',
-    SourceNote: '资料'
+    SourceNote: '笔记'
   } as Record<string, string>)[value] || value
 }
 
 function sourceLevelLabel(value: string) {
   return ({ primary: '一手来源', secondary: '二手整理', tertiary: '三手线索' } as Record<string, string>)[value] || 'Wiki'
+}
+
+function knowledgeKindLabel(value: string) {
+  return ({
+    user_idea: '用户想法',
+    discussion_conclusion: '讨论结论',
+    source_backed_conclusion: '有资料支撑的结论',
+    open_question: '待验证问题'
+  } as Record<string, string>)[value] || value
 }
 
 function relationLabel(value: string) {
@@ -628,7 +644,6 @@ function relationLabel(value: string) {
 }
 
 function sectionTitle(key: string) {
-  if (selectedSourceType.value === 'user_selection' && key === 'notes') return '内容'
   const labels: Record<string, string> = {
     problem: '问题',
     key_idea: '核心观点',
@@ -640,13 +655,17 @@ function sectionTitle(key: string) {
     limitations: '局限',
     key_takeaways: '要点',
     interview_notes: '面试笔记',
-    notes: '笔记',
+    notes: '补充说明',
     definition: '定义',
     question_context: '问题语境',
     core_points: '核心要点',
     interview_questions: '面试问题',
     answer_frame: '回答框架',
     learning_value: '学习价值',
+    knowledge_kind: '知识类型',
+    main_points: '沉淀要点',
+    conversation_insights: '对话洞见',
+    open_questions: '待验证问题',
     content: '内容',
     ocr_excerpt: 'OCR 摘录',
     image_notes: '图片笔记',
@@ -660,47 +679,11 @@ function shouldRenderContentField(key: string, value: unknown) {
   if (sourceType === 'xiaohongshu' && ['notes', 'ocr_excerpt', 'image_notes', 'source_url'].includes(key)) {
     return false
   }
-  const hidden = new Set([
-    'schema_version',
-    'compile_status',
-    'compile_error',
-    'source_packet_id',
-    'raw_source_path',
-    'pdf_storage_uri',
-    'compiler_model',
-    'parser_used',
-    'pipeline',
-    'extractor_agent',
-    'distiller_agent',
-    'reviewer_agent',
-    'merge_agent',
-    'review_status',
-    'review_confidence',
-    'review_hints',
-    'distill_review',
-    'source_kind',
-    'source_type',
-    'source_query_id',
-    'artifact_uri',
-    'maintenance_candidate_id',
-    'maintenance_candidate_type',
-    'evidence',
-    'question',
-    'title',
-    'import_impact',
-    'linked_knowledge',
-    'downloaded_images',
-    'attachments',
-    'image_urls',
-    '_ocr_text',
-    '_ocr_notes',
-    '_ocr_status'
-  ])
-  return !key.startsWith('_') && !hidden.has(key) && hasContent(value)
+  return isReaderContentField(key) && hasContent(value)
 }
 
 function hasContent(value: unknown) {
-  if (value === null || value === undefined || value === '') return false
+  if (!hasReaderContent(value)) return false
   if (Array.isArray(value)) return value.some((item) => cleanText(renderInline(item)).trim())
   if (typeof value === 'object') return Object.keys(value as Record<string, unknown>).length > 0
   return Boolean(cleanText(String(value)).trim())
@@ -749,8 +732,10 @@ function uniqueStrings(values: string[]) {
 }
 
 function readableUrl(url: string) {
-  if (url.startsWith('oss://') || url.startsWith('local://')) return url.replace(/^oss:\/\/[^/]+\//, '').replace(/^local:\/\//, '')
-  if (url.startsWith('file://')) return url.replace(/^file:\/\//, '')
+  if (/^(oss|local|file):\/\//i.test(url) || /^[A-Za-z]:[\\/]/.test(url)) {
+    const filename = url.replace(/\\/g, '/').split('/').pop() || '原始资料'
+    try { return decodeURIComponent(filename) } catch { return filename }
+  }
   try {
     const parsed = new URL(url)
     return parsed.hostname + parsed.pathname
@@ -797,20 +782,22 @@ onMounted(() => {
   --ink-bg: #0b0908;
   --ink-panel: #12100d;
   --ink-control: #15130f;
-  --ink-text: #f8fafc;
-  --ink-text-soft: #cbd5e1;
-  --ink-text-muted: #94a3b8;
+  --ink-text: var(--text);
+  --ink-text-soft: var(--text-soft);
+  --ink-text-muted: var(--text-muted);
   --desk-accent: #9bb8ad;
   --desk-accent-bright: #d4e3d8;
   --line-quiet: rgba(195, 214, 202, 0.1);
   --line-hover: rgba(195, 214, 202, 0.24);
   --line-active: rgba(195, 214, 202, 0.32);
-  --reader-serif: "Source Serif 4", "Noto Serif SC", "Songti SC", Georgia, serif;
+  --reader-serif: var(--font-sans);
   position: relative;
   z-index: 1;
   min-height: calc(100dvh - 84px);
-  padding-top: 48px;
-  padding-bottom: 48px;
+  padding-top: 0;
+  padding-bottom: 16px;
+  container-type: inline-size;
+  container-name: vault;
   background: transparent;
   color: var(--ink-text);
 }
@@ -821,8 +808,8 @@ onMounted(() => {
   max-width: 1440px;
   min-height: calc(100dvh - 120px);
   margin: 0 auto;
-  padding: 18px;
-  border: 1px solid var(--line-quiet);
+  padding: 0;
+  border: 0;
   border-radius: 20px;
   background: transparent;
 }
@@ -831,8 +818,8 @@ onMounted(() => {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) 320px;
-  gap: 24px;
+  grid-template-columns: 220px minmax(0, 1fr) 260px;
+  gap: 16px;
   align-items: start;
 }
 
@@ -855,19 +842,25 @@ onMounted(() => {
 }
 
 .vault-library {
-  min-height: calc(100dvh - 156px);
+  position: sticky;
+  top: 32px;
+  height: calc(100dvh - 96px);
+  min-height: 0;
+  overflow: auto;
   padding: 20px 16px;
 }
 
 .vault-reader {
   min-width: 0;
-  padding: 32px 40px;
+  padding: 28px;
 }
 
 .vault-trace {
   display: grid;
   gap: 14px;
-  padding: 24px 20px;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 .column-head,
@@ -1062,11 +1055,11 @@ onMounted(() => {
   margin: 0;
   color: var(--ink-text);
   font-family: var(--reader-serif);
-  font-size: 28px;
+  font-size: clamp(22px, 2.2cqi, 28px);
   font-weight: 600;
   line-height: 1.3;
   letter-spacing: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   text-wrap: pretty;
 }
 
@@ -1343,7 +1336,7 @@ onMounted(() => {
   min-height: 420px;
   display: grid;
   place-content: center;
-  padding: 32px 40px;
+  padding: 28px;
   border-radius: 16px;
 }
 
@@ -1355,7 +1348,7 @@ onMounted(() => {
 .reader-empty h1 {
   margin: 8px 0 0;
   font-family: var(--reader-serif);
-  font-size: 28px;
+  font-size: clamp(22px, 2.2cqi, 28px);
   font-weight: 600;
   line-height: 1.3;
 }
@@ -1394,78 +1387,46 @@ onMounted(() => {
   color: var(--desk-accent-bright);
 }
 
-@media (min-width: 1024px) and (max-width: 1279px) {
-  .vault-layout {
-    grid-template-columns: 220px minmax(0, 1fr) 280px;
-    gap: 20px;
-  }
 
-  .vault-library {
-    padding: 20px 16px;
-  }
-
-  .vault-reader {
-    padding: 32px 40px;
-  }
-
-  .vault-trace {
-    padding: 24px 20px;
-  }
+/* Respond to available workspace width, including a docked browser or sidebar. */
+@container vault (max-width: 1150px) {
+  .vault-layout { grid-template-columns: 210px minmax(0, 1fr); }
+  .vault-trace { display: none; }
+  .reader-detail-section { display: block; }
+  .detail-stack { display: grid; gap: 12px; margin-top: 16px; }
 }
 
-@media (max-width: 1023px) {
-  .vault-stage {
-    padding: 14px;
-  }
-
-  .mobile-library-picker {
-    display: block;
-  }
-
-  .vault-layout {
-    grid-template-columns: 1fr;
-    gap: 16px;
-  }
-
-  .vault-library,
-  .vault-trace {
-    display: none;
-  }
-
-  .vault-reader {
-    padding: 28px 24px;
-  }
-
-  .reader-detail-section {
-    display: block;
-  }
-
-  .detail-stack {
-    display: grid;
-    gap: 14px;
-  }
+@container vault (max-width: 650px) {
+  .vault-layout { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .vault-library { position: static; height: 240px; padding: 16px; }
+  .vault-reader { padding: 22px 18px; }
+  .wiki-document h1 { font-size: 23px; }
 }
 
-@media (max-width: 720px) {
-  .vault-stage {
-    padding: 10px;
-    border-radius: 16px;
-  }
-
-  .vault-reader {
-    padding: 22px 18px;
-  }
-
-  .wiki-document h1,
-  .reader-empty h1 {
-    font-size: 25px;
-  }
-
-  .pipeline-head,
-  .reader-actions {
-    align-items: flex-start;
-  }
+.reader-detail-section {
+  margin-top: 20px;
+  padding: 12px 0;
+  border-block: 1px solid var(--line-quiet);
 }
+
+.reader-detail-section summary {
+  cursor: pointer;
+  color: var(--desk-accent-bright);
+  font-size: 14px;
+}
+
+.reader-detail-section summary span {
+  margin-left: 12px;
+  color: var(--ink-text-muted);
+  font-size: 12px;
+}
+
+.paper-pipeline > summary { cursor: pointer; font-size: 14px; color: var(--desk-accent-bright); }
+.paper-pipeline > summary span { margin-left: 12px; color: var(--ink-text-muted); font-size: 12px; }
+
+.source-technical { margin-top: 12px; color: var(--ink-text-muted); font-size: 12px; }
+.source-technical summary { cursor: pointer; }
+.source-technical p { overflow-wrap: anywhere; }
 
 .library-collapse {
   display: grid;

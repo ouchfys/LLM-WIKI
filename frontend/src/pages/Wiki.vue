@@ -2,34 +2,16 @@
   <section class="chat-scene">
     <div class="chat-window">
       <header class="chat-window-head">
-        <div class="window-dots">
-          <span></span>
-          <span></span>
-          <span></span>
-        </div>
         <div class="chat-head-copy">
           <strong>{{ displaySessionTitle(currentSessionTitle) }}</strong>
-        <span>{{ messages.length > 1 ? `${messages.length} 条消息` : 'LLM-WIKI 对话' }}</span>
+        <span>{{ messages.length > 1 ? `${messages.length} 条消息` : '基于知识库回答，附原文来源' }}</span>
         </div>
         <div class="chat-head-side">
           <span v-if="activeCardTitle" class="active-context">{{ activeCardTitle }}</span>
         </div>
       </header>
 
-      <details class="prompt-drawer">
-        <summary>参考提问</summary>
-        <div class="prompt-strip">
-          <button
-            v-for="prompt in quickPrompts"
-            :key="prompt"
-            type="button"
-            class="prompt-chip"
-            @click="draft = prompt"
-          >
-            {{ prompt }}
-          </button>
-        </div>
-      </details>
+      <ChatPrompts :expanded="!messages.some(message => message.role === 'user')" @select="choosePrompt" />
 
       <div ref="threadRef" class="chat-thread">
         <article
@@ -37,7 +19,6 @@
           :key="message.id"
           class="chat-message"
           :class="message.role"
-          @mouseup="captureMessageSelection(message, $event)"
         >
           <div class="message-stack">
             <section class="session-entry">
@@ -55,7 +36,7 @@
                 <header class="process-head">
                   <div>
                     <span class="process-live-dot"></span>
-                    <strong>{{ isMessageProcessing(message) ? '正在查找证据' : '检索过程' }}</strong>
+                    <strong>{{ isMessageProcessing(message) ? runPhaseLabel : '检索过程' }}</strong>
                   </div>
                   <span>{{ processSummary(message) }}</span>
                 </header>
@@ -111,25 +92,13 @@
                 </ol>
               </section>
 
-              <div class="message-text" v-html="renderMarkdown(message.content)"></div>
+              <details v-if="message.trace?.context_budget?.input_tokens_estimate" class="context-usage">
+                <summary>会话上下文 · 约 {{ Math.round((message.trace.context_budget.input_tokens_estimate || 0) / 1000) }}K / {{ Math.round((message.trace.context_budget.window || 0) / 1000) }}K Token</summary>
+                <p>显示本轮最后一次模型请求的估算输入用量，已另外预留回答空间。整理上下文会保存摘要，原始聊天仍可查找；Wiki 知识库独立保存。</p>
+                <p v-if="message.trace.context_budget.compactions?.some(item => item.status === 'compacted')">本轮已整理较早对话。</p>
+              </details>
 
-              <div
-                v-if="message.role === 'assistant' && message.content.trim()"
-                class="selection-capture"
-                :class="{ active: selectedInsight?.messageId === message.id }"
-              >
-                <div>
-                  <span>{{ selectedInsight?.messageId === message.id ? '已选片段' : '知识回流' }}</span>
-                  <strong>{{ selectedInsight?.messageId === message.id ? selectedInsight.preview : insightPreview(message) }}</strong>
-                </div>
-                <button
-                  type="button"
-                  :disabled="capturingInsight"
-                  @click="captureSelectedInsight(message)"
-                >
-                  {{ captureButtonText(message) }}
-                </button>
-              </div>
+              <div class="message-text" v-html="renderMarkdown(message.content)"></div>
 
               <div
                 v-if="message.citations?.length || message.resources?.length || message.profileUpdates?.length"
@@ -178,30 +147,36 @@
         <strong>{{ activeCardTitle }}</strong>
       </div>
 
-      <div v-if="insightStatus" class="insight-status" :class="insightStatus.type">
-        <span>{{ insightStatus.text }}</span>
-        <button
-          v-if="insightStatus.cardId"
-          type="button"
-          @click="openCapturedCard(insightStatus.cardId)"
-        >
-          查看卡片
-        </button>
+      <div v-if="sending || controlNotice" class="run-status" role="status" aria-live="polite">
+        <span v-if="sending">{{ runPhaseLabel }} · {{ elapsedSeconds }} 秒</span>
+        <span v-if="sending && activeRunId">Enter 补充当前要求 · Alt + Enter 排队追问 · Shift + Enter 换行</span>
+        <span v-if="controlNotice">{{ controlNotice }}</span>
       </div>
-
-      <form class="chat-composer" @submit.prevent="send">
+      <div v-if="visibleQueue.length" class="input-queue" aria-label="待处理消息">
+        <div v-for="item in visibleQueue" :key="item.id" class="queued-input">
+          <span>{{ queueLabel(item) }}：{{ item.content }}</span>
+          <button v-if="item.status === 'ready' && !sending" type="button" @click="drainQueue(true)">执行</button>
+          <button v-if="['blocked', 'failed'].includes(item.status)" type="button" @click="restoreQueuedInput(item)">重新填写</button>
+        </div>
+      </div>
+      <form class="chat-composer" @submit.prevent="send()">
         <n-input
           ref="composeInput"
           v-model:value="draft"
           type="textarea"
           class="composer-input"
-          placeholder="问你的知识库，例如：帮我把最近保存的面经整理成一段面试表达。"
+          :placeholder="sending ? '可以继续输入补充要求，按 Enter 插话；/wiki、/compact 将排队。' : '问你的知识库，或输入 /wiki、/compact。'"
+          aria-label="向知识库提问"
           :autosize="{ minRows: 2, maxRows: 6 }"
           @keydown="handleComposeKeydown"
         />
         <div class="composer-actions">
-          <button type="button" class="composer-ghost" @click="draft = ''">清空</button>
-          <n-button type="primary" attr-type="submit" :loading="sending" :disabled="!draft.trim()">
+          <button type="button" class="composer-ghost" @click="draft = ''">清空输入</button>
+          <n-button v-if="sending" type="primary" attr-type="button"
+            :disabled="!activeRunId || stopRequested || runPhase === 'saving'" @click="stopCurrentRun">
+            {{ stopRequested ? '正在停止' : '停止' }}
+          </n-button>
+          <n-button v-else type="primary" attr-type="submit" :disabled="!draft.trim()">
             发送
           </n-button>
         </div>
@@ -226,178 +201,55 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NInput, NModal, NTag } from 'naive-ui'
-import { api } from '../api'
-
-type Citation = {
-  card_id: string
-  title: string
-  page_type: string
-  summary: string
-  markdown_path: string
-}
-
-type LearningResource = {
-  category: string
-  title: string
-  url: string
-  snippet?: string
-}
-
-type ToolEventItem = {
-  card_id?: string
-  title?: string
-  page_type?: string
-  summary?: string
-  markdown_path?: string
-  score?: number
-  match_reason?: string
-  matched_sections?: Array<{ section?: string; snippet?: string; route?: string }>
-  source_title?: string
-  table_id?: string
-  page?: number
-  row_label?: string
-  column_label?: string
-  value?: string
-  cell_id?: string
-  url?: string
-  snippet?: string
-  section?: string
-  text?: string
-  evidence_kind?: string
-}
-
-type ToolEvent = {
-  eventId?: string
-  tool: string
-  label: string
-  status: 'running' | 'done' | 'error'
-  detail?: string
-  query?: string
-  reason?: string
-  items?: ToolEventItem[]
-}
-
-type ToolPlan = {
-  intent?: string
-  answer_mode?: string
-  use_wiki?: boolean
-  use_web?: boolean
-  use_resources?: boolean
-  open_cards?: boolean
-  tools?: Array<{ name: string; query: string; reason?: string }>
-}
-
-type TraceCard = {
-  card_id: string
-  title: string
-  page_type: string
-  summary: string
-  markdown_path: string
-  matched_chunks?: string[]
-}
-
-type AgentTrace = {
-  tool_plan?: ToolPlan
-  tool_observations?: Array<{
-    tool: string
-    query?: string
-    status: 'running' | 'done' | 'error'
-    summary?: string
-    items?: ToolEventItem[]
-  }>
-  retrieved_cards?: TraceCard[]
-  web_results?: Array<{ title: string; url: string; snippet?: string }>
-  resources?: LearningResource[]
-  diagnostics?: {
-    wiki_card_count?: number
-    wiki_page_count?: number
-    web_result_count?: number
-    resource_count?: number
-  }
-  runtime?: {
-    run_id?: string
-    status?: string
-    current_state?: string
-    wall_time_ms?: number
-    model_calls?: number
-    model_failures?: number
-    model_duration_ms?: number
-    tool_calls?: number
-    tool_failures?: number
-    tool_duration_ms?: number
-    retry_count?: number
-    token_usage?: {
-      prompt_tokens?: number
-      completion_tokens?: number
-      total_tokens?: number
-      estimated_calls?: number
-      contains_estimates?: boolean
-    }
-  }
-}
-
-type ChatMessage = {
-  id: number
-  role: 'user' | 'assistant'
-  content: string
-  citations?: Citation[]
-  resources?: LearningResource[]
-  toolEvents?: ToolEvent[]
-  toolPlan?: ToolPlan
-  trace?: AgentTrace
-  profileUpdates?: Array<{ signal_type: string; value: string }>
-}
-
-type SelectedInsight = {
-  messageId: number
-  text: string
-  preview: string
-}
-
-type InsightStatus = {
-  type: 'pending' | 'success' | 'error'
-  text: string
-  cardId?: string
-}
-
-type SseChunk =
-  | { type: 'card_list'; citations?: Citation[] }
-  | { type: 'resource_list'; resources?: LearningResource[] }
-  | { type: 'tool_plan'; plan?: ToolPlan }
-  | { type: 'agent_trace'; trace?: AgentTrace }
-  | { type: 'tool_status'; event_id?: string; tool: string; label: string; status: 'running' | 'done' | 'error'; detail?: string; query?: string; reason?: string; items?: ToolEventItem[] }
-  | { type: 'token'; text?: string }
-  | { type: 'profile'; updates?: Array<{ signal_type: string; value: string }> }
-  | { type: 'error'; message?: string }
-  | { type: 'done' }
+import { NButton, NInput, NModal, NTag, type InputInst } from 'naive-ui'
+import { api, apiErrorMessage } from '../api'
+import ChatPrompts from '../components/ChatPrompts.vue'
+import { consumeEventStream } from '../lib/chatStream'
+import type { Citation, ToolEventItem, ToolEvent, TraceCard, ChatMessage, SlashCommand, RunInput, SseChunk, ChatSession, ChatHistory, StoredChatMessage, RunInputList, AgentTrace } from '../types/chat'
 
 const route = useRoute()
 const router = useRouter()
-const composeInput = ref<any>(null)
+const composeInput = ref<InputInst | null>(null)
 const threadRef = ref<HTMLElement | null>(null)
 const historyIndex = ref(-1)
 const SESSION_STORAGE_KEY = 'wiki_chat_session_id'
 
 const draft = ref('')
 const sending = ref(false)
+const activeRunId = ref('')
+const activeAssistantId = ref<number | null>(null)
+const stopRequested = ref(false)
+const runPhase = ref('')
+const controlNotice = ref('')
+const inboxItems = ref<RunInput[]>([])
+const queuePosting = ref(false)
+const elapsedSeconds = ref(0)
+let startedAt = 0
+let timer: ReturnType<typeof setInterval> | undefined
+let streamController: AbortController | null = null
+let turnEpoch = 0
+let draining = false
+const consumedInputIds = new Set<string>()
+const automaticQueueIds = new Set<string>()
+let turnOutcome: 'completed' | 'cancelled' | 'failed' = 'completed'
+const visibleQueue = computed(() => inboxItems.value.filter(item => ['pending', 'ready', 'blocked', 'running', 'failed'].includes(item.status)))
+const runPhaseLabel = computed(() => stopRequested.value ? '正在请求停止' : ({
+  starting: '正在连接', searching: '正在检索资料', answering: '正在生成回答',
+  saving: '正在保存结果（此步骤不可中断）', command: '正在执行知识/上下文命令（此步骤不可中断）'
+} as Record<string, string>)[runPhase.value] || '正在处理')
 const currentSessionId = ref('')
 const currentSessionTitle = ref('新对话')
 const activeCitation = ref<Citation | null>(null)
 const rawModalVisible = ref(false)
 const rawModalTitle = ref('')
 const rawMarkdown = ref('')
-const selectedInsight = ref<SelectedInsight | null>(null)
-const insightStatus = ref<InsightStatus | null>(null)
-const capturingInsight = ref(false)
 
-const quickPrompts = [
-  '总结我最近记录的面经要点。',
-  '把我的 RAG 知识整理成项目表达。',
-  '我最近保存了哪些 Agent 相关内容？'
-]
+function choosePrompt(prompt: string) {
+  draft.value = prompt
+  nextTick(() => composeInput.value?.focus())
+}
 
 const initialMessages: ChatMessage[] = [
   {
@@ -422,12 +274,14 @@ function scrollThreadToBottom() {
 }
 
 async function createSession(syncRoute = true) {
-  const { data } = await api.post('/wiki/sessions', { title: '新对话' })
+  await abandonActiveStream()
+  const { data } = await api.post<ChatSession>('/wiki/sessions', { title: '新对话' })
   currentSessionId.value = data.id
   currentSessionTitle.value = data.title || '新对话'
   localStorage.setItem(SESSION_STORAGE_KEY, data.id)
   messages.value = [...initialMessages]
   activeCitation.value = null
+  inboxItems.value = []
   scrollThreadToBottom()
   if (syncRoute) {
     await router.replace({
@@ -438,15 +292,18 @@ async function createSession(syncRoute = true) {
 }
 
 async function loadSessionHistory(sessionId: string) {
-  const { data } = await api.get(`/wiki/sessions/${sessionId}/messages`)
+  await abandonActiveStream()
+  const { data } = await api.get<ChatHistory>(`/wiki/sessions/${sessionId}/messages`)
   currentSessionId.value = sessionId
   currentSessionTitle.value = data.session?.title || '对话'
   messages.value = data.items?.length ? normalizeMessages(data.items) : [...initialMessages]
   localStorage.setItem(SESSION_STORAGE_KEY, sessionId)
+  const queued = await api.get<RunInputList>('/agent-runs/inbox', { params: { session_id: sessionId } })
+  inboxItems.value = queued.data.items || []
   scrollThreadToBottom()
 }
 
-function normalizeMessages(items: any[]): ChatMessage[] {
+function normalizeMessages(items: StoredChatMessage[]): ChatMessage[] {
   return items.map((item) => ({
     id: item.id,
     role: item.role,
@@ -493,104 +350,11 @@ function openTraceCard(card: TraceCard) {
   }
 }
 
-function captureMessageSelection(message: ChatMessage, event: MouseEvent) {
-  if (message.role !== 'assistant') return
-  const selection = window.getSelection()
-  const text = (selection?.toString() || '').trim()
-  if (!text || text.length < 20) return
-
-  const target = event.currentTarget as HTMLElement | null
-  const anchor = selection?.anchorNode
-  const focus = selection?.focusNode
-  if (!target || !anchor || !focus || !target.contains(anchor) || !target.contains(focus)) {
-    return
-  }
-
-  selectedInsight.value = {
-    messageId: message.id,
-    text,
-    preview: text.length > 120 ? `${text.slice(0, 120)}...` : text
-  }
-  insightStatus.value = null
-}
-
-function previousUserQuestion(messageId: number) {
-  const index = messages.value.findIndex((message) => message.id === messageId)
-  if (index <= 0) return ''
-  for (let i = index - 1; i >= 0; i -= 1) {
-    const item = messages.value[i]
-    if (item.role === 'user') return item.content
-  }
-  return ''
-}
-
-async function captureSelectedInsight(message: ChatMessage) {
-  if (message.role !== 'assistant' || capturingInsight.value) return
-  const selected = selectedInsight.value?.messageId === message.id ? selectedInsight.value : null
-  const selectedText = selected?.text || message.content.trim()
-  if (!selectedText) return
-
-  capturingInsight.value = true
-  insightStatus.value = { type: 'pending', text: '正在蒸馏、审查并合并到 Wiki...' }
-  try {
-    const { data } = await api.post(
-      '/wiki/maintenance/query-insights/capture-selection',
-      {
-        session_id: currentSessionId.value,
-        message_id: String(message.id),
-        selected_text: selectedText,
-        question: previousUserQuestion(message.id),
-        answer: message.content,
-        citations: message.citations || [],
-        resources: message.resources || [],
-        tool_plan: message.toolPlan || {},
-        trace: message.trace || {},
-        auto_merge: true,
-        use_llm: true
-      },
-      { timeout: 180000 }
-    )
-    const merged = data?.candidate?.status === 'merged'
-    const title = data?.distill?.title || '已选内容'
-    const resultCardId = data?.result_card_id || data?.candidate?.merge?.result_card_id || ''
-    insightStatus.value = {
-      type: 'success',
-      text: merged
-        ? `已加入知识库：${title}`
-        : `已进入知识候选区：${title}`,
-      cardId: resultCardId || undefined
-    }
-    selectedInsight.value = null
-    window.getSelection()?.removeAllRanges()
-  } catch (error) {
-    console.error('[WikiChat] capture selection failed:', error)
-    insightStatus.value = { type: 'error', text: '加入知识库失败，请稍后重试。' }
-  } finally {
-    capturingInsight.value = false
-  }
-}
-
-function openCapturedCard(cardId: string) {
-  if (!cardId) return
-  router.push({ path: '/vault', query: { card: cardId } })
-}
-
-function insightPreview(message: ChatMessage) {
-  const text = message.content.replace(/\s+/g, ' ').trim()
-  if (!text) return '将这条回答整理成一条可维护的 Wiki 知识。'
-  return text.length > 120 ? `${text.slice(0, 120)}...` : text
-}
-
-function captureButtonText(message: ChatMessage) {
-  if (capturingInsight.value) return '保存中...'
-  return selectedInsight.value?.messageId === message.id ? '加入选中内容' : '加入整段'
-}
-
 function isMessageProcessing(message: ChatMessage) {
   return Boolean(
     sending.value
     && message.role === 'assistant'
-    && messages.value[messages.value.length - 1]?.id === message.id
+    && activeAssistantId.value === message.id
   )
 }
 
@@ -680,7 +444,14 @@ function processStepTitle(tool: string) {
     evidence_lookup: '核验原文依据',
     web_search: '搜索外部资料',
     web_fetch: '读取网页原文',
-    resource_recommend: '查找延伸资源'
+    resource_recommend: '查找延伸资源',
+    conversation_context: '选择相关对话',
+    wiki_write: '沉淀 Wiki 知识',
+    wiki_validate: '校验 Wiki 结构',
+    context_compact: '整理较早对话',
+    search_session_history: '搜索会话原文',
+    read_session_messages: '读取会话原文',
+    read_tool_result: '读取工具记录'
   }
   return labels[tool] || tool
 }
@@ -719,6 +490,10 @@ function processStepDetail(step: ToolEvent) {
   if (step.tool === 'table_query') return step.detail || '已定位表格单元格及页码。'
   if (step.tool === 'evidence_lookup') return step.detail || '已按需回查原文段落。'
   if (step.tool === 'context') return '已结合最近对话解析追问指代。'
+  if (step.tool === 'conversation_context') return step.detail || '已按用户要求选择相关对话。'
+  if (step.tool === 'wiki_write') return step.detail || '已生成对话洞见并写入 Wiki。'
+  if (step.tool === 'wiki_validate') return step.detail || '已校验 Wiki 结构并更新索引。'
+  if (step.tool === 'context_compact') return step.detail || '已保存上下文摘要，原始对话仍然保留。'
   return step.detail || (step.status === 'error' ? '工具执行失败。' : '工具执行完成。')
 }
 
@@ -750,9 +525,10 @@ function openProcessCard(item: ToolEventItem) {
 }
 
 function handleComposeKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault()
-    send()
+    send(undefined, event.altKey)
     return
   }
 
@@ -777,6 +553,45 @@ function handleComposeKeydown(event: KeyboardEvent) {
 }
 
 function handleStreamChunk(chunk: SseChunk, assistantMessage: ChatMessage) {
+  if (chunk.type === 'run_started') {
+    activeRunId.value = chunk.run_id
+    return
+  }
+  if (chunk.type === 'heartbeat') return
+  if (chunk.type === 'phase') {
+    runPhase.value = chunk.phase
+    return
+  }
+  if (chunk.type === 'queue_update') {
+    for (const item of chunk.items) {
+      upsertInput(item)
+      if (item.status === 'ready') automaticQueueIds.add(item.id)
+    }
+    return
+  }
+  if (chunk.type === 'answer_reset') {
+    assistantMessage.content = ''
+    assistantMessage.citations = []
+    assistantMessage.resources = []
+    assistantMessage.toolEvents = (assistantMessage.toolEvents || []).filter(item => item.status === 'done')
+    activeCitation.value = null
+    for (const id of chunk.input_ids || []) consumedInputIds.add(id)
+    for (const item of inboxItems.value) {
+      if (chunk.input_ids?.includes(item.id)) item.status = 'consumed'
+    }
+    controlNotice.value = chunk.detail || '正在重新生成回答。'
+    return
+  }
+  if (chunk.type === 'cancelled') {
+    turnOutcome = 'cancelled'
+    assistantMessage.content = chunk.message
+    assistantMessage.citations = []
+    assistantMessage.resources = []
+    assistantMessage.toolEvents = (assistantMessage.toolEvents || []).filter(item => item.status !== 'running')
+    activeCitation.value = null
+    controlNotice.value = '已停止；待执行命令不会自动保存未完成的回答。'
+    return
+  }
   if (chunk.type === 'tool_plan') {
     assistantMessage.toolPlan = chunk.plan
     return
@@ -841,70 +656,261 @@ function handleStreamChunk(chunk: SseChunk, assistantMessage: ChatMessage) {
   }
 
   if (chunk.type === 'error' && chunk.message) {
+    turnOutcome = 'failed'
     assistantMessage.content += `\n${chunk.message}`
   }
 }
 
-async function consumeSseResponse(response: Response, assistantMessage: ChatMessage) {
-  const reader = response.body?.getReader()
-  if (!reader) {
-    throw new Error('No response body')
-  }
+async function consumeSseResponse(response: Response, assistantMessage: ChatMessage, epoch: number) {
+  await consumeEventStream<SseChunk>(
+    response,
+    chunk => handleStreamChunk(chunk, assistantMessage),
+    () => epoch === turnEpoch
+  )
+}
 
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-
-    buffer += decoder.decode(value, { stream: true })
-    const events = buffer.split(/\r?\n\r?\n/)
-    buffer = events.pop() || ''
-
-    for (const eventBlock of events) {
-      const lines = eventBlock
-        .split(/\r?\n/)
-        .map((line) => line.trimEnd())
-        .filter(Boolean)
-
-      const dataLines = lines
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-
-      if (!dataLines.length) continue
-
-      const payload = dataLines.join('\n')
-      if (!payload || payload === '[DONE]') continue
-
-      let chunk: SseChunk
-      try {
-        chunk = JSON.parse(payload)
-      } catch {
-        continue
-      }
-
-      if (chunk.type === 'done') {
-        return
-      }
-
-      handleStreamChunk(chunk, assistantMessage)
-    }
+function parseSlashCommand(text: string): SlashCommand | null {
+  const match = text.trim().match(/^\/(wiki|compact)(?:\s+([\s\S]*))?$/i)
+  if (!match) return null
+  return {
+    name: match[1].toLowerCase() as SlashCommand['name'],
+    argument: (match[2] || '').trim()
   }
 }
 
-async function send() {
+function upsertInput(item: RunInput) {
+  const index = inboxItems.value.findIndex(value => value.id === item.id)
+  const previous = inboxItems.value[index]
+  const next = { ...item }
+  if (next.status === 'pending' && previous && previous.status !== 'pending') next.status = previous.status
+  if (consumedInputIds.has(item.id)) next.status = 'consumed'
+  if (index < 0) inboxItems.value.push(next)
+  else inboxItems.value[index] = next
+}
+
+function queueLabel(item: RunInput) {
+  if (item.status === 'blocked') return '本轮已停止，未执行'
+  if (item.status === 'failed') return '执行未确认，请检查后重试'
+  if (item.status === 'running') return '执行中（若连接断开，请先检查结果）'
+  return item.kind === 'interrupt' ? '补充要求待生效' : '当前回答结束后执行'
+}
+
+async function queueDuringRun(text: string, followup: boolean) {
+  if (queuePosting.value) {
+    controlNotice.value = '上一条消息正在确认，输入已保留，请稍后发送。'
+    return
+  }
+  const runId = activeRunId.value
+  const epoch = turnEpoch
+  if (!runId || stopRequested.value || runPhase.value === 'saving') {
+    controlNotice.value = '当前步骤暂不接受插话，输入已保留，请稍后发送。'
+    return
+  }
+  const command = parseSlashCommand(text)
+  if (command?.name === 'wiki' && !command.argument) {
+    controlNotice.value = '请在 /wiki 后写明要沉淀的内容。'
+    return
+  }
+  const kind = command ? 'command' : followup ? 'followup' : 'interrupt'
+  const content = command ? (command.name === 'compact' ? '/compact' : `/wiki ${command.argument}`) : text
+  let accepted = false
+  queuePosting.value = true
+  try {
+    const { data } = await api.post<RunInput>(`/agent-runs/${runId}/inputs`, { id: crypto.randomUUID(), kind, content })
+    accepted = true
+    if (epoch !== turnEpoch) return
+    upsertInput(data)
+    if (kind === 'interrupt') {
+      const index = messages.value.findIndex(item => item.id === activeAssistantId.value)
+      messages.value.splice(index < 0 ? messages.value.length : index, 0, { id: Date.now(), role: 'user', content: text })
+    }
+    controlNotice.value = kind === 'interrupt'
+      ? '补充要求已收到，将在当前模型/工具步骤结束后生效。'
+      : '已排队，当前回答完成后执行；若本轮取消则不会自动执行。'
+    const latest = await api.get<RunInputList>(`/agent-runs/${runId}/inputs`)
+    if (epoch !== turnEpoch) return
+    for (const item of latest.data.items || []) {
+      upsertInput(item)
+      if (item.status === 'ready') automaticQueueIds.add(item.id)
+    }
+  } catch (error) {
+    if (epoch !== turnEpoch) return
+    controlNotice.value = accepted ? '消息已接收，但队列刷新失败；请勿重复发送。'
+      : apiErrorMessage(error, '未能加入队列，输入已保留。')
+  } finally {
+    if (accepted && epoch === turnEpoch && draft.value.trim() === text) draft.value = ''
+    queuePosting.value = false
+  }
+  if (!sending.value) await drainQueue()
+}
+
+async function stopCurrentRun() {
+  const runId = activeRunId.value
+  const epoch = turnEpoch
+  if (!runId || stopRequested.value) return
+  stopRequested.value = true
+  try {
+    await api.post(`/agent-runs/${runId}/cancel`)
+    // Keep reading SSE until the server acknowledges cancellation; a browser
+    // abort alone cannot stop backend tools or prevent late writes.
+  } catch (error) {
+    if (epoch !== turnEpoch) return
+    stopRequested.value = false
+    controlNotice.value = apiErrorMessage(error, '停止请求未确认，请重试。')
+  }
+}
+
+async function abandonActiveStream() {
+  const runId = activeRunId.value
+  const controller = streamController
+  ++turnEpoch
+  automaticQueueIds.clear()
+  activeRunId.value = ''
+  activeAssistantId.value = null
+  sending.value = false
+  controlNotice.value = ''
+  if (runId) {
+    // keepalive also covers page navigation. The original session owns this run.
+    void fetch(`/api/agent-runs/${runId}/cancel`, { method: 'POST', keepalive: true }).catch(() => {})
+  }
+  controller?.abort()
+  streamController = null
+}
+
+async function restoreQueuedInput(item: RunInput) {
+  draft.value = item.content
+  const { data } = await api.post<RunInput>(`/agent-runs/${item.run_id}/inputs/${item.id}/state`, { status: 'dismissed' })
+  upsertInput(data)
+}
+
+async function drainQueue(manual = false) {
+  if (draining || sending.value || queuePosting.value) return
+  draining = true
+  const sessionId = currentSessionId.value
+  try {
+    while (!sending.value && sessionId === currentSessionId.value) {
+      const item = inboxItems.value.find(value => value.status === 'ready' && value.kind !== 'interrupt'
+        && (manual || automaticQueueIds.has(value.id)))
+      if (!item) break
+      try {
+        const { data } = await api.post<RunInput>(`/agent-runs/${item.run_id}/inputs/${item.id}/state`, { status: 'running' })
+        upsertInput(data)
+      } catch {
+        controlNotice.value = '队列已由其他页面处理，请刷新后查看。'
+        break
+      }
+      if (sessionId !== currentSessionId.value) {
+        await api.post<RunInput>(`/agent-runs/${item.run_id}/inputs/${item.id}/state`, { status: 'failed' })
+        break
+      }
+      const success = await send(item.content)
+      const { data } = await api.post<RunInput>(`/agent-runs/${item.run_id}/inputs/${item.id}/state`, {
+        status: success ? 'completed' : 'failed'
+      })
+      if (sessionId === currentSessionId.value) upsertInput(data)
+      automaticQueueIds.delete(item.id)
+      if (!success) {
+        // Stopping one queued turn also stops its remaining queued commands.
+        // Do not let a later, unrelated chat silently execute those writes.
+        const remaining = inboxItems.value.filter(value => value.status === 'ready')
+        automaticQueueIds.clear()
+        if (sessionId === currentSessionId.value) {
+          for (const pending of remaining) {
+            const blocked = await api.post<RunInput>(`/agent-runs/${pending.run_id}/inputs/${pending.id}/state`, { status: 'blocked' })
+            if (sessionId === currentSessionId.value) upsertInput(blocked.data)
+          }
+        }
+        break
+      }
+    }
+  } catch {
+    controlNotice.value = '队列执行状态未确认，请先检查结果，不会自动重复执行。'
+  } finally {
+    draining = false
+  }
+}
+
+async function runSlashCommand(command: SlashCommand, assistantMessage: ChatMessage, sessionId: string) {
+  if (command.name === 'wiki') {
+    if (!command.argument) {
+      assistantMessage.content = '请在 `/wiki` 后说明想沉淀的内容，例如：`/wiki 把刚才关于 Agent 记忆的最终方案存进知识库`。'
+      return
+    }
+    assistantMessage.toolEvents = [{
+      eventId: `conversation_context:${assistantMessage.id}`,
+      tool: 'conversation_context',
+      label: 'Conversation Context',
+      status: 'running',
+      detail: '正在按你的要求定位本次会话中的相关内容。'
+    }]
+    const { data } = await api.post<{ answer?: string; card?: Citation; trace?: AgentTrace }>(
+      '/wiki/maintenance/query-insights/capture-conversation',
+      {
+        session_id: sessionId,
+        instruction: command.argument,
+        auto_merge: true,
+        use_llm: true
+      },
+      { timeout: 180000 }
+    )
+    assistantMessage.content = data.answer || '对话洞见已处理。'
+    assistantMessage.citations = data.card ? [data.card] : []
+    assistantMessage.trace = data.trace || undefined
+    assistantMessage.toolEvents = []
+    if (data.card && sessionId === currentSessionId.value) activeCitation.value = data.card
+    return
+  }
+
+  assistantMessage.toolEvents = [{
+    eventId: `context_compact:${assistantMessage.id}`,
+    tool: 'context_compact',
+    label: 'Context Compact',
+    status: 'running',
+    detail: '正在把较早对话整理成可继续使用的上下文摘要。'
+  }]
+  const { data } = await api.post<{ answer?: string; trace?: AgentTrace }>(
+    `/wiki/sessions/${sessionId}/compact`,
+    { keep_recent_turns: 2, use_llm: true },
+    { timeout: 180000 }
+  )
+  assistantMessage.content = data.answer || '已整理较早对话。'
+  assistantMessage.trace = data.trace || undefined
+  assistantMessage.toolEvents = []
+}
+
+async function send(queuedText?: string, followup = false): Promise<boolean> {
   historyIndex.value = -1
-  const text = draft.value.trim()
-  if (!text || sending.value) return
+  const text = (queuedText ?? draft.value).trim()
+  if (!text) return false
+  if (text.toLowerCase() === '/stop') {
+    if (sending.value) await stopCurrentRun()
+    else controlNotice.value = '当前没有运行中的任务。'
+    draft.value = ''
+    return false
+  }
+  if (sending.value) {
+    await queueDuringRun(text, followup)
+    return false
+  }
+  const command = parseSlashCommand(text)
+  const sessionId = currentSessionId.value
+  const epoch = ++turnEpoch
+  turnOutcome = 'completed'
+  stopRequested.value = false
+  controlNotice.value = ''
+  activeRunId.value = ''
+  runPhase.value = command ? 'command' : 'starting'
+  startedAt = Date.now()
+  elapsedSeconds.value = 0
 
   messages.value.push({ id: Date.now(), role: 'user', content: text })
-  draft.value = ''
+  if (queuedText === undefined) draft.value = ''
   sending.value = true
   activeCitation.value = null
   scrollThreadToBottom()
 
   const assistantId = Date.now() + 1
+  activeAssistantId.value = assistantId
   const assistantMessageDraft: ChatMessage = {
     id: assistantId,
     role: 'assistant',
@@ -921,15 +927,20 @@ async function send() {
   scrollThreadToBottom()
 
   try {
+    if (command) {
+      await runSlashCommand(command, assistantMessage, sessionId)
+    } else {
+    streamController = new AbortController()
     const response = await fetch('/api/wiki/chat', {
       method: 'POST',
+      signal: streamController.signal,
       headers: {
         'Content-Type': 'application/json',
         Accept: 'text/event-stream'
       },
       body: JSON.stringify({
         message: text,
-        session_id: currentSessionId.value,
+        session_id: sessionId,
         stream: true
       })
     })
@@ -938,18 +949,36 @@ async function send() {
       throw new Error(`HTTP ${response.status}`)
     }
 
-    await consumeSseResponse(response, assistantMessage)
+    await consumeSseResponse(response, assistantMessage, epoch)
+    }
 
     if (!assistantMessage.content.trim()) {
       assistantMessage.content = '这次没有拿到有效回答，请重试。'
     }
   } catch (error) {
+    if (epoch !== turnEpoch) return false
+    turnOutcome = 'failed'
     console.error('[WikiChat] stream failed:', error)
-    assistantMessage.content = '请求失败，请稍后重试。'
+    assistantMessage.toolEvents = []
+    assistantMessage.content = command
+      ? `/${command.name} 执行未确认，请检查结果后再重试。`
+      : '请求失败，请稍后重试。'
+    if (activeRunId.value) {
+      void api.post(`/agent-runs/${activeRunId.value}/cancel`).catch(() => {})
+    }
   } finally {
+    if (epoch === turnEpoch) {
     sending.value = false
+    activeRunId.value = ''
+    activeAssistantId.value = null
+    streamController = null
     scrollThreadToBottom()
+    }
   }
+  if (epoch !== turnEpoch) return false
+  const success = turnOutcome === 'completed'
+  if (success && !draining) await drainQueue()
+  return success
 }
 
 function profileLabel(value: string) {
@@ -1146,13 +1175,30 @@ watch(
 watch(() => route.query.ask, applyRoutePrompt)
 
 onMounted(async () => {
+  timer = setInterval(() => {
+    if (sending.value) elapsedSeconds.value = Math.floor((Date.now() - startedAt) / 1000)
+  }, 1000)
   await ensureSession()
   applyRoutePrompt()
   scrollThreadToBottom()
 })
+
+onBeforeUnmount(() => {
+  if (timer) clearInterval(timer)
+  void abandonActiveStream()
+})
 </script>
 
 <style scoped>
+.context-usage { margin: 0.5rem 0; color: var(--text-muted, #aaa); font-size: 0.78rem; }
+.context-usage summary { cursor: pointer; }
+.context-usage p { max-width: 64ch; margin: 0.5rem 0; line-height: 1.65; }
+
+.run-status, .input-queue { padding: 8px 20px; color: var(--muted, #9bb8ad); font-size: 13px; }
+.run-status { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.queued-input { display: flex; align-items: center; gap: 12px; padding: 7px 0; }
+.queued-input span { flex: 1; overflow-wrap: anywhere; white-space: pre-wrap; }
+.queued-input button { background: transparent; color: inherit; border: 1px solid currentColor; border-radius: 6px; padding: 4px 8px; cursor: pointer; }
 .chat-scene {
   height: 100%;
 }
@@ -1165,53 +1211,33 @@ onMounted(async () => {
   --ink-panel-soft: #1d1913;
   --ink-text: #f8fafc;
   --ink-text-soft: #cbd5e1;
-  --ink-text-muted: #94a3b8;
+  --ink-text-muted: #aab5bd;
   --desk-accent: #9bb8ad;
   --desk-accent-bright: #d4e3d8;
   --desk-signal: #8fa99e;
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  display: flex;
+  flex-direction: column;
   gap: 16px;
-  height: calc(100vh - 84px);
+  height: calc(100dvh - 68px);
   padding: 16px;
   border: 1px solid rgba(195, 214, 202, 0.14);
-  border-radius: 20px;
-  background: linear-gradient(180deg, rgba(21, 19, 15, 0.96), rgba(8, 7, 6, 0.98));
-  box-shadow: 0 18px 48px rgba(8, 7, 6, 0.32);
+  border-radius: var(--radius-panel);
+  background: var(--panel);
 }
 
 .chat-window-head {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 14px;
   align-items: center;
   padding: 8px 10px 10px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.08);
 }
 
-.window-dots {
-  display: flex;
-  gap: 6px;
-}
 
-.window-dots span {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  background: rgba(148, 163, 184, 0.2);
-}
 
-.window-dots span:first-child {
-  background: rgba(248, 113, 113, 0.7);
-}
 
-.window-dots span:nth-child(2) {
-  background: rgba(245, 185, 66, 0.7);
-}
 
-.window-dots span:nth-child(3) {
-  background: rgba(54, 211, 153, 0.7);
-}
 
 .chat-head-copy strong,
 .chat-head-copy span {
@@ -1246,51 +1272,9 @@ onMounted(async () => {
   white-space: nowrap;
 }
 
-.prompt-drawer {
-  padding: 0 4px;
-}
-
-.prompt-drawer summary {
-  width: fit-content;
-  min-height: 28px;
-  padding: 5px 9px;
-  border: 1px solid rgba(195, 214, 202, 0.12);
-  border-radius: 8px;
-  background: rgba(29, 25, 19, 0.42);
-  color: var(--ink-text-muted);
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.prompt-drawer summary:hover,
-.prompt-drawer summary:focus-visible {
-  border-color: rgba(195, 214, 202, 0.34);
-  color: var(--ink-text-soft);
-}
-
-.prompt-strip {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding-top: 10px;
-}
-
-.prompt-chip {
-  min-height: 34px;
-  padding: 0 12px;
-  border: 1px solid rgba(195, 214, 202, 0.12);
-  border-radius: 8px;
-  background: rgba(29, 25, 19, 0.46);
-  color: var(--ink-text-soft);
-  cursor: pointer;
-}
-
-.prompt-chip:hover {
-  border-color: rgba(155, 184, 173, 0.34);
-  background: rgba(155, 184, 173, 0.1);
-}
-
 .chat-thread {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -1333,11 +1317,11 @@ onMounted(async () => {
   padding: 14px 16px 16px;
   border: 1px solid rgba(195, 214, 202, 0.14);
   border-radius: 14px;
-  background: linear-gradient(180deg, rgba(21, 19, 15, 0.86), rgba(17, 16, 13, 0.94));
+  background: transparent;
 }
 
 .chat-message.user .session-entry {
-  background: linear-gradient(180deg, rgba(29, 25, 19, 0.86), rgba(17, 16, 13, 0.94));
+  background: var(--panel-soft);
 }
 
 .session-entry-meta {
@@ -1811,77 +1795,6 @@ onMounted(async () => {
   font-size: 12px;
 }
 
-.selection-capture {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-  padding: 10px 12px;
-  border: 1px solid rgba(195, 214, 202, 0.14);
-  border-radius: 12px;
-  background: rgba(29, 25, 19, 0.5);
-}
-
-.selection-capture.active {
-  border-color: rgba(195, 214, 202, 0.28);
-  background: rgba(155, 184, 173, 0.1);
-}
-
-.selection-capture span,
-.selection-capture strong {
-  display: block;
-}
-
-.selection-capture span {
-  color: var(--ink-text-muted);
-  font-size: 11px;
-  font-weight: 800;
-}
-
-.selection-capture.active span {
-  color: #c2d6ca;
-}
-
-.selection-capture strong {
-  overflow: hidden;
-  margin-top: 3px;
-  color: var(--ink-text-soft);
-  font-size: 12px;
-  line-height: 1.45;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.selection-capture.active strong {
-  color: var(--desk-accent-bright);
-}
-
-.selection-capture button {
-  min-height: 32px;
-  padding: 0 12px;
-  border: 1px solid rgba(195, 214, 202, 0.18);
-  border-radius: 8px;
-  background: rgba(29, 25, 19, 0.72);
-  color: var(--ink-text-soft);
-  cursor: pointer;
-}
-
-.selection-capture.active button {
-  border-color: rgba(195, 214, 202, 0.34);
-  background: rgba(155, 184, 173, 0.14);
-  color: var(--desk-accent-bright);
-}
-
-.selection-capture button:hover {
-  border-color: rgba(195, 214, 202, 0.34);
-  background: rgba(155, 184, 173, 0.12);
-}
-
-.selection-capture button:disabled {
-  cursor: wait;
-  opacity: 0.65;
-}
-
 .context-banner {
   display: flex;
   align-items: center;
@@ -1899,30 +1812,6 @@ onMounted(async () => {
 
 .context-banner strong {
   font-size: 13px;
-}
-
-.insight-status {
-  padding: 9px 12px;
-  border-radius: 14px;
-  font-size: 12px;
-}
-
-.insight-status.pending {
-  border: 1px solid rgba(245, 158, 11, 0.2);
-  background: rgba(245, 158, 11, 0.1);
-  color: #fde68a;
-}
-
-.insight-status.success {
-  border: 1px solid rgba(16, 185, 129, 0.2);
-  background: rgba(16, 185, 129, 0.1);
-  color: #bbf7d0;
-}
-
-.insight-status.error {
-  border: 1px solid rgba(239, 68, 68, 0.22);
-  background: rgba(239, 68, 68, 0.1);
-  color: #fecaca;
 }
 
 .chat-composer {
@@ -2040,4 +1929,7 @@ onMounted(async () => {
     justify-content: flex-end;
   }
 }
+.chat-message.assistant .session-entry { border: 0; }
+.chat-head-copy strong { font-size: 18px; font-weight: 600; }
+.session-entry-meta small { font-family: var(--font-sans); }
 </style>

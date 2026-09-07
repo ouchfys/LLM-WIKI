@@ -1,4 +1,5 @@
 from __future__ import annotations
+from system.conversation.context_budget import ContextBudget, ContextPolicy
 
 import tempfile
 from pathlib import Path
@@ -73,6 +74,7 @@ def test_chat_turn_uses_runtime_event_model_and_aggregates_metrics() -> None:
             wiki_store=_WikiStore(),
             wiki_resolver=_Resolver(),
             llm=_FakeLLM(),
+            context_budget=ContextBudget(ContextPolicy()),
             runtime=runtime,
         )
 

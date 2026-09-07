@@ -8,6 +8,8 @@ sources/, wiki/, and queries/ beneath STORAGE_ROOT_PREFIX.
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import threading
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -15,10 +17,28 @@ from system.core import config
 
 
 class ObjectStorage:
-    def __init__(self):
+    TENANT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+    def __init__(self, tenant_id: str | None = None):
         self.repo_root = Path(__file__).resolve().parents[2]
         self.backend = (getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
-        self.root_prefix = (getattr(config, "STORAGE_ROOT_PREFIX", "") or "").strip("/")
+        configured_tenant = getattr(config, "STORAGE_TENANT_ID", "admin") or "admin"
+        selected_tenant = configured_tenant if tenant_id is None else tenant_id
+        self.tenant_id = self.normalize_tenant_id(selected_tenant)
+        configured_prefix = (
+            f"users/{self.tenant_id}"
+            if tenant_id is not None
+            else (getattr(config, "STORAGE_ROOT_PREFIX", "") or f"users/{self.tenant_id}").strip("/")
+        )
+        expected_prefix = f"users/{self.tenant_id}"
+        if configured_prefix != expected_prefix:
+            raise ValueError(
+                f"Storage prefix {configured_prefix!r} does not match tenant {self.tenant_id!r}; "
+                f"expected {expected_prefix!r}."
+            )
+        self.root_prefix = configured_prefix
+        configured_tenant = self.normalize_tenant_id(configured_tenant)
+        self._uses_default_local_cache = self.tenant_id == configured_tenant
         self.bucket_name = getattr(config, "OSS_BUCKET", "") or ""
         self.endpoint = getattr(config, "OSS_ENDPOINT", "") or ""
         self._bucket = None
@@ -26,6 +46,14 @@ class ObjectStorage:
     @property
     def enabled(self) -> bool:
         return self.backend == "oss"
+
+    @property
+    def local_cache_root(self) -> Path:
+        return (
+            self.repo_root
+            if self._uses_default_local_cache
+            else self.repo_root / "tenants" / self.tenant_id
+        )
 
     def uri_for_key(self, key: str) -> str:
         key = self._normalize_key(key)
@@ -36,9 +64,9 @@ class ObjectStorage:
     def key_for_local_path(self, path: str | Path) -> str:
         local_path = Path(path)
         if not local_path.is_absolute():
-            local_path = self.repo_root / local_path
+            local_path = self.local_cache_root / local_path
         try:
-            rel = local_path.resolve().relative_to(self.repo_root.resolve()).as_posix()
+            rel = local_path.resolve().relative_to(self.local_cache_root.resolve()).as_posix()
         except ValueError:
             rel = local_path.name
         return self._normalize_key(rel)
@@ -228,9 +256,13 @@ class ObjectStorage:
         uri = (uri or "").strip()
         if uri.startswith("oss://"):
             parsed = urlparse(uri)
-            return parsed.path.lstrip("/")
+            if self.bucket_name and parsed.netloc and parsed.netloc != self.bucket_name:
+                raise ValueError(
+                    f"OSS URI bucket {parsed.netloc!r} does not match configured bucket {self.bucket_name!r}."
+                )
+            return self._normalize_key(parsed.path.lstrip("/"))
         if uri.startswith("local://"):
-            return uri.removeprefix("local://").strip("/")
+            return self._normalize_key(uri.removeprefix("local://").strip("/"))
         return self._normalize_key(uri)
 
     def local_cache_path_for_key(self, key: str) -> Optional[Path]:
@@ -241,17 +273,32 @@ class ObjectStorage:
                 key = key[len(prefix):]
         if not key:
             return None
-        return self.repo_root / key
+        return self.local_cache_root / key
 
     def _normalize_key(self, key: str) -> str:
         key = (key or "").replace("\\", "/").strip("/")
+        if any(part in {".", ".."} for part in key.split("/")):
+            raise ValueError("Object storage keys cannot contain relative path segments.")
         if not key:
             return self.root_prefix.rstrip("/") if self.root_prefix else ""
         if self.root_prefix:
             prefix = self.root_prefix.rstrip("/")
             if key != prefix and not key.startswith(prefix + "/"):
+                if key.startswith("users/"):
+                    raise ValueError(
+                        f"Object key is outside tenant {self.tenant_id!r}: {key!r}"
+                    )
                 key = f"{prefix}/{key}"
         return key
+
+    @classmethod
+    def normalize_tenant_id(cls, tenant_id: str) -> str:
+        normalized = str(tenant_id or "").strip().lower()
+        if not cls.TENANT_ID_PATTERN.fullmatch(normalized):
+            raise ValueError(
+                "tenant_id must use 1-64 lowercase letters, numbers, underscores, or hyphens."
+            )
+        return normalized
 
     def _iter_oss_objects(self, key_prefix: str, limit: int = 100):
         try:
@@ -289,10 +336,29 @@ class ObjectStorage:
 
 
 _STORAGE: ObjectStorage | None = None
+_TENANT_STORAGES: dict[str, ObjectStorage] = {}
+_STORAGE_LOCK = threading.Lock()
 
 
-def get_object_storage() -> ObjectStorage:
+def get_object_storage(tenant_id: str | None = None) -> ObjectStorage:
+    """Return default storage or an explicitly tenant-scoped storage client.
+
+    Existing application code uses the configured local tenant. Authentication
+    middleware can later pass its trusted tenant ID here without allowing tools
+    or request payloads to choose an arbitrary object prefix.
+    """
     global _STORAGE
-    if _STORAGE is None:
-        _STORAGE = ObjectStorage()
-    return _STORAGE
+    if tenant_id is None:
+        if _STORAGE is None:
+            with _STORAGE_LOCK:
+                if _STORAGE is None:
+                    _STORAGE = ObjectStorage()
+        return _STORAGE
+
+    normalized = ObjectStorage.normalize_tenant_id(tenant_id)
+    with _STORAGE_LOCK:
+        storage = _TENANT_STORAGES.get(normalized)
+        if storage is None:
+            storage = ObjectStorage(tenant_id=normalized)
+            _TENANT_STORAGES[normalized] = storage
+        return storage

@@ -21,6 +21,8 @@ ALLOWED_UPDATE_FIELDS = {
     "aliases",
     "evidence_updates",
     "maintenance_notes",
+    "conversation_insights",
+    "open_questions",
 }
 
 CREATE_CARD_TYPES = {
@@ -111,10 +113,14 @@ class MaintenanceCandidateProcessor:
         deterministic_review = self._review(payload)
         candidate_type = str(payload.get("candidate_type") or "")
         content = payload.get("content_json") if isinstance(payload.get("content_json"), dict) else {}
-        is_user_selection = str(content.get("source_type") or "") == "user_selection"
+        source_type = str(content.get("source_type") or "")
+        is_explicit_user_capture = source_type in {
+            "conversation_insight",
+            "conversation_insight_update",
+        }
         llm_review = (
             self._llm_review(payload, deterministic_review)
-            if self.llm and candidate_type != "web_source_candidate" and not is_user_selection
+            if self.llm and candidate_type != "web_source_candidate" and not is_explicit_user_capture
             else {}
         )
         review = self._combine_reviews(deterministic_review, llm_review)
@@ -421,12 +427,18 @@ class MaintenanceCandidateProcessor:
         artifact_uri = str(content_json.get("artifact_uri") or "")
         if artifact_uri:
             source_urls.append(artifact_uri)
+        source_type = str(content_json.get("source_type") or "")
         card_id = self.wiki_store.create_card(
             title=title,
             page_type=page_type,
             content_json=content_json,
             summary=summary,
-            source_level="secondary" if candidate_type in {"interview_note", "open_question"} else "source_reported",
+            source_level=(
+                "secondary"
+                if candidate_type in {"interview_note", "open_question", "source_note"}
+                or source_type.startswith("conversation_insight")
+                else "source_reported"
+            ),
             source_urls=source_urls,
             related_topics=related_topics,
         )
