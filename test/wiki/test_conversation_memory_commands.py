@@ -76,4 +76,3 @@ def test_wiki_command_distills_conversation_into_source_note(tmp_path):
     assert candidate["content_json"]["source_type"] == "conversation_insight"
     assert candidate["content_json"]["source_message_ids"] == ["11", "12"]
     assert candidate["content_json"]["knowledge_kind"] == "discussion_conclusion"
-

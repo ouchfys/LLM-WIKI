@@ -31,4 +31,3 @@ def mount_frontend(app: FastAPI, directory: Path | None = None) -> None:
     if (dist / "index.html").is_file():
         # Must be mounted after all API routes.
         app.mount("/", FrontendFiles(directory=str(dist), html=True), name="frontend")
-

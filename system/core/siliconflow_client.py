@@ -43,11 +43,11 @@ def _require_api_key(api_key: str, env_name: str = "SILICONFLOW_API_KEY") -> str
 class SiliconFlowChat:
     """
     硅基流动 Chat API 客户端
-    
+
     提供与 ChatGLM3 兼容的接口:
       - chat(tokenizer, prompt, history, **kwargs) -> (response, history)
       - stream_chat(tokenizer, prompt, history, **kwargs) -> Iterator
-    
+
     这样现有代码中 model.chat(...) 可以无缝切换。
     """
 
@@ -88,13 +88,13 @@ class SiliconFlowChat:
     ) -> Tuple[str, list]:
         """
         兼容 ChatGLM3 的 chat 接口
-        
+
         Args:
             tokenizer: 占位参数 (不使用，保持接口兼容)
             prompt: 用户输入
             history: 对话历史 [(query, response), ...]
             **kwargs: do_sample, temperature, max_length, repetition_penalty 等
-            
+
         Returns:
             (response_text, updated_history)
         """
@@ -126,7 +126,7 @@ class SiliconFlowChat:
     ) -> Iterator[Tuple[str, list, None]]:
         """
         兼容 ChatGLM3 的 stream_chat 接口 (流式输出)
-        
+
         Yields:
             (current_response, history, past_key_values=None)
         """
@@ -440,11 +440,11 @@ class DeepSeekChat(SiliconFlowChat):
 class SiliconFlowEmbeddings:
     """
     硅基流动 Embedding API 客户端
-    
+
     提供批量与单条文本向量接口:
       - embed_documents(texts) -> List[List[float]]
       - embed_query(text) -> List[float]
-    
+
     当前 Wiki 主查询链路不依赖该兼容客户端。
     """
 
@@ -474,10 +474,10 @@ class SiliconFlowEmbeddings:
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """
         批量生成文本向量
-        
+
         Args:
             texts: 文本列表
-            
+
         Returns:
             向量列表 (每个向量为 float 列表)
         """
@@ -488,7 +488,7 @@ class SiliconFlowEmbeddings:
             batch = texts[i : i + self.batch_size]
             batch_embeddings = self._call_api(batch)
             all_embeddings.extend(batch_embeddings)
-            
+
             if i + self.batch_size < len(texts):
                 time.sleep(0.1)  # 小延迟避免限流
 
@@ -497,10 +497,10 @@ class SiliconFlowEmbeddings:
     def embed_query(self, text: str) -> List[float]:
         """
         生成单个查询文本的向量
-        
+
         Args:
             text: 查询文本
-            
+
         Returns:
             向量 (float 列表)
         """

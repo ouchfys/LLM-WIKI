@@ -553,4 +553,3 @@ class SessionStore(UserMemoryStore):
             conn.execute("DELETE FROM sessions")
             conn.commit()
         return count
-
