@@ -139,6 +139,11 @@ class SessionCompactPayload(BaseModel):
     use_llm: bool = True
 
 
+class ProjectPurposePayload(BaseModel):
+    instruction: str = ""
+    use_llm: bool = True
+
+
 class RepairAgentProcessPayload(BaseModel):
     limit: int = 10
     use_llm: bool = True
@@ -2312,6 +2317,95 @@ def compact_chat_session(
     except Exception as exc:
         runtime.mark_failed(run_id, str(exc) or exc.__class__.__name__)
         raise HTTPException(status_code=500, detail=f"Context compaction failed: {exc}") from exc
+
+
+@router.post("/sessions/{session_id}/purpose")
+def project_purpose_command(
+    session_id: str,
+    payload: ProjectPurposePayload,
+    session_store=Depends(get_session_store),
+):
+    """View or update the current project's purpose through natural language."""
+    session = session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    project_id = str(session.get("project_id") or "paperwiki-default")
+    project = session_store.get_project(project_id) or {}
+    instruction = str(payload.instruction or "").strip()
+    current = str(project.get("purpose") or "").strip()
+
+    if not instruction:
+        answer = f"当前项目目标：\n\n{current}" if current else "当前项目还没有明确的长期目标。可以输入 `/purpose 我希望这个项目……`。"
+        session_store.save_message(
+            session_id, "user", "/purpose",
+            metadata={"mode": "command", "command": "purpose"},
+        )
+        session_store.save_message(
+            session_id, "assistant", answer,
+            metadata={"mode": "command", "command": "purpose", "project_id": project_id},
+        )
+        return {"ok": True, "answer": answer, "purpose": current, "project": project}
+
+    if instruction.lower() in {"clear", "reset", "delete", "清除", "清空", "重置", "删除"}:
+        purpose = ""
+    elif payload.use_llm:
+        raw_messages = session_store.get_messages(session_id, last_n=30)
+        conversation = "\n\n".join(
+            f"[{item.get('id')}] {item.get('role')}: {str(item.get('content') or '')[:1500]}"
+            for item in raw_messages
+            if not (item.get("metadata") or {}).get("command")
+        )[-16000:]
+        prompt = f"""Maintain the durable purpose of one personal paper-research project.
+Return only concise Chinese Markdown, without a code fence or commentary.
+Use sections only when supported: 项目目标、研究范围、关键问题、长期约束.
+The instruction is authoritative. Use recent conversation only to resolve references such as '刚才的方向'.
+Preserve compatible existing items, replace contradicted items, and omit temporary answer-format preferences.
+Do not copy paper claims into the project purpose and do not invent goals.
+
+Existing purpose:
+{current or '(empty)'}
+
+Recent conversation:
+{conversation or '(empty)'}
+
+User instruction:
+{instruction}
+"""
+        try:
+            purpose = str(get_chat_llm().invoke(
+                prompt,
+                temperature=0.0,
+                max_tokens=1200,
+                enable_thinking=False,
+            ) or "").strip()
+            purpose = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", purpose, flags=re.I | re.S).strip()
+            if not purpose:
+                raise RuntimeError("Purpose model returned empty content")
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Project purpose update failed: {exc}") from exc
+    else:
+        purpose = instruction
+
+    updated = session_store.set_project_purpose(
+        project_id,
+        purpose,
+        evidence=instruction,
+        source_session_id=session_id,
+    )
+    answer = "已清除当前项目目标。" if not purpose else f"已更新当前项目目标：\n\n{purpose}"
+    session_store.save_message(
+        session_id,
+        "user",
+        "/purpose" + (f" {instruction}" if instruction else ""),
+        metadata={"mode": "command", "command": "purpose"},
+    )
+    session_store.save_message(
+        session_id,
+        "assistant",
+        answer,
+        metadata={"mode": "command", "command": "purpose", "project_id": project_id},
+    )
+    return {"ok": True, "answer": answer, "purpose": purpose, "project": updated}
 
 
 @router.delete("/sessions/{session_id}")

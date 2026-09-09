@@ -9,9 +9,10 @@ import re
 
 
 from system.memory.user_memory import UserMemoryStore
+from system.memory.project_memory import DEFAULT_PROJECT_ID, ProjectMemoryStore
 
 
-class SessionStore(UserMemoryStore):
+class SessionStore(UserMemoryStore, ProjectMemoryStore):
     def __init__(self, db_path: str = None):
         base_dir = Path(__file__).resolve().parents[2]
         path = Path(db_path) if db_path else base_dir / "sessions.db"
@@ -82,6 +83,23 @@ class SessionStore(UserMemoryStore):
             columns = {row[1] for row in conn.execute("PRAGMA table_info(user_profile)")}
             if "source_session_id" not in columns:
                 conn.execute("ALTER TABLE user_profile ADD COLUMN source_session_id TEXT DEFAULT ''")
+            if "evidence_message_id" not in columns:
+                conn.execute("ALTER TABLE user_profile ADD COLUMN evidence_message_id INTEGER DEFAULT 0")
+            if "confidence" not in columns:
+                conn.execute("ALTER TABLE user_profile ADD COLUMN confidence REAL DEFAULT 1.0")
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS user_profile_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT NOT NULL,
+                    previous_value TEXT NOT NULL DEFAULT '',
+                    new_value TEXT NOT NULL,
+                    evidence TEXT NOT NULL DEFAULT '',
+                    source_session_id TEXT NOT NULL DEFAULT '',
+                    evidence_message_id INTEGER NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL
+                )"""
+            )
             # ---- 情节记忆表：已讲过的论文/话题，带过期时间 ----
             conn.execute(
                 """
@@ -117,6 +135,7 @@ class SessionStore(UserMemoryStore):
                 CREATE INDEX IF NOT EXISTS tool_results_session ON session_tool_results(session_id, id);
                 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id);
             """)
+            self._init_project_memory_schema(conn)
             self._init_preference_fts(conn)
             conn.commit()
 
@@ -168,25 +187,28 @@ class SessionStore(UserMemoryStore):
     #  会话管理（原有方法，保持不变）
     # ===========================================================
 
-    def create_session(self, title: str = "新会话", settings: dict = None) -> str:
+    def create_session(self, title: str = "新会话", settings: dict = None,
+                       project_id: str = DEFAULT_PROJECT_ID) -> str:
         session_id = str(uuid.uuid4())
         with closing(self._connect()) as conn:
             conn.execute(
                 """
-                INSERT INTO sessions (id, title, created_at, settings_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO sessions (id, title, created_at, settings_json, project_id)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     title,
                     self._now_iso(),
                     self._dump_json(settings or {}),
+                    project_id or DEFAULT_PROJECT_ID,
                 ),
             )
             conn.commit()
         return session_id
 
-    def ensure_session(self, session_id: str, title: str = "新会话", settings: dict = None) -> str:
+    def ensure_session(self, session_id: str, title: str = "新会话", settings: dict = None,
+                       project_id: str = DEFAULT_PROJECT_ID) -> str:
         session_id = (session_id or "").strip()
         if not session_id:
             return self.create_session(title=title, settings=settings)
@@ -199,14 +221,15 @@ class SessionStore(UserMemoryStore):
             if not row:
                 conn.execute(
                     """
-                    INSERT INTO sessions (id, title, created_at, settings_json)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO sessions (id, title, created_at, settings_json, project_id)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
                         title,
                         self._now_iso(),
                         self._dump_json(settings or {}),
+                        project_id or DEFAULT_PROJECT_ID,
                     ),
                 )
                 conn.commit()
@@ -215,7 +238,7 @@ class SessionStore(UserMemoryStore):
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT id, title, created_at, settings_json FROM sessions WHERE id = ?",
+                "SELECT id, title, created_at, settings_json, project_id FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
         if not row:
@@ -225,6 +248,7 @@ class SessionStore(UserMemoryStore):
             "title": row["title"],
             "created_at": row["created_at"],
             "settings": self._load_json(row["settings_json"]),
+            "project_id": row["project_id"] or DEFAULT_PROJECT_ID,
         }
 
     def save_message(
@@ -253,6 +277,24 @@ class SessionStore(UserMemoryStore):
             conn.commit()
             # A late model response must not recreate messages after deletion.
             return int(cursor.lastrowid) if cursor.rowcount else 0
+
+    def update_message_metadata(self, session_id: str, message_id: int, patch: Dict[str, Any]) -> bool:
+        """Merge metadata after post-answer memory maintenance finishes."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT metadata_json FROM messages WHERE session_id=? AND id=?",
+                (session_id, int(message_id)),
+            ).fetchone()
+            if not row:
+                return False
+            metadata = self._load_json(row["metadata_json"])
+            metadata.update(patch or {})
+            conn.execute(
+                "UPDATE messages SET metadata_json=? WHERE session_id=? AND id=?",
+                (self._dump_json(metadata), session_id, int(message_id)),
+            )
+            conn.commit()
+        return True
 
     def get_messages(self, session_id: str, last_n: int = 80) -> List[Dict[str, Any]]:
         """Return raw persisted messages for explicit conversation commands.
@@ -408,7 +450,7 @@ class SessionStore(UserMemoryStore):
             metadata = self._load_json(row["metadata_json"])
             # A compaction acknowledgement is part of the visible transcript,
             # not fresh conversational context for the model.
-            if metadata.get("command") == "compact" or metadata.get("cancelled"):
+            if metadata.get("command") in {"compact", "purpose"} or metadata.get("cancelled"):
                 continue
             if role == "user":
                 if pending_user is not None:
@@ -469,7 +511,7 @@ class SessionStore(UserMemoryStore):
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
-                SELECT id, title, created_at
+                SELECT id, title, created_at, project_id
                 FROM sessions
                 ORDER BY created_at DESC, id DESC
                 """
@@ -480,6 +522,7 @@ class SessionStore(UserMemoryStore):
                 "id": row["id"],
                 "title": row["title"],
                 "created_at": row["created_at"],
+                "project_id": row["project_id"] or DEFAULT_PROJECT_ID,
             }
             for row in rows
         ]
@@ -515,6 +558,7 @@ class SessionStore(UserMemoryStore):
         with closing(self._connect()) as conn:
             conn.execute("DELETE FROM context_checkpoints WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_tool_results WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_state WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute(
                 """
@@ -535,6 +579,7 @@ class SessionStore(UserMemoryStore):
             ).fetchone()
             if not row:
                 return False
+            conn.execute("DELETE FROM session_state WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM context_checkpoints WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_tool_results WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
@@ -549,6 +594,7 @@ class SessionStore(UserMemoryStore):
             count = int(row["count"] if row else 0)
             conn.execute("DELETE FROM context_checkpoints")
             conn.execute("DELETE FROM session_tool_results")
+            conn.execute("DELETE FROM session_state")
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM sessions")
             conn.commit()

@@ -208,6 +208,23 @@ def test_queue_is_idempotent_and_finalization_fences_late_inputs(tmp_path):
     runtime.update_input(run_id, "command-1", "completed")
 
 
+def test_project_purpose_command_can_be_queued(tmp_path):
+    runtime = AgentRunStore(str(tmp_path / "purpose-queue.db"))
+    run_id = runtime.create_run(run_type="wiki_chat")["id"]
+    runtime.transition(run_id, "CHAT_RUNNING")
+
+    viewed = runtime.enqueue_input(run_id, kind="command", content="/purpose", input_id="purpose-view")
+    updated = runtime.enqueue_input(
+        run_id,
+        kind="command",
+        content="/purpose 聚焦低成本推理",
+        input_id="purpose-update",
+    )
+
+    assert viewed["status"] == "pending"
+    assert updated["status"] == "pending"
+
+
 def test_control_api_validation_and_cancel_flag(tmp_path):
     db = str(tmp_path / "api.db")
     runtime = AgentRunStore(db)

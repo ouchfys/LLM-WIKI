@@ -256,9 +256,12 @@ class AgentRunStore:
         if not content or len(content) > 8000:
             raise ValueError("Input must contain 1–8000 characters")
         if kind == "command" and not (
-            content == "/compact" or content.startswith("/wiki ")
+            content == "/compact"
+            or content == "/purpose"
+            or content.startswith("/purpose ")
+            or content.startswith("/wiki ")
         ):
-            raise ValueError("Only /wiki <instruction> and /compact can be queued as commands")
+            raise ValueError("Only /wiki <instruction>, /purpose [instruction], and /compact can be queued as commands")
         now = self.now_iso()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")

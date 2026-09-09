@@ -227,6 +227,7 @@ def get_wiki_chat() -> WikiChatService:
         learning_profile=get_learning_profile(),
         session_store=get_session_store(),
         llm=get_chat_llm(),
+        memory_llm=get_chat_llm(),
         chunk_index=get_chunk_index(),
         web_search=get_web_search(),
         web_fetch=get_web_fetch(),

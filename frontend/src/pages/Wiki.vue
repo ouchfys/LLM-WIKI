@@ -165,7 +165,7 @@
           v-model:value="draft"
           type="textarea"
           class="composer-input"
-          :placeholder="sending ? '可以继续输入补充要求，按 Enter 插话；/wiki、/compact 将排队。' : '问你的知识库，或输入 /wiki、/compact。'"
+          :placeholder="sending ? '可以继续输入补充要求，按 Enter 插话；Slash 命令将排队。' : '问你的知识库，或输入 /wiki、/purpose、/compact。'"
           aria-label="向知识库提问"
           :autosize="{ minRows: 2, maxRows: 6 }"
           @keydown="handleComposeKeydown"
@@ -449,8 +449,11 @@ function processStepTitle(tool: string) {
     wiki_write: '沉淀 Wiki 知识',
     wiki_validate: '校验 Wiki 结构',
     context_compact: '整理较早对话',
+    project_purpose: '维护项目目标',
     search_session_history: '搜索会话原文',
     read_session_messages: '读取会话原文',
+    search_project_history: '搜索项目历史',
+    read_project_messages: '读取项目历史原文',
     read_tool_result: '读取工具记录'
   }
   return labels[tool] || tool
@@ -670,7 +673,7 @@ async function consumeSseResponse(response: Response, assistantMessage: ChatMess
 }
 
 function parseSlashCommand(text: string): SlashCommand | null {
-  const match = text.trim().match(/^\/(wiki|compact)(?:\s+([\s\S]*))?$/i)
+  const match = text.trim().match(/^\/(wiki|purpose|compact)(?:\s+([\s\S]*))?$/i)
   if (!match) return null
   return {
     name: match[1].toLowerCase() as SlashCommand['name'],
@@ -712,7 +715,11 @@ async function queueDuringRun(text: string, followup: boolean) {
     return
   }
   const kind = command ? 'command' : followup ? 'followup' : 'interrupt'
-  const content = command ? (command.name === 'compact' ? '/compact' : `/wiki ${command.argument}`) : text
+  const content = command
+    ? command.name === 'compact'
+      ? '/compact'
+      : `/${command.name}${command.argument ? ` ${command.argument}` : ''}`
+    : text
   let accepted = false
   queuePosting.value = true
   try {
@@ -861,6 +868,24 @@ async function runSlashCommand(command: SlashCommand, assistantMessage: ChatMess
     return
   }
 
+  if (command.name === 'purpose') {
+    assistantMessage.toolEvents = [{
+      eventId: `project_purpose:${assistantMessage.id}`,
+      tool: 'project_purpose',
+      label: 'Project Purpose',
+      status: 'running',
+      detail: command.argument ? '正在结合当前会话更新项目目标。' : '正在读取当前项目目标。'
+    }]
+    const { data } = await api.post<{ answer?: string }>(
+      `/wiki/sessions/${sessionId}/purpose`,
+      { instruction: command.argument, use_llm: true },
+      { timeout: 180000 }
+    )
+    assistantMessage.content = data.answer || '项目目标已处理。'
+    assistantMessage.toolEvents = []
+    return
+  }
+
   assistantMessage.toolEvents = [{
     eventId: `context_compact:${assistantMessage.id}`,
     tool: 'context_compact',
@@ -986,7 +1011,13 @@ function profileLabel(value: string) {
     interest: '兴趣',
     weak_point: '薄弱点',
     preference: '偏好',
-    goal: '目标'
+    goal: '目标',
+    project_goal: '项目目标',
+    project_constraint: '项目约束',
+    project_decision: '项目决策',
+    project_open_question: '项目待解问题',
+    project_milestone: '项目里程碑',
+    project_topic: '项目话题'
   }[value] || value
 }
 

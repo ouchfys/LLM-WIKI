@@ -126,7 +126,7 @@ export type ChatMessage = {
 }
 
 export type SlashCommand = {
-  name: 'wiki' | 'compact'
+  name: 'wiki' | 'compact' | 'purpose'
   argument: string
 }
 

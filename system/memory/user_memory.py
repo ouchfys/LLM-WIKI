@@ -11,21 +11,36 @@ class UserMemoryStore:
     #  用户偏好管理（user_profile 表）
     # ===========================================================
 
-    def upsert_preference(self, key: str, value: str, evidence: str = "", *, source_session_id: str = "") -> None:
+    def upsert_preference(self, key: str, value: str, evidence: str = "", *, source_session_id: str = "",
+                          evidence_message_id: int = 0, confidence: float = 1.0) -> None:
         """按 key 写入或覆盖一条稳定偏好。"""
         with closing(self._connect()) as conn:
+            previous = conn.execute("SELECT value FROM user_profile WHERE key = ?", (key,)).fetchone()
             conn.execute(
                 """
-                INSERT INTO user_profile (key, value, evidence, updated_at, source_session_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO user_profile
+                    (key, value, evidence, updated_at, source_session_id, evidence_message_id, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
                     value = excluded.value,
                     evidence = excluded.evidence,
                     updated_at = excluded.updated_at,
-                    source_session_id = excluded.source_session_id
+                    source_session_id = excluded.source_session_id,
+                    evidence_message_id = excluded.evidence_message_id,
+                    confidence = excluded.confidence
                 """,
-                (key, value, evidence, self._now_iso(), source_session_id),
+                (key, value, evidence, self._now_iso(), source_session_id,
+                 int(evidence_message_id or 0), max(0.0, min(float(confidence), 1.0))),
             )
+            if not previous or str(previous["value"]) != str(value):
+                conn.execute(
+                    """INSERT INTO user_profile_history
+                       (key, previous_value, new_value, evidence, source_session_id,
+                        evidence_message_id, confidence, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (key, str(previous["value"] if previous else ""), value, evidence, source_session_id,
+                     int(evidence_message_id or 0), max(0.0, min(float(confidence), 1.0)), self._now_iso()),
+                )
             conn.commit()
         print(f"[SessionStore] Upsert preference: {key} = {value}")
 
@@ -50,7 +65,9 @@ class UserMemoryStore:
         """返回所有偏好的详细信息，含证据和更新时间。"""
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT key, value, evidence, updated_at, source_session_id FROM user_profile ORDER BY updated_at DESC"
+                """SELECT key, value, evidence, updated_at, source_session_id,
+                          evidence_message_id, confidence
+                   FROM user_profile ORDER BY updated_at DESC"""
             ).fetchall()
         return [
             {
@@ -58,6 +75,8 @@ class UserMemoryStore:
                 "value": row["value"],
                 "evidence": row["evidence"],
                 "source_session_id": row["source_session_id"],
+                "evidence_message_id": int(row["evidence_message_id"] or 0),
+                "confidence": float(row["confidence"] if row["confidence"] is not None else 1.0),
                 "scope": "user",
                 "updated_at": row["updated_at"],
             }
