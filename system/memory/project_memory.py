@@ -18,6 +18,7 @@ class ProjectMemoryStore:
 
     _PROJECT_MEMORY_TYPES = {
         "goal", "constraint", "decision", "open_question", "milestone", "topic",
+        "research_direction", "failed_attempt",
     }
 
     def _init_project_memory_schema(self, conn) -> None:
@@ -102,7 +103,15 @@ class ProjectMemoryStore:
     def get_project(self, project_id: str = DEFAULT_PROJECT_ID) -> Optional[Dict[str, Any]]:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        files = getattr(self, "project_memory_files", None)
+        if files is not None:
+            purpose_path = files.project_dir(project_id) / "purpose.md"
+            if purpose_path.exists():
+                result["purpose"] = files.read_purpose(project_id)
+        return result
 
     def create_project(self, name: str, project_id: str) -> Dict[str, Any]:
         project_id = str(project_id or "").strip()
@@ -125,6 +134,7 @@ class ProjectMemoryStore:
                 (project_id, now),
             )
             conn.commit()
+        self._sync_project_memory_files(project_id)
         return self.get_project(project_id) or {}
 
     def get_session_project_id(self, session_id: str) -> str:
@@ -163,6 +173,17 @@ class ProjectMemoryStore:
                 now,
             )
             conn.commit()
+        files = getattr(self, "project_memory_files", None)
+        if files is not None:
+            project = self.get_project(project_id) or {}
+            files.write_purpose(
+                project_id,
+                str(project.get("name") or DEFAULT_PROJECT_NAME),
+                purpose,
+                source_session_id=source_session_id,
+                evidence=evidence,
+                updated_at=now,
+            )
         return self.get_project(project_id) or {}
 
     def get_session_state(self, session_id: str) -> Dict[str, Any]:
@@ -354,12 +375,14 @@ class ProjectMemoryStore:
                            WHERE id=? AND project_id=? AND memory_type=? AND status='active'""",
                         (int(supersedes_id), project_id, memory_type),
                     ).fetchone()
-                    if replaced:
-                        supersedes = int(replaced["id"])
-                        conn.execute(
-                            "UPDATE project_memories SET status='superseded', updated_at=? WHERE id=?",
-                            (now_iso, supersedes),
-                        )
+                    if not replaced:
+                        conn.rollback()
+                        return None
+                    supersedes = int(replaced["id"])
+                    conn.execute(
+                        "UPDATE project_memories SET status='superseded', updated_at=? WHERE id=?",
+                        (now_iso, supersedes),
+                    )
                 cursor = conn.execute(
                     """INSERT INTO project_memories
                        (project_id, memory_type, content, source_session_id,
@@ -377,6 +400,7 @@ class ProjectMemoryStore:
                  "evidence_message_ids": evidence, "supersedes_id": supersedes_id}, now_iso,
             )
             conn.commit()
+        self._sync_project_memory_files(project_id)
         return self.get_project_memory(memory_id)
 
     def get_project_memory(self, memory_id: int) -> Optional[Dict[str, Any]]:
@@ -392,12 +416,14 @@ class ProjectMemoryStore:
         limit: int = 6,
     ) -> List[Dict[str, Any]]:
         now = self._now_iso()
+        expired_changed = False
         with closing(self._connect()) as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """UPDATE project_memories SET status='expired'
                    WHERE project_id=? AND status='active' AND expires_at IS NOT NULL AND expires_at < ?""",
                 (project_id, now),
             )
+            expired_changed = bool(cursor.rowcount)
             conn.commit()
             rows = conn.execute(
                 """SELECT * FROM project_memories
@@ -405,6 +431,8 @@ class ProjectMemoryStore:
                    ORDER BY importance DESC, updated_at DESC LIMIT 200""",
                 (project_id,),
             ).fetchall()
+        if expired_changed:
+            self._sync_project_memory_files(project_id)
         terms = self._memory_terms(query)
         ranked = []
         for row in rows:
@@ -509,20 +537,81 @@ class ProjectMemoryStore:
     def render_project_context(self, session_id: str, query: str = "", memory_limit: int = 6) -> str:
         project_id = self.get_session_project_id(session_id)
         project = self.get_project(project_id) or {}
-        project_state = self.get_project_state(project_id)
         session_state = self.get_session_state(session_id)
-        memories = self.search_project_memories(project_id, query, limit=memory_limit)
         lines = [f"project: {project.get('name') or DEFAULT_PROJECT_NAME}"]
-        if str(project.get("purpose") or "").strip():
-            lines.append("purpose:\n" + str(project["purpose"]).strip())
-        for label, state in (("project_state", project_state), ("session_state", session_state)):
-            visible = {key: value for key, value in state.items() if key not in {"version", "updated_at"} and value not in (None, "", [], {})}
-            if visible:
-                lines.append(f"{label}: " + json.dumps(visible, ensure_ascii=False))
-        if memories:
-            lines.append("relevant_project_memories:")
-            lines.extend(f"- [memory:{item['id']}][{item['memory_type']}] {item['content']}" for item in memories)
+        files = getattr(self, "project_memory_files", None)
+        if files is not None:
+            prompt_index = files.prompt_index(project_id)
+            if prompt_index:
+                lines.append(prompt_index)
+        else:
+            purpose = str(project.get("purpose") or "").strip()
+            if purpose:
+                lines.append("purpose:\n" + purpose)
+        visible = {
+            key: value for key, value in session_state.items()
+            if key not in {"version", "updated_at"} and value not in (None, "", [], {})
+        }
+        if visible:
+            lines.append("[CURRENT_SESSION_STATE]\n" + json.dumps(visible, ensure_ascii=False))
+        lines.append(
+            "[MEMORY_BOUNDARY]\n"
+            "Project memory is a navigation/state layer, not paper evidence. "
+            "Open a topic file when its index entry is relevant; use Wiki tools for paper knowledge."
+        )
         return "\n".join(lines)
+
+    def open_project_memory_topic(self, session_id: str, topic: str) -> Dict[str, str]:
+        """Open one validated topic file inside the current project's memory root."""
+        files = getattr(self, "project_memory_files", None)
+        if files is None:
+            raise ValueError("Project memory files are unavailable")
+        return files.open_topic(self.get_session_project_id(session_id), topic)
+
+    def _sync_all_project_memory_files(self) -> None:
+        files = getattr(self, "project_memory_files", None)
+        if files is None:
+            return
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT id FROM projects ORDER BY created_at").fetchall()
+        for row in rows:
+            self._sync_project_memory_files(str(row["id"]))
+
+    def _sync_project_memory_files(self, project_id: str) -> None:
+        files = getattr(self, "project_memory_files", None)
+        if files is None:
+            return
+        with closing(self._connect()) as conn:
+            project = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+            rows = conn.execute(
+                "SELECT * FROM project_memories WHERE project_id=? ORDER BY updated_at DESC, id DESC",
+                (project_id,),
+            ).fetchall()
+        if not project:
+            return
+        project_data = dict(project)
+        files.ensure_project(
+            project_id,
+            str(project_data.get("name") or DEFAULT_PROJECT_NAME),
+            str(project_data.get("purpose") or ""),
+        )
+        files.sync_project(
+            project_id,
+            str(project_data.get("name") or DEFAULT_PROJECT_NAME),
+            [self._memory_row(row) for row in rows],
+            updated_at=max(
+                [str(project_data.get("updated_at") or ""), *[str(row["updated_at"] or "") for row in rows]]
+            ) or self._now_iso(),
+        )
+
+    def _sync_user_memory_file(self) -> None:
+        files = getattr(self, "project_memory_files", None)
+        if files is None:
+            return
+        files.sync_preferences(
+            self.get_all_preferences_detailed(),
+            updated_at=self._now_iso(),
+        )
 
     @staticmethod
     def _merge_state(current: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:

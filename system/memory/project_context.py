@@ -21,6 +21,15 @@ class ProjectContextManager:
         "language_preference", "answer_length", "answer_style",
         "citation_preference", "explanation_style",
     }
+    MEMORY_TARGETS = {
+        "goals": "goal",
+        "constraints": "constraint",
+        "decisions": "decision",
+        "open_questions": "open_question",
+        "milestones": "milestone",
+        "research_direction": "research_direction",
+        "failed_attempts": "failed_attempt",
+    }
 
     def __init__(self, store, invoke: Optional[Invoke] = None):
         self.store = store
@@ -87,7 +96,8 @@ Current message:
             return []
 
         project_context = self.store.render_project_context(session_id, message, memory_limit=6)
-        prompt = f"""Extract working state and durable project memory from one completed research-chat turn.
+        prompt = f"""Maintain lightweight project memory after one completed research-chat turn.
+The model proposes semantic patches. Python validates scope, evidence, IDs and file paths before committing them.
 Return strict JSON only with this shape:
 {{
   "session_state": {{
@@ -102,22 +112,24 @@ Return strict JSON only with this shape:
     {{"key": "language_preference|answer_length|answer_style|citation_preference|explanation_style",
       "value": string, "evidence_quote": string, "confidence": number}}
   ],
-  "memories": [
-    {{"type": "goal|constraint|decision|open_question|milestone|topic", "content": string,
+  "memory_patches": [
+    {{"operation": "upsert|supersede",
+      "target": "goals|constraints|decisions|open_questions|milestones|research_direction|failed_attempts",
+      "content": string,
       "evidence_quote": string, "confidence": number, "importance": number,
-      "durability": "durable|temporary", "supersedes_memory_id": integer|null}}
+      "durability": "durable|temporary", "supersedes_id": integer|null}}
   ]
 }}
 
 Rules:
-- Session state may describe the immediate task. Project state and memories require evidence that the item matters across conversations in this research project.
-- Store explicit project goals, durable constraints, confirmed/rejected decisions, unresolved research questions and completed milestones.
-- Every project memory requires evidence_quote copied exactly from the user message. Assistant suggestions must wait for later user confirmation.
-- When the user explicitly replaces or reverses an existing [memory:id] of the same type, set supersedes_memory_id to that id. Otherwise return null.
-- Do not turn paper claims, retrieved Wiki content, assistant suggestions or one-turn formatting requests into project memory.
+- Session state may describe the immediate task. A memory patch must remain useful in another conversation in this project.
+- Save explicit project goals, durable constraints, confirmed/rejected decisions, open questions, milestones, research direction changes, and failed attempts whose cause or lesson prevents repeated work.
+- Every memory patch requires evidence_quote copied exactly from the user message. Assistant suggestions must wait for later user confirmation.
+- Use operation=supersede only when the user explicitly replaces or reverses an existing memory:id of the same target, and set supersedes_id to that id. Otherwise use upsert and null.
+- Do not store paper claims, retrieved Wiki content, assistant suggestions, compact summaries, or one-turn formatting requests as project memory. Paper knowledge belongs to the Wiki.
 - A user preference such as language or answer length is user memory, not project memory.
 - Only extract a user preference when the user explicitly makes it persistent, for example with '以后', '默认', '始终' or '记住'. One-turn requests are not preferences. evidence_quote must be an exact substring of the user message.
-- Return empty arrays/objects when nothing deserves persistence. Do not invent facts.
+- Return empty arrays/objects when nothing deserves persistence. Most turns should produce no memory patch. Do not invent facts.
 
 Existing project context:
 {project_context}
@@ -172,12 +184,23 @@ Assistant answer:
             "open_question": "open_questions",
             "milestone": "milestones",
             "topic": "active_topics",
+            "research_direction": "active_topics",
+            "failed_attempt": "failed_attempts",
         }
         durable_memory_changed = False
-        for candidate in parsed.get("memories") or []:
+        candidates = parsed.get("memory_patches")
+        if candidates is None:
+            # Backward-compatible input for old saved fixtures and clients.
+            candidates = parsed.get("memories") or []
+        for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
-            memory_type = str(candidate.get("type") or "").strip().lower()
+            target = str(candidate.get("target") or "").strip().lower()
+            memory_type = self.MEMORY_TARGETS.get(
+                target,
+                str(candidate.get("type") or "").strip().lower(),
+            )
+            operation = str(candidate.get("operation") or "upsert").strip().lower()
             content = " ".join(str(candidate.get("content") or "").split())
             evidence_quote = str(candidate.get("evidence_quote") or "").strip()
             confidence = _number(candidate.get("confidence"), 0.0)
@@ -186,8 +209,16 @@ Assistant answer:
                     or not evidence_quote or evidence_quote.lower() not in message.lower()):
                 continue
             durability = str(candidate.get("durability") or "temporary").lower()
-            supersedes_id = self._positive_int(candidate.get("supersedes_memory_id"))
-            if supersedes_id is not None and not self._supersession_supported(evidence_quote):
+            supersedes_id = self._positive_int(
+                candidate.get("supersedes_id", candidate.get("supersedes_memory_id"))
+            )
+            if operation not in {"upsert", "supersede"}:
+                continue
+            if operation == "supersede" and supersedes_id is None:
+                continue
+            if supersedes_id is not None and (
+                operation != "supersede" or not self._supersession_supported(evidence_quote)
+            ):
                 continue
             saved = self.store.add_project_memory(
                 project_id,

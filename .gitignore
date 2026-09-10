@@ -4,6 +4,7 @@
 .impeccable/
 
 # Runtime data
+/.paperwiki/
 logs/*
 !logs/.gitkeep
 data/*

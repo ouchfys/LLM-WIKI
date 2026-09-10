@@ -48,11 +48,15 @@ def test_project_purpose_and_memory_are_shared_without_sharing_session_state(tmp
     )
 
     context = store.render_project_context(second, "CUDA kernel")
+    memory_dir = tmp_path / ".paperwiki" / "memory" / "projects" / DEFAULT_PROJECT_ID
 
     assert "研究低成本 LLM Serving" in context
-    assert "不考虑定制 CUDA kernel" in context
     assert "暂时排除" in context
     assert "比较 QServe" not in context
+    assert "[PROJECT_MEMORY_INDEX]" in context
+    assert (memory_dir / "purpose.md").exists()
+    assert (memory_dir / "MEMORY.md").exists()
+    assert "暂时排除" in (memory_dir / "topics" / "decisions.md").read_text(encoding="utf-8")
     assert store.get_session_state(second) == {}
 
 
@@ -107,15 +111,17 @@ def test_model_resolves_followup_and_distills_validated_project_memory(tmp_path)
                 "evidence_quote": "以后回答先说结论",
                 "confidence": 0.94,
             }],
-            "memories": [{
-                "type": "constraint",
+            "memory_patches": [{
+                "operation": "upsert",
+                "target": "constraints",
                 "content": "不能修改 CUDA kernel",
                 "evidence_quote": "这个项目以后不考虑定制 kernel",
                 "confidence": 0.96,
                 "importance": 0.9,
                 "durability": "durable",
             }, {
-                "type": "decision",
+                "operation": "upsert",
+                "target": "decisions",
                 "content": "低置信度内容不应落库",
                 "evidence_quote": "以后回答先说结论",
                 "confidence": 0.4,
@@ -146,6 +152,12 @@ def test_model_resolves_followup_and_distills_validated_project_memory(tmp_path)
     assert preference["evidence_message_id"] == user_id
     assert preference["source_session_id"] == session_id
     assert preference["confidence"] == 0.94
+    assert "conclusion_first" in (
+        tmp_path / ".paperwiki" / "memory" / "preferences.md"
+    ).read_text(encoding="utf-8")
+    topic = store.open_project_memory_topic(session_id, "constraints")
+    assert topic["path"] == "topics/constraints.md"
+    assert "不能修改 CUDA kernel" in topic["content"]
 
 
 def test_new_project_memory_can_supersede_conflicting_old_memory(tmp_path):
@@ -168,14 +180,15 @@ def test_new_project_memory_can_supersede_conflicting_old_memory(tmp_path):
         return json.dumps({
             "session_state": {},
             "user_preferences": [],
-            "memories": [{
-                "type": "constraint",
+            "memory_patches": [{
+                "operation": "supersede",
+                "target": "constraints",
                 "content": "允许定制 CUDA kernel",
                 "evidence_quote": message,
                 "confidence": 0.97,
                 "importance": 0.9,
                 "durability": "durable",
-                "supersedes_memory_id": old["id"],
+                "supersedes_id": old["id"],
             }],
         }, ensure_ascii=False)
 
@@ -190,6 +203,53 @@ def test_new_project_memory_can_supersede_conflicting_old_memory(tmp_path):
     active = store.search_project_memories(DEFAULT_PROJECT_ID, "CUDA kernel")
     assert [item["content"] for item in active] == ["允许定制 CUDA kernel"]
     assert store.get_project_state(DEFAULT_PROJECT_ID)["constraints"] == ["允许定制 CUDA kernel"]
+
+
+def test_memory_files_preserve_manual_notes_and_reject_invalid_topics(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    session_id = store.create_session("memory files")
+    directory = tmp_path / ".paperwiki" / "memory" / "projects" / DEFAULT_PROJECT_ID
+    topic_path = directory / "topics" / "failed-attempts.md"
+    topic_path.write_text(
+        topic_path.read_text(encoding="utf-8").replace(
+            "可在这里补充人工备注；自动同步不会覆盖本节。",
+            "人工备注：不要重复运行旧解析器。",
+        ),
+        encoding="utf-8",
+    )
+
+    store.add_project_memory(
+        DEFAULT_PROJECT_ID,
+        "failed_attempt",
+        "旧解析器会丢失表格结构",
+        source_session_id=session_id,
+        confidence=0.99,
+        importance=0.9,
+    )
+
+    content = topic_path.read_text(encoding="utf-8")
+    assert "旧解析器会丢失表格结构" in content
+    assert "人工备注：不要重复运行旧解析器。" in content
+    try:
+        store.open_project_memory_topic(session_id, "../purpose")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid project-memory topic must be rejected")
+
+
+def test_invalid_supersedes_id_does_not_create_a_memory(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+
+    saved = store.add_project_memory(
+        DEFAULT_PROJECT_ID,
+        "decision",
+        "采用不存在的替代关系",
+        supersedes_id=999999,
+    )
+
+    assert saved is None
+    assert store.search_project_memories(DEFAULT_PROJECT_ID, "不存在的替代关系") == []
 
 
 def test_purpose_command_view_update_and_clear(tmp_path):

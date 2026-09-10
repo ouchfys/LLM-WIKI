@@ -74,15 +74,37 @@ QUEUED -> EXTRACTING -> DISTILLING -> VERIFYING
 | 类型 | 内容 | 使用方式 |
 | --- | --- | --- |
 | Wiki 知识库 | Markdown 论文页、主题页及来源证据 | 按问题检索和引用 |
-| 项目记忆 | 项目目标、研究状态、约束、决定、里程碑和开放问题 | 同项目跨会话自动加载或按需召回 |
-| 用户记忆 | 明确的持续偏好及其原文证据、来源会话和置信度 | 跨项目少量注入或按需召回 |
+| 项目记忆 | 项目目标、研究方向、约束、决定、失败经验、里程碑和开放问题 | 固定加载 Markdown 小索引，主题文件按需打开 |
+| 用户记忆 | 明确的持续偏好及其原文证据、来源会话和置信度 | 少量固定注入，并同步成人可读的 `preferences.md` |
 | 会话记录与上下文 | 原始消息、工具观察、压缩摘要 | 构建本次模型请求，支持历史找回 |
 
-工具规划和最终回答共享有效历史。预算允许时保留全部有效对话；完整请求接近阈值时，先缩减工具观察，再总结早期历史并保留近期原文。
+项目记忆采用类似 Codex / Claude Code 的渐进式文件结构，而不是给少量个人记忆部署向量数据库：
+
+```text
+.paperwiki/memory/
+├── preferences.md
+└── projects/<project-id>/
+    ├── purpose.md
+    ├── MEMORY.md
+    └── topics/
+        ├── goals.md
+        ├── constraints.md
+        ├── decisions.md
+        ├── open-questions.md
+        ├── milestones.md
+        ├── research-direction.md
+        └── failed-attempts.md
+```
+
+每个新会话固定读取 `purpose.md` 和紧凑的 `MEMORY.md`。当索引表明某个主题与当前问题有关时，工具调用 Agent 使用 `project_memory_open` 打开对应文件。主题文件不会被当作论文证据；论文事实仍然通过 `wiki_search -> wiki_open` 获取。
+
+回答完成后，同一个 DeepSeek V4 Flash 模型返回结构化 `memory_patches`，判断本轮是否产生了值得跨会话保留的目标、决定或经验。多数普通问答不产生 Patch。Python 检查目标文件、原文依据、置信度、ID、替代关系和作用域，再原子更新 Markdown；SQLite 保留原始消息、结构化记录和事件，作为来源与审计账本。模型不能通过记忆 Patch 修改 Wiki 或任意路径。
+
+工具规划和最终回答共享有效历史。预算允许时保留全部有效对话；完整请求接近阈值时，先缩减工具观察，再总结早期历史并保留近期原文。工具结果采用类似 DeepSeek Harness 的两级保护：单条模型可见结果超过 50KB 时立即改成头尾预览；上下文达到压缩阈值后，再把超过 8192 字符的旧工具结果压到前 4096＋后 1024。两级处理都不调用模型。
 
 - DeepSeek V4 Flash 默认按 **1M Token** 窗口配置，另可设置应用运行预算。默认约在窗口的 80% 触发整理。
-- 摘要与覆盖边界原子提交到 SQLite 检查点；原始消息仍保留，模型可调用历史搜索、原文读取和工具记录读取工具。
-- DeepSeek V4 Flash 自动把多轮追问改写为独立检索问题，并在回答完成后提取结构化会话状态、项目状态和长期记忆候选；Python 校验证据、作用域、置信度、去重和 TTL 后提交。
+- 摘要与覆盖边界原子提交到 SQLite 检查点；原始消息和完整工具结果仍保留。每个工具观察携带 `result_id`、原始大小和省略量，模型可调用历史搜索、原文读取，或用 `read_tool_result` 按 offset 分页、按 query 跳到命中文本附近。
+- DeepSeek V4 Flash 自动把多轮追问改写为独立检索问题，并在回答完成后提出结构化项目记忆 Patch；Python 校验证据、作用域、置信度、去重、TTL 和替代关系后提交。
 - `/purpose` 查看项目目标；`/purpose <自然语言要求>` 结合当前会话更新目标；`/purpose 清除` 清空项目目标。普通对话仍会自动维护项目状态和记忆。
 - `/compact` 手动整理会话；普通聊天和自动压缩不会写入 Wiki。
 - `/wiki <沉淀要求>` 将用户指定的讨论沉淀到知识库，保留论文事实、AI 综合和用户洞见的来源区别。
@@ -147,6 +169,7 @@ MCP 不复制入库逻辑。它只负责文献发现与提交，去重、解析�
 | 文档解析 | arXiv LaTeXML HTML、MinerU VLM API、PyMuPDF fallback |
 | LLM | DeepSeek 官方 Chat Completions + SiliconFlow 模型分工 |
 | 知识主体 | Markdown Wiki |
+| 项目记忆 | Markdown 索引与主题文件、SQLite 来源账本 |
 | 检索 | SQLite FTS5、Qwen3-Embedding-0.6B、RRF |
 | 表格 | 结构化 cell、Pandas、只读 DuckDB |
 | 存储 | 本地文件系统 / 阿里云 OSS 租户前缀 |
@@ -269,6 +292,7 @@ system/wiki/              检索、核验、编译、版本和表格查询
 system/storage/           本地 / OSS 对象存储
 system/conversation/      会话记录、Token 预算和压缩检查点
 system/memory/            用户偏好、项目状态、跨会话记忆与自动提炼
+.paperwiki/memory/        运行时生成的 purpose、记忆索引与主题文件（不提交 Git）
 scripts/                  入库、迁移和索引维护工具
 test/                     自动化测试与冻结评测集
 docs/                     架构、配置、运行和评测说明
@@ -286,8 +310,8 @@ docs/                     架构、配置、运行和评测说明
 
 ## 设计原则
 
-- Markdown 是用户可读、可编辑、可 diff 的长期知识主体。
-- 知识检索索引可以从 Markdown 重建；SQLite 中的会话、用户记忆和任务状态则需独立保存。
+- Wiki Markdown 是论文知识主体；`.paperwiki/memory` Markdown 是轻量的项目上下文层，两者不共用检索与引用语义。
+- Wiki 检索索引和项目记忆文件都可以从持久化记录重建；SQLite 中的原始会话、来源账本和任务状态需独立备份。
 - 模型负责提议和语义判断，程序负责验证、状态和副作用。
 - 低风险自动提交，只有真正改变旧知识的情况才要求人判断。
 - 解析器是可替换适配层，不让某个文档工具绑死整个 Agent。

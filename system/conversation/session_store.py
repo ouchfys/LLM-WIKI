@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import closing
@@ -9,16 +10,23 @@ import re
 
 
 from system.memory.user_memory import UserMemoryStore
+from system.memory.project_files import ProjectMemoryFiles
 from system.memory.project_memory import DEFAULT_PROJECT_ID, ProjectMemoryStore
 
 
 class SessionStore(UserMemoryStore, ProjectMemoryStore):
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, memory_root: str = None):
         base_dir = Path(__file__).resolve().parents[2]
         path = Path(db_path) if db_path else base_dir / "sessions.db"
         self.db_path = str(path)
+        configured_memory_root = memory_root or os.getenv("PAPERWIKI_MEMORY_ROOT", "").strip()
+        self.project_memory_files = ProjectMemoryFiles(
+            configured_memory_root or path.parent / ".paperwiki" / "memory"
+        )
         self._preference_fts_enabled = False
         self._init_db()
+        self._sync_all_project_memory_files()
+        self._sync_user_memory_file()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -412,7 +420,7 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             conn.commit()
             return cursor.lastrowid if cursor.rowcount else None
 
-    def read_tool_result(self, session_id, result_id, offset=0):
+    def read_tool_result(self, session_id, result_id, offset=0, query=""):
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT tool, result_json FROM session_tool_results WHERE session_id = ? AND id = ?",
                                (session_id, int(result_id))).fetchone()
@@ -420,8 +428,13 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             return []
         offset = max(0, int(offset))
         content = row["result_json"]
+        query = str(query or "").strip()
+        matched_offset = content.lower().find(query.lower()) if query else -1
+        if matched_offset >= 0:
+            offset = max(0, matched_offset - 500)
         return [{"result_id": int(result_id), "tool": row["tool"], "content": content[offset:offset + 4000],
-                 "offset": offset, "next_offset": offset + 4000 if len(content) > offset + 4000 else None}]
+                 "offset": offset, "next_offset": offset + 4000 if len(content) > offset + 4000 else None,
+                 "total_chars": len(content), "query": query, "match_found": matched_offset >= 0 if query else None}]
 
     def get_history(self, session_id: str, last_n: Optional[int] = 5) -> list:
         with closing(self._connect()) as conn:

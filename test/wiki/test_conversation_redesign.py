@@ -69,6 +69,9 @@ def test_checkpoint_recovery_history_search_and_deletion(tmp_path):
     assert reopened.search_session_history(sid, "SECRET-OTHER-SESSION") == []
     assert reopened.read_tool_result(other, result_id) == []
     assert "TAIL" in reopened.read_tool_result(sid, result_id, 8000)[0]["content"]
+    matched = reopened.read_tool_result(sid, result_id, query="TAIL")[0]
+    assert matched["match_found"] is True and "TAIL" in matched["content"]
+    assert matched["total_chars"] > 8000
     assert reopened.delete_session(sid)
     assert reopened.get_context_checkpoints(sid) == []
     assert reopened.read_tool_result(sid, result_id) == []
@@ -114,6 +117,8 @@ def test_history_tools_reach_both_model_prompt_paths(tmp_path):
     assert "Question-0" in service._observation_context([observation])
     assert "Question-0" in service._answer_observation_context([service._observation_payload(observation)])
     assert "result_id=" in observation.summary
+    assert observation.result_id > 0 and observation.result_size_bytes > 0
+    assert f"result_id={observation.result_id}" in service._observation_context([observation])
 
 
 def test_temporary_requests_and_paper_language_are_not_durable_preferences():

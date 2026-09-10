@@ -174,6 +174,53 @@ def test_unicode_clipping_and_token_counter_metadata():
     assert counter.mode in {"cl100k_estimate_1.25x", "utf8_byte_upper_estimate"}
 
 
+def test_oversized_tool_result_keeps_head_tail_and_recovery_handle():
+    policy = ContextPolicy(
+        window=8000, output_reserve=1200, safety=256,
+        history=1200, planning_history=800, summary=256,
+        compact_trigger=1800, compact_keep=600,
+        tool_max_inline_bytes=500,
+    )
+    budget = ContextBudget(policy, ByteCounter())
+    original = "HEAD-SENTINEL\n" + ("middle-data\n" * 200) + "TAIL-SENTINEL"
+    preview = budget.bound_tool_result(original, result_id=73)
+
+    assert len(preview.encode("utf-8")) <= 500
+    assert "HEAD-SENTINEL" in preview and "TAIL-SENTINEL" in preview
+    assert "result_id=73" in preview and "read_tool_result" in preview
+    assert "UTF-8 字节" in preview
+
+    structured = "[Observation 1] result_id=74\n" + "\n".join(
+        f'[Tool Item {i}] {{"id": {i}, "text": "' + ("内容" * 10) + '"}'
+        for i in range(1, 10)
+    )
+    structured_preview = budget.bound_tool_result(structured, result_id=74)
+    assert len(structured_preview.encode("utf-8")) <= 500
+    assert "[Tool Item 1]" in structured_preview and "[Tool Item 9]" in structured_preview
+    assert "完整条目" in structured_preview and "result_id=74" in structured_preview
+
+
+def test_pressure_pruning_retains_complete_structured_items_from_both_ends():
+    policy = ContextPolicy(
+        window=8000, output_reserve=1200, safety=256,
+        history=1200, planning_history=800, summary=256,
+        compact_trigger=1800, compact_keep=600,
+        tool_prune_chars=600, tool_prune_head_chars=350, tool_prune_tail_chars=150,
+    )
+    budget = ContextBudget(policy, ByteCounter())
+    items = "\n".join(
+        f'[Tool Item {i}] {{"id": {i}, "text": "VALUE-{i}-' + ("x" * 45) + '"}'
+        for i in range(1, 11)
+    )
+    block = f"[Observation 1] tool=table_query; result_id=91; summary=rows\n{items}"
+    pruned = budget._prune_observation_chars(block)
+
+    assert len(pruned) <= 600
+    assert "[Tool Item 1]" in pruned and "[Tool Item 10]" in pruned
+    assert "完整条目" in pruned and "result_id=91" in pruned
+    assert "VALUE-1-" in pruned and "VALUE-10-" in pruned
+
+
 def test_stream_auto_compaction_is_visible_and_persisted_in_trace(tmp_path):
     from system.wiki.wiki_chat import WikiToolPlan
     store, sid = populated(tmp_path)

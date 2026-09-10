@@ -42,6 +42,9 @@ class UserMemoryStore:
                      int(evidence_message_id or 0), max(0.0, min(float(confidence), 1.0)), self._now_iso()),
                 )
             conn.commit()
+        sync = getattr(self, "_sync_user_memory_file", None)
+        if callable(sync):
+            sync()
         print(f"[SessionStore] Upsert preference: {key} = {value}")
 
     def get_preference(self, key: str) -> Optional[str]:
@@ -88,6 +91,9 @@ class UserMemoryStore:
         with closing(self._connect()) as conn:
             conn.execute("DELETE FROM user_profile WHERE key = ?", (key,))
             conn.commit()
+        sync = getattr(self, "_sync_user_memory_file", None)
+        if callable(sync):
+            sync()
         print(f"[SessionStore] Deleted preference: {key}")
 
     def clear_all_preferences(self) -> None:
@@ -95,6 +101,9 @@ class UserMemoryStore:
         with closing(self._connect()) as conn:
             conn.execute("DELETE FROM user_profile")
             conn.commit()
+        sync = getattr(self, "_sync_user_memory_file", None)
+        if callable(sync):
+            sync()
         print("[SessionStore] Cleared all preferences")
 
     # ===========================================================
