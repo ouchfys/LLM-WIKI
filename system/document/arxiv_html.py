@@ -104,6 +104,7 @@ class ArxivHtmlParser:
             source_url=source_url,
             source_key=source_key,
         )
+        figures = _figure_records(article, source_url=source_url, source_key=source_key)
         abstract_node = article.select_one(".ltx_abstract")
         abstract = _clean(abstract_node.get_text(" ", strip=True) if abstract_node else "")
         abstract = re.sub(r"^Abstract\s*", "", abstract, flags=re.IGNORECASE)
@@ -122,6 +123,7 @@ class ArxivHtmlParser:
             },
             blocks=blocks,
             elements=elements,
+            figures=figures,
             tables=tables,
             parser="arxiv-html",
         )
@@ -197,6 +199,39 @@ def _extract_article(article: Tag, *, source_url: str, source_key: str):
     # paragraph node.
     markdown = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", _markdown_node(article, source_url)).strip() + "\n"
     return blocks, elements, tables, markdown
+
+
+def _figure_records(article: Tag, *, source_url: str, source_key: str) -> list[dict]:
+    records = []
+    for index, figure in enumerate(article.find_all("figure")):
+        if figure.find("table") is not None:
+            continue
+        image = figure.find("img")
+        if image is None:
+            continue
+        ref = str(figure.get("id") or image.get("id") or f"figure-{index}")
+        element_id = stable_evidence_id(source_key, "figure", ref, index)
+        caption_node = figure.find("figcaption")
+        caption = _clean(caption_node.get_text(" ", strip=True) if caption_node else image.get("alt", ""))
+        heading = figure.find_previous(re.compile(r"^h[1-6]$"))
+        previous = figure.find_previous_sibling("p")
+        following = figure.find_next_sibling("p")
+        discussion = " ".join(
+            _clean(node.get_text(" ", strip=True))
+            for node in (previous, following)
+            if node is not None
+        )[:2400]
+        records.append({
+            "figure_id": f"fig-{element_id[3:]}",
+            "element_id": element_id,
+            "asset_path": urljoin(source_url, str(image.get("src") or "")),
+            "caption": caption,
+            "section_path": [_clean(heading.get_text(" ", strip=True))] if heading else [],
+            "page": 0,
+            "source_text": discussion,
+            "metadata": {"source_locator_kind": "html_anchor", "source_ref": ref},
+        })
+    return records
 
 
 def _table_record(node: Tag, source_key: str, ref: str, index: int, heading_path: list[str]) -> dict:

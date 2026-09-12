@@ -39,7 +39,7 @@ SYSTEM_CONTENT_KEYS = {
     "import_impact", "claims", "markdown_status", "review_status_text",
     "evidence", "links",
     "conversation_instruction", "source_session_id", "source_message_ids",
-    "related_sources",
+    "related_sources", "selected_table_ids",
 }
 
 INTERNAL_SECTION_HEADINGS = {
@@ -346,6 +346,19 @@ class MarkdownVault:
 
         preferred = {
             "PaperPage": [
+                ("paper_type", "Paper Type"),
+                ("research_problem", "Research Problem"),
+                ("motivation", "Motivation"),
+                ("contributions", "Contributions"),
+                ("method_overview", "Method Overview"),
+                ("method_components", "Method Components"),
+                ("execution_flow", "Execution Flow"),
+                ("experiment_setup", "Experiment Setup"),
+                ("key_results", "Key Results"),
+                ("key_tables", "Key Tables"),
+                ("figure_notes", "Figure Notes"),
+                ("ablations", "Ablations"),
+                ("comparison_to_prior_work", "Comparison To Prior Work"),
                 ("problem", "Problem"),
                 ("key_idea", "Key Ideas"),
                 ("method", "Method"),
@@ -450,12 +463,28 @@ class MarkdownVault:
             return []
         if isinstance(value, str) and value.strip() in {"-", "- ", "[]"}:
             return []
+        if label == "Key Tables" and isinstance(value, list):
+            return MarkdownVault._render_key_tables(value)
+        if label == "Figure Notes" and isinstance(value, list):
+            return MarkdownVault._render_figure_notes(value)
         lines = [f"## {label}", ""]
         if isinstance(value, list):
             for item in value:
                 if isinstance(item, dict):
-                    parts = [f"{k}: {v}" for k, v in item.items() if v not in (None, "")]
-                    lines.append(f"- {'; '.join(parts)}")
+                    title = str(item.get("name") or item.get("finding") or item.get("factor") or "").strip()
+                    if title:
+                        lines.extend([f"### {title}", ""])
+                    for key, nested in item.items():
+                        if key in {"name", "finding", "factor"} or nested in (None, "", [], {}):
+                            continue
+                        nested_label = key.replace("_", " ").title()
+                        if isinstance(nested, list):
+                            lines.append(f"- **{nested_label}**: " + "；".join(str(entry) for entry in nested))
+                        else:
+                            lines.append(f"- **{nested_label}**: {nested}")
+                    if not title and not any(item.values()):
+                        continue
+                    lines.append("")
                 else:
                     lines.append(f"- {item}")
         elif isinstance(value, dict):
@@ -465,6 +494,51 @@ class MarkdownVault:
             lines.append(str(value).strip())
         lines.append("")
         return lines
+
+    @staticmethod
+    def _render_key_tables(tables: List[Dict[str, Any]]) -> List[str]:
+        lines = ["## Key Tables", ""]
+        for index, table in enumerate(tables, start=1):
+            if not isinstance(table, dict):
+                continue
+            caption = str(table.get("caption") or f"Table {index}").strip()
+            lines.extend([f"### {caption}", ""])
+            location = " / ".join(
+                value for value in (
+                    str(table.get("section") or "").strip(),
+                    f"page {table.get('page')}" if table.get("page") else "",
+                ) if value
+            )
+            if location:
+                lines.extend([f"*来源位置：{location}*", ""])
+            markdown = str(table.get("markdown") or "").strip()
+            if markdown:
+                lines.extend([markdown, ""])
+        return lines if len(lines) > 2 else []
+
+    @staticmethod
+    def _render_figure_notes(figures: List[Dict[str, Any]]) -> List[str]:
+        lines = ["## Figure Notes", ""]
+        for index, figure in enumerate(figures, start=1):
+            if not isinstance(figure, dict):
+                continue
+            caption = str(figure.get("caption") or f"Figure {index}").strip()
+            lines.extend([f"### {caption}", ""])
+            description = str(figure.get("description") or "").strip()
+            if description:
+                lines.extend([description, ""])
+            for key, label in (("trend", "趋势"), ("conditions", "适用条件")):
+                value = str(figure.get(key) or "").strip()
+                if value:
+                    lines.append(f"- **{label}**：{value}")
+            values = figure.get("key_values") or []
+            if values:
+                lines.append(f"- **关键数值**：{'；'.join(str(value) for value in values)}")
+            source_text = str(figure.get("source_text") or "").strip()
+            if source_text and source_text != description:
+                lines.append(f"- **论文正文说明**：{source_text}")
+            lines.append("")
+        return lines if len(lines) > 2 else []
 
     @staticmethod
     def _slugify(title: str) -> str:

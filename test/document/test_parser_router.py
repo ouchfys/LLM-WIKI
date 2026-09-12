@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import zipfile
 from pathlib import Path
@@ -10,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from system.document.arxiv_html import ArxivHtmlParser
-from system.document.mineru import _read_archive, _from_markdown
+from system.document.mineru import _enrich_tables, _read_archive, _from_markdown
 from system.document.models import ParsedDocument
 from system.document.parser_router import PaperParserRouter
 
@@ -30,6 +31,10 @@ def _arxiv_html() -> str:
       <figure id="T1"><figcaption>Table 1: Results</figcaption>
         <table><tr><th>Model</th><th>Score</th></tr><tr><td>Ours</td><td>91.2</td></tr></table>
       </figure>
+      <figure id="F1"><img src="figures/curve.png" alt="Scaling curve" />
+        <figcaption>Figure 1: Accuracy increases with compute.</figcaption>
+      </figure>
+      <p>The curve compares three compute budgets under the same evaluation setup.</p>
       <h2 id="bib">References</h2><p class="ltx_p">Reference entry.</p>
     </article></body></html>
     """
@@ -47,6 +52,9 @@ def test_arxiv_html_passes_quality_gate_and_builds_table_evidence():
     assert parsed.metadata["bbox_available"] is False
     assert parsed.tables[0]["headers"] == [["Model", "Score"]]
     assert parsed.tables[0]["rows"] == [["Ours", "91.2"]]
+    assert parsed.figures[0]["caption"] == "Figure 1: Accuracy increases with compute."
+    assert parsed.figures[0]["asset_path"] == "https://arxiv.org/html/figures/curve.png"
+    assert "three compute budgets" in parsed.figures[0]["source_text"]
     assert "$91.2$" in parsed.markdown
     assert parsed.elements and all(item["bbox"] == {} for item in parsed.elements)
 
@@ -88,9 +96,99 @@ def test_router_records_why_it_degraded(monkeypatch, tmp_path):
 def test_mineru_archive_is_consumed_in_memory_without_extracting_files():
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as bundle:
-        bundle.writestr("full.md", "# MinerU Paper\n\n## Abstract\n\nUseful evidence.\n\n<table><tr><td>Model</td><td>Score</td></tr><tr><td>A</td><td>90</td></tr></table>")
+        bundle.writestr(
+            "full.md",
+            "# MinerU Paper\n\n## Abstract\n\nUseful evidence.\n\n"
+            "## Results\n\n![Throughput curve](images/chart.png)\n\n"
+            "Figure 1: Throughput rises with batch size under the tested setting.\n\n"
+            "The authors report that the curve saturates after batch size 32.\n\n"
+            "<table><tr><td>Model</td><td>Score</td></tr><tr><td>A</td><td>90</td></tr></table>\n\n"
+            "Table 1: Main accuracy results.",
+        )
+        bundle.writestr("images/chart.png", b"fake-image-bytes")
+        bundle.writestr("content_list.json", json.dumps([
+            {
+                "type": "image",
+                "img_path": "images/chart.png",
+                "image_caption": ["Figure 1: Throughput rises with batch size under the tested setting."],
+                "image_footnote": ["The curve uses batch sizes from 1 to 64."],
+                "page_idx": 3,
+            },
+            {
+                "type": "table",
+                "table_caption": ["Table 1: Main accuracy results.", "Table 2: Caption accidentally grouped by MinerU."],
+                "table_body": "<table><tr><td>Model</td><td>Score</td></tr><tr><td>A</td><td>90</td></tr></table>",
+                "page_idx": 4,
+            },
+        ]))
     markdown, metadata = _read_archive(buffer.getvalue())
+    provider_figures = metadata.pop("_figures")
+    provider_tables = metadata.pop("_tables")
     parsed = _from_markdown(markdown, source_key="hash", source_path="paper.pdf")
     assert metadata["markdown_file"] == "full.md"
+    assert metadata["image_files"] == [{"path": "images/chart.png", "size": 16}]
     assert parsed.title == "MinerU Paper"
     assert parsed.tables[0]["rows"] == [["A", "90"]]
+    assert parsed.tables[0]["caption"] == "Table 1: Main accuracy results."
+    assert parsed.tables[0]["section_path"] == ["Results"]
+    assert parsed.figures[0]["asset_path"] == "images/chart.png"
+    assert parsed.figures[0]["caption"].startswith("Figure 1")
+    assert "saturates after batch size 32" in parsed.figures[0]["source_text"]
+    assert provider_figures[0]["page"] == 4
+    assert provider_figures[0]["source_text"] == "The curve uses batch sizes from 1 to 64."
+    assert provider_tables[0]["page"] == 5
+    assert provider_tables[0]["caption"] == "Table 1: Main accuracy results."
+
+
+def test_mineru_content_list_matches_table_caption_by_body_instead_of_position():
+    parsed = _from_markdown(
+        "# Paper\n\n<table><tr><td>Model</td><td>Score</td></tr><tr><td>A</td><td>90</td></tr></table>\n\n"
+        "Wrong caption near first table.\n\n"
+        "<table><tr><td>Device</td><td>Throughput</td></tr><tr><td>GPU</td><td>3000</td></tr></table>",
+        source_key="hash",
+        source_path="paper.pdf",
+    )
+    providers = [
+        {
+            "caption": "Table 2: Throughput",
+            "page": 8,
+            "body": "<table><tr><td>Device</td><td>Throughput</td></tr><tr><td>GPU</td><td>3000</td></tr></table>",
+        },
+        {
+            "caption": "Table 1: Accuracy",
+            "page": 7,
+            "body": "<table><tr><td>Model</td><td>Score</td></tr><tr><td>A</td><td>90</td></tr></table>",
+        },
+    ]
+    _enrich_tables(parsed.tables, providers)
+    assert parsed.tables[0]["caption"] == "Table 1: Accuracy"
+    assert parsed.tables[0]["page"] == 7
+    assert parsed.tables[1]["caption"] == "Table 2: Throughput"
+    assert parsed.tables[1]["page"] == 8
+
+
+def test_mineru_recovers_orphan_caption_when_markdown_table_order_is_crossed():
+    parsed = _from_markdown(
+        "# Paper\n\n"
+        "<table><tr><td>Task</td><td>Score</td></tr><tr><td>LongBench</td><td>38.5</td></tr></table>\n\n"
+        "Table 4. Absolute throughput.\n\n"
+        "<table><tr><td>Device</td><td>Throughput</td></tr><tr><td>GPU</td><td>3000</td></tr></table>\n\n"
+        "Table 5. LongBench evaluation.",
+        source_key="hash",
+        source_path="paper.pdf",
+    )
+    providers = [
+        {
+            "caption": "",
+            "page": 9,
+            "body": "<table><tr><td>Task</td><td>Score</td></tr><tr><td>LongBench</td><td>38.5</td></tr></table>",
+        },
+        {
+            "caption": "Table 4. Absolute throughput.",
+            "page": 10,
+            "body": "<table><tr><td>Device</td><td>Throughput</td></tr><tr><td>GPU</td><td>3000</td></tr></table>",
+        },
+    ]
+    _enrich_tables(parsed.tables, providers)
+    assert parsed.tables[0]["caption"] == "Table 5. LongBench evaluation."
+    assert parsed.tables[1]["caption"] == "Table 4. Absolute throughput."

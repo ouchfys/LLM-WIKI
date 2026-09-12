@@ -348,7 +348,15 @@ class PaperMergeAgent:
             relation_decisions=relation_decisions,
         ).content_json
         card_id = existing["id"] if existing else str(uuid.uuid4())
-        summary = _merge_summary(existing.get("summary", ""), candidate.summary) if existing else candidate.summary
+        # v2 recompilation replaces the legacy abstract-like summary instead of
+        # appending another paragraph to it. Provenance and prior claims remain
+        # in the compiler audit data.
+        summary = (
+            candidate.summary
+            if existing and content.get("schema_version") == "paper-wiki-v2"
+            else _merge_summary(existing.get("summary", ""), candidate.summary) if existing
+            else candidate.summary
+        )
         source_urls = _unique_list((existing.get("source_urls") if existing else []) + packet.source_urls)
         related_topics = _unique_list((existing.get("related_topics") if existing else []) + candidate.related_topics)
         card_id = self._write_canonical_card(

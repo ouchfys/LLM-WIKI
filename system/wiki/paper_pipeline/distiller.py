@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from typing import Any
 
+from system.conversation.context_budget import default_counter
 from system.core.llm_call import invoke_structured
+from system.storage import get_object_storage
 
 from system.wiki.paper_pipeline.models import CandidateClaim, DistilledCandidate, SourcePacket
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore, normalize_alias
 from system.wiki.wiki_builder import sanitize_wiki_text
 
 
-DISTILL_PROMPT = """\
-You are the paper knowledge distillation agent for LLM-WIKI.
-Input is one paper_pdf SourcePacket. Produce source-grounded reusable wiki
-candidates, not a one-off long summary.
+PAPER_PAGE_PROMPT = """\
+You compile one research paper into a detailed, self-contained PaperWiki page.
+The page must let a reader understand the paper's motivation, design, execution,
+evaluation and limitations without reopening the PDF for ordinary questions.
 
 Output language:
 - Write all free-text explanations in Simplified Chinese.
@@ -24,74 +27,98 @@ Output language:
 
 Hard rules:
 - Return valid JSON only. No markdown fences and no prose outside JSON.
-- Do not invent authors, datasets, metrics, numbers, or conclusions.
-- Prefer durable TopicPage articles that can be reused and extended by later papers.
-- Do not create cards for incidental details that are only useful inside this paper.
+- Do not invent authors, datasets, metrics, numbers, figure contents, or conclusions.
+- Cover every substantive part of the paper. Do not summarize only the abstract or introduction.
+- Explain causal links: what problem each design choice solves and how components interact.
+- For empirical papers, state datasets/models/baselines/metrics/settings before reporting results.
+- selected_table_ids may contain only IDs shown in the source. Select 2-5 tables that best
+  explain the main results, comparisons or ablations. Python will insert their exact Markdown;
+  never copy or rewrite table cells into another field.
+- figure_notes may contain only figure_ids shown in the source. Describe each useful figure
+  from its caption and nearby author-written discussion. State trends, axes, conditions and
+  key values only when the supplied text explicitly supports them. Never infer unseen pixels.
 - Every claim must include evidence copied or tightly paraphrased from the source,
-  a section_id, and the evidence_ids shown in the source section header.
+  a section_id, and only evidence_ids shown in that source section header. If an exact
+  evidence ID is unavailable, leave evidence_ids empty; the verifier will bind by text.
 - Describe each claim with subject/aspect/predicate/value/scope. Do not decide
   whether it supports, challenges, or supersedes the Wiki; the merge stage owns
   all cross-source relation decisions.
-- If evidence is weak, leave fields empty instead of guessing.
-- TopicPage candidates must have aliases.
-- candidate_type must be one of: paper_page, concept_card, method_card.
-- page_type must be one of: PaperPage, TopicPage.
-- Field quality targets:
-  problem: explain the research problem and why it matters.
-  key_idea: explain the central insight with enough detail for a user to understand it later.
-  method: describe the actual workflow, signals, models, probes, datasets, or evaluation steps when supported.
-  results/findings: include only source-supported conclusions, metrics, or qualitative observations.
-  limitations: leave empty when evidence is insufficient; do not invent caveats.
-  key_takeaways: 2-6 concrete reusable items.
-- Write naturally. Paragraphs or line breaks are both acceptable.
-- Do not pad content to hit an arbitrary sentence count.
-- Do not return a vague one-sentence key_idea or method when the source contains enough detail.
+- Produce 6-12 high-value claims distributed across method, results and limitations when supported.
+- Use arrays of named objects for components, experiment settings and results so the rendered
+  page remains readable. Use "论文未明确报告" for a genuinely absent limitation; do not guess.
 
 Return this exact JSON shape:
-{{
-  "paper_page": {{
+{
+  "paper_page": {
     "candidate_type": "paper_page",
     "page_type": "PaperPage",
     "title": "...",
     "aliases": [],
     "summary": "...",
-    "content_json": {{
-      "schema_version": "paper-wiki-v1",
+    "content_json": {
+      "schema_version": "paper-wiki-v2",
       "compile_status": "llm_refined",
-      "problem": "",
-      "key_idea": "",
-      "method": "",
-      "results": "",
+      "paper_type": "empirical/system/theory/survey/other",
+      "research_problem": "",
+      "motivation": "",
+      "contributions": [""],
+      "method_overview": "",
+      "method_components": [{"name":"", "purpose":"", "mechanism":"", "details":""}],
+      "execution_flow": [""],
+      "experiment_setup": [{"name":"Datasets / Models / Baselines / Metrics / Hardware", "details":""}],
+      "key_results": [{"finding":"", "evidence":"", "conditions":"", "table_id":""}],
+      "selected_table_ids": ["tbl-..."],
+      "figure_notes": [{"figure_id":"fig-...", "description":"", "trend":"", "conditions":"", "key_values":[]}],
+      "ablations": [{"factor":"", "finding":"", "implication":"", "table_id":""}],
       "limitations": "",
-      "key_takeaways": [],
+      "comparison_to_prior_work": "",
+      "key_takeaways": [""],
       "interview_notes": [],
       "notes": ""
-    }},
-    "claims": [{{
+    },
+    "claims": [{
       "claim": "...",
       "subject": "the knowledge entity being discussed",
       "aspect": "the specific property being asserted",
       "predicate": "requires / improves / uses / equals / ...",
       "value": "normalized value when applicable",
-      "scope": {{"version": "", "model": "", "dataset": "", "task": "", "setting": ""}},
+      "scope": {"version": "", "model": "", "dataset": "", "task": "", "setting": ""},
       "qualifiers": [],
       "evidence": "...",
       "section_id": "...",
       "page_start": 0,
       "evidence_ids": ["ev-..."]
-    }}],
+    }],
     "related_topics": [],
     "source_level": "primary"
-  }},
+  }
+}
+
+Paper title: __TITLE__
+
+Source packet (section IDs and artifact IDs are authoritative):
+__SOURCE_CONTEXT__
+"""
+
+
+TOPIC_PROMPT = """\
+You create reusable TopicPage candidates from a compiled paper page. Return JSON only.
+Write explanations in Simplified Chinese while preserving technical names in their original language.
+Create 0-4 cards. Create a card only for a durable concept or method that future papers can extend;
+do not split incidental paper details into separate cards. Every claim must reuse source-grounded
+evidence and section IDs from the compiled paper. Do not invent facts.
+
+Return:
+{
   "knowledge_cards": [
-    {{
+    {
       "candidate_type": "concept_card",
       "page_type": "TopicPage",
       "title": "...",
       "aliases": ["..."],
       "summary": "...",
-      "content_json": {{
-        "schema_version": "paper-wiki-v1",
+      "content_json": {
+        "schema_version": "topic-wiki-v1",
         "compile_status": "llm_refined",
         "definition": "",
         "mechanism": "",
@@ -99,31 +126,45 @@ Return this exact JSON shape:
         "findings": "",
         "limitations": "",
         "key_takeaways": []
-      }},
-      "claims": [{{
+      },
+      "claims": [{
         "claim": "...",
         "subject": "the card concept or method",
         "aspect": "the specific property being asserted",
         "predicate": "requires / improves / uses / equals / ...",
         "value": "normalized value when applicable",
-        "scope": {{"version": "", "model": "", "dataset": "", "task": "", "setting": ""}},
+        "scope": {"version": "", "model": "", "dataset": "", "task": "", "setting": ""},
         "qualifiers": [],
         "evidence": "...",
         "section_id": "...",
         "page_start": 0,
         "evidence_ids": ["ev-..."]
-      }}],
+      }],
       "related_topics": [],
       "source_level": "primary"
-    }}
+    }
   ]
-}}
+}
 
-Paper title: {title}
-Abstract: {abstract}
+Compiled paper page:
+__PAPER_PAGE__
+"""
 
-Source sections:
-{sections}
+
+REVISION_PROMPT = """\
+You are revising a PaperWiki page that failed deterministic coverage checks.
+Return the complete paper_page JSON object in the same paper-wiki-v2 schema.
+Fix every listed issue using only the supplied source. Preserve correct detail and evidence.
+Do not invent missing facts, numbers, tables, figures or limitations.
+
+Coverage issues:
+__ISSUES__
+
+Current candidate:
+__CANDIDATE__
+
+Source:
+__SOURCE_CONTEXT__
 """
 
 
@@ -136,7 +177,8 @@ class PaperDistiller:
         candidates = self._llm_distill(packet) if self.llm else []
         if not candidates:
             candidates = self._fallback_candidates(packet)
-        candidates.extend(self._seed_reusable_candidates(packet))
+        for candidate in candidates:
+            self._attach_source_artifacts(candidate, packet)
         deduped = self._dedupe_candidates(candidates)
         for candidate in deduped:
             candidate.source_packet_id = packet.source_id
@@ -150,25 +192,79 @@ class PaperDistiller:
         return deduped
 
     def _llm_distill(self, packet: SourcePacket) -> list[DistilledCandidate]:
-        prompt = DISTILL_PROMPT.format(
-            title=packet.title,
-            abstract=sanitize_wiki_text(packet.abstract)[:1200],
-            sections=self._sections_for_prompt(packet),
-        )
+        source_context = self._source_context_for_prompt(packet)
+        prompt = PAPER_PAGE_PROMPT.replace("__TITLE__", packet.title).replace("__SOURCE_CONTEXT__", source_context)
         try:
-            raw = invoke_structured(self.llm, prompt, temperature=0.0, max_tokens=4500)
+            raw = invoke_structured(
+                self.llm,
+                prompt,
+                temperature=0.0,
+                max_tokens=int(os.getenv("PAPERWIKI_PAPER_OUTPUT_TOKENS", "12000")),
+            )
         except Exception as exc:
             print(f"[paper_pipeline.distiller] LLM distill failed: {exc}")
             return []
         payload = parse_json_object(raw)
         if not payload:
             return []
-        candidates = []
         paper = payload.get("paper_page")
-        if isinstance(paper, dict):
-            candidate = self._candidate_from_payload(paper)
-            if candidate:
-                candidates.append(candidate)
+        candidate = self._candidate_from_payload(paper) if isinstance(paper, dict) else None
+        if not candidate:
+            return []
+        self._attach_source_artifacts(candidate, packet)
+
+        issues = paper_coverage_issues(candidate, packet)
+        if issues:
+            revised = self._revise_paper(candidate, packet, source_context, issues)
+            if revised:
+                self._attach_source_artifacts(revised, packet)
+                if len(paper_coverage_issues(revised, packet)) <= len(issues):
+                    candidate = revised
+
+        return [candidate] + self._llm_topic_candidates(candidate)
+
+    def _revise_paper(
+        self,
+        candidate: DistilledCandidate,
+        packet: SourcePacket,
+        source_context: str,
+        issues: list[str],
+    ) -> DistilledCandidate | None:
+        prompt = (
+            REVISION_PROMPT
+            .replace("__ISSUES__", "\n".join(f"- {issue}" for issue in issues))
+            .replace("__CANDIDATE__", _candidate_prompt_json(candidate))
+            .replace("__SOURCE_CONTEXT__", source_context)
+        )
+        try:
+            raw = invoke_structured(
+                self.llm,
+                prompt,
+                temperature=0.0,
+                max_tokens=int(os.getenv("PAPERWIKI_PAPER_OUTPUT_TOKENS", "12000")),
+            )
+        except Exception as exc:
+            print(f"[paper_pipeline.distiller] Paper coverage revision failed: {exc}")
+            return None
+        payload = parse_json_object(raw) or {}
+        item = payload.get("paper_page") if isinstance(payload.get("paper_page"), dict) else payload
+        revised = self._candidate_from_payload(item) if isinstance(item, dict) else None
+        return revised if revised and revised.candidate_type == "paper_page" else None
+
+    def _llm_topic_candidates(self, paper: DistilledCandidate) -> list[DistilledCandidate]:
+        prompt = TOPIC_PROMPT.replace("__PAPER_PAGE__", _candidate_prompt_json(paper, include_artifacts=False))
+        try:
+            raw = invoke_structured(
+                self.llm,
+                prompt,
+                temperature=0.0,
+                max_tokens=int(os.getenv("PAPERWIKI_TOPIC_OUTPUT_TOKENS", "4500")),
+            )
+        except Exception as exc:
+            print(f"[paper_pipeline.distiller] Topic distill failed: {exc}")
+            return []
+        payload = parse_json_object(raw) or {}
+        candidates = []
         for item in payload.get("knowledge_cards") or []:
             if not isinstance(item, dict):
                 continue
@@ -373,45 +469,254 @@ class PaperDistiller:
                 alias_index[key] = new_index
         return deduped
 
+    def _attach_source_artifacts(self, candidate: DistilledCandidate, packet: SourcePacket) -> None:
+        """Resolve model-selected IDs and attach exact parser output.
+
+        The LLM chooses relevance and writes explanations. Python owns identity
+        and bytes: table cells are copied from SourceTable.markdown verbatim, so
+        no model transcription can change a metric.
+        """
+        if candidate.candidate_type != "paper_page":
+            return
+        content = candidate.content_json
+        requested = content.get("selected_table_ids") or []
+        if isinstance(requested, str):
+            requested = re.findall(r"tbl-[0-9a-z-]+", requested, flags=re.IGNORECASE)
+        table_map = {table.table_id: table for table in packet.tables}
+        selected = [str(value) for value in requested if str(value) in table_map]
+        if not selected and packet.tables:
+            selected = [table.table_id for table in _rank_key_tables(packet.tables)]
+        selected = list(dict.fromkeys(selected))[: int(os.getenv("PAPERWIKI_MAX_CARD_TABLES", "5"))]
+        content["selected_table_ids"] = selected
+        content["key_tables"] = [
+            {
+                "table_id": table_id,
+                "caption": table_map[table_id].caption,
+                "section": " / ".join(table_map[table_id].section_path),
+                "page": table_map[table_id].page,
+                "markdown": table_map[table_id].markdown,
+            }
+            for table_id in selected
+        ]
+
+        figure_map = {str(item.get("figure_id") or ""): item for item in packet.figures if isinstance(item, dict)}
+        requested_notes = content.get("figure_notes") or []
+        if isinstance(requested_notes, dict):
+            requested_notes = [requested_notes]
+        notes = []
+        for item in requested_notes:
+            if not isinstance(item, dict):
+                continue
+            figure_id = str(item.get("figure_id") or "")
+            source = figure_map.get(figure_id)
+            if not source:
+                continue
+            notes.append(_resolved_figure_note(source, item))
+        if not notes and figure_map:
+            for source in list(figure_map.values())[: int(os.getenv("PAPERWIKI_MAX_CARD_FIGURES", "6"))]:
+                notes.append(_resolved_figure_note(source, {}))
+        content["figure_notes"] = notes[: int(os.getenv("PAPERWIKI_MAX_CARD_FIGURES", "6"))]
+
+    @staticmethod
+    def _source_context_for_prompt(packet: SourcePacket) -> str:
+        return build_source_context(packet)
+
     @staticmethod
     def _sections_for_prompt(packet: SourcePacket) -> str:
-        parts = []
-        preferred = []
-        remaining = []
-        for section in packet.sections:
-            heading = (section.heading or "").lower()
-            text = (section.text or "").lower()
-            if any(key in heading for key in ("abstract", "introduction", "method", "approach", "experiment", "result", "conclusion")):
-                preferred.append(section)
-            elif any(key in text[:500] for key in ("difficulty", "hidden representation", "probe", "probing", "experiment", "result")):
-                preferred.append(section)
-            else:
-                remaining.append(section)
-        for section in (preferred + remaining)[:6]:
-            text = sanitize_wiki_text(section.text)
-            if not text:
-                continue
-            parts.append(
-                f"[section_id={section.section_id}; heading={section.heading}; page={section.page_start}; evidence_ids={','.join(section.evidence_ids)}]\n{text[:1000]}"
-            )
-        for table in packet.tables[:4]:
-            cell_refs = ",".join(cell.cell_id for cell in table.cells[:80])
-            section = " / ".join(table.section_path)
-            parts.append(
-                f"[table_id={table.table_id}; heading={section}; page={table.page}; "
-                f"element_id={table.element_id}; cell_ids={cell_refs}]\n"
-                f"Caption: {table.caption}\n{table.markdown[:2200]}"
-            )
-        for element in packet.elements:
-            if element.element_type not in {"figure", "formula"}:
-                continue
-            parts.append(
-                f"[element_id={element.element_id}; type={element.element_type}; page={element.page}; "
-                f"heading={' / '.join(element.heading_path)}]\n{element.caption or element.text}"
-            )
-            if len(parts) >= 12:
-                break
-        return "\n\n---\n\n".join(parts)[:10500]
+        """Compatibility wrapper for callers/tests using the old helper name."""
+        return build_source_context(packet)
+
+
+def build_source_context(packet: SourcePacket) -> str:
+    """Build a token-budgeted, section-balanced view of the complete paper."""
+    counter = default_counter()
+    budget = max(16_000, int(os.getenv("PAPERWIKI_PAPER_INPUT_TOKENS", "320000")))
+    outline = "\n".join(
+        f"- section_id={section.section_id}; heading={section.heading}; page={section.page_start or 'unknown'}"
+        for section in packet.sections
+    )
+    section_parts = []
+    section_weights = []
+    for section in packet.sections:
+        text = sanitize_wiki_text(section.text)
+        if not text:
+            continue
+        evidence_ids = section.evidence_ids[:24]
+        evidence_suffix = f" (+{len(section.evidence_ids) - 24} more)" if len(section.evidence_ids) > 24 else ""
+        section_parts.append(
+            f"[SECTION section_id={section.section_id}; heading={section.heading}; "
+            f"page={section.page_start or 'unknown'}; evidence_ids={','.join(evidence_ids)}{evidence_suffix}]\n{text}"
+        )
+        section_weights.append(_section_weight(section.heading))
+
+    if not section_parts and packet.raw_source_path:
+        raw = _strip_source_frontmatter(get_object_storage().read_text(packet.raw_source_path))
+        if raw:
+            section_parts = [f"[SECTION section_id=full-paper; heading={packet.title}; page=unknown]\n{raw}"]
+            section_weights = [1.0]
+
+    artifact_parts = []
+    for table in packet.tables:
+        artifact_parts.append(
+            f"[TABLE table_id={table.table_id}; heading={' / '.join(table.section_path)}; "
+            f"page={table.page or 'unknown'}; element_id={table.element_id}]\n"
+            f"Caption: {table.caption or '(caption unavailable)'}\n{table.markdown}"
+        )
+    for figure in packet.figures:
+        if not isinstance(figure, dict):
+            continue
+        artifact_parts.append(
+            f"[FIGURE figure_id={figure.get('figure_id', '')}; heading={' / '.join(figure.get('section_path') or [])}; "
+            f"page={figure.get('page') or 'unknown'}; asset={figure.get('asset_path', '')}]\n"
+            f"Caption: {figure.get('caption') or '(caption unavailable)'}\n"
+            f"Nearby paper discussion: {figure.get('source_text') or '(unavailable)'}"
+        )
+
+    header = (
+        f"Title: {packet.title}\nAbstract: {sanitize_wiki_text(packet.abstract)}\n\n"
+        f"Complete section outline:\n{outline or '- unavailable'}"
+    )
+    full = "\n\n---\n\n".join([header] + section_parts + artifact_parts)
+    if counter.count(full) <= budget:
+        return full
+
+    separator_cost = counter.count("\n\n---\n\n")
+    remaining = max(0, budget - counter.count(header) - separator_cost * (len(section_parts) + len(artifact_parts)))
+    artifact_need = sum(counter.count(part) for part in artifact_parts)
+    artifact_budget = min(artifact_need, max(2_000, int(remaining * 0.30))) if artifact_parts else 0
+    section_budget = max(0, remaining - artifact_budget)
+    clipped_sections = _fit_weighted_parts(section_parts, section_weights, section_budget, counter)
+    clipped_artifacts = _fit_weighted_parts(artifact_parts, [1.0] * len(artifact_parts), artifact_budget, counter)
+    return "\n\n---\n\n".join([header] + clipped_sections + clipped_artifacts)
+
+
+def _fit_weighted_parts(parts: list[str], weights: list[float], budget: int, counter) -> list[str]:
+    if not parts or budget <= 0:
+        return []
+    total_weight = sum(weights) or float(len(parts))
+    allocations = [max(160, int(budget * weight / total_weight)) for weight in weights]
+    # If minimum allocations overshoot, equal-share every item so the complete
+    # outline still has a corresponding source excerpt.
+    if sum(allocations) > budget:
+        allocations = [max(32, budget // len(parts))] * len(parts)
+    fitted = [counter.clip(part, allocation) for part, allocation in zip(parts, allocations)]
+    while counter.count("\n\n---\n\n".join(fitted)) > budget and any(fitted):
+        largest = max(range(len(fitted)), key=lambda index: counter.count(fitted[index]))
+        current = counter.count(fitted[largest])
+        fitted[largest] = counter.clip(fitted[largest], max(0, current - 128))
+    return [part for part in fitted if part]
+
+
+def _section_weight(heading: str) -> float:
+    heading = (heading or "").lower()
+    if any(key in heading for key in (
+        "method", "approach", "system", "architecture", "implement", "experiment",
+        "evaluation", "result", "analysis", "ablation", "discussion", "limitation",
+        "conclusion", "方法", "实验", "结果", "消融", "限制",
+    )):
+        return 3.0
+    if any(key in heading for key in ("abstract", "introduction", "background", "related", "摘要", "引言")):
+        return 2.0
+    return 1.0
+
+
+def _strip_source_frontmatter(markdown: str) -> str:
+    text = str(markdown or "")
+    if text.startswith("---"):
+        match = re.match(r"^---\s*\n.*?\n---\s*\n", text, flags=re.DOTALL)
+        if match:
+            return text[match.end():]
+    return text
+
+
+def _rank_key_tables(tables: list[Any]) -> list[Any]:
+    keywords = (
+        "main result", "comparison", "performance", "accuracy", "throughput", "latency",
+        "quality", "benchmark", "ablation", "perplexity", "memory", "speedup",
+        "主要结果", "对比", "性能", "准确率", "吞吐", "延迟", "消融",
+    )
+
+    def score(table: Any) -> tuple[int, int]:
+        text = f"{table.caption} {' '.join(table.section_path)} {table.markdown[:1200]}".lower()
+        keyword_score = sum(5 for keyword in keywords if keyword in text)
+        size_score = min(8, len(table.rows)) + min(5, len(table.headers[-1]) if table.headers else 0)
+        return keyword_score + size_score, len(table.markdown)
+
+    limit = int(os.getenv("PAPERWIKI_DEFAULT_CARD_TABLES", "3"))
+    return sorted(tables, key=score, reverse=True)[: max(1, limit)]
+
+
+def _resolved_figure_note(source: dict[str, Any], proposed: dict[str, Any]) -> dict[str, Any]:
+    caption = sanitize_wiki_text(str(source.get("caption") or ""))
+    source_text = sanitize_wiki_text(str(source.get("source_text") or ""))
+    description = sanitize_wiki_text(str(proposed.get("description") or ""))
+    if not description:
+        description = caption or source_text or "MinerU 提取到该图，但论文文本未提供足够描述。"
+    return {
+        "figure_id": str(source.get("figure_id") or ""),
+        "caption": caption,
+        "section": " / ".join(source.get("section_path") or []),
+        "page": int(source.get("page") or 0),
+        "asset_path": str(source.get("asset_path") or ""),
+        "description": description,
+        "trend": sanitize_wiki_text(str(proposed.get("trend") or "")),
+        "conditions": sanitize_wiki_text(str(proposed.get("conditions") or "")),
+        "key_values": [
+            sanitize_wiki_text(str(value)) for value in proposed.get("key_values") or [] if str(value).strip()
+        ],
+        "source_text": source_text,
+    }
+
+
+def paper_coverage_issues(candidate: DistilledCandidate, packet: SourcePacket | None = None) -> list[str]:
+    """Deterministic completeness gate for the richer PaperPage schema."""
+    content = candidate.content_json or {}
+    if candidate.candidate_type != "paper_page" or content.get("schema_version") != "paper-wiki-v2":
+        return []
+    issues = []
+    paper_type = str(content.get("paper_type") or "").lower()
+    required_text = {
+        "research_problem": 80,
+        "motivation": 60,
+        "method_overview": 120,
+    }
+    if packet and any(
+        any(term in (section.heading or "").lower() for term in ("related", "background", "prior work", "相关工作", "背景"))
+        for section in packet.sections
+    ):
+        required_text["comparison_to_prior_work"] = 60
+    for key, minimum in required_text.items():
+        if len(sanitize_wiki_text(str(content.get(key) or ""))) < minimum:
+            issues.append(f"{key} is missing or too shallow (minimum {minimum} characters)")
+    for key, minimum in (("contributions", 2), ("key_takeaways", 3)):
+        value = content.get(key)
+        if not isinstance(value, list) or len([item for item in value if item not in (None, "", {})]) < minimum:
+            issues.append(f"{key} needs at least {minimum} substantive items")
+    empirical = bool(packet and packet.tables) or paper_type in {"empirical", "system"}
+    if empirical:
+        for key, minimum in (("method_components", 2), ("execution_flow", 3)):
+            value = content.get(key)
+            if not isinstance(value, list) or len([item for item in value if item not in (None, "", {})]) < minimum:
+                issues.append(f"empirical/system paper {key} needs at least {minimum} substantive items")
+        if not isinstance(content.get("experiment_setup"), list) or not content.get("experiment_setup"):
+            issues.append("empirical/system paper needs experiment_setup")
+        if not isinstance(content.get("key_results"), list) or len(content.get("key_results") or []) < 2:
+            issues.append("empirical/system paper needs at least two key_results")
+    if packet and packet.tables and not content.get("key_tables"):
+        issues.append("source contains tables but no exact key_tables were attached")
+    if packet and packet.figures and not content.get("figure_notes"):
+        issues.append("source contains figures but no figure_notes were attached")
+    return issues
+
+
+def _candidate_prompt_json(candidate: DistilledCandidate, *, include_artifacts: bool = True) -> str:
+    payload = candidate.model_dump() if hasattr(candidate, "model_dump") else candidate.dict()
+    if not include_artifacts:
+        content = dict(payload.get("content_json") or {})
+        content.pop("key_tables", None)
+        content.pop("figure_notes", None)
+        payload["content_json"] = content
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def _best_evidence(packet: SourcePacket) -> dict[str, Any]:

@@ -170,10 +170,14 @@ def parse_frontmatter(raw: str) -> dict[str, Any]:
 
 
 def parse_sections(body: str) -> dict[str, str]:
+    # Audit snapshots live between user-facing sections as HTML comments. They
+    # must be parsed separately by parse_system_metadata, never absorbed into
+    # the preceding prose/list field during a reindex-and-rewrite cycle.
+    body = re.sub(r"<!--\s*wiki-(?:system|claim)\s+\{.*?\}\s*-->", "", body or "", flags=re.DOTALL)
     sections: dict[str, str] = {}
     current = ""
     buffer: list[str] = []
-    for line in (body or "").replace("\r\n", "\n").splitlines():
+    for line in body.replace("\r\n", "\n").splitlines():
         match = re.match(r"^##\s+(.+?)\s*$", line)
         if match:
             if current:

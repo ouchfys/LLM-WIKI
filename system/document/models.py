@@ -14,6 +14,7 @@ class ParsedDocument:
     metadata: dict[str, Any] = field(default_factory=dict)
     blocks: list[dict[str, Any]] = field(default_factory=list)
     elements: list[dict[str, Any]] = field(default_factory=list)
+    figures: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
     parser: str = ""
     # Optional lossless provider artifact. The legacy database column that
@@ -29,6 +30,7 @@ class ParsedDocument:
             "blocks": self.blocks,
             "markdown": self.markdown,
             "elements": self.elements,
+            "figures": self.figures,
             "tables": self.tables,
             "source_document": self.source_document,
             "parser_used": self.parser or self.metadata.get("parser", "unknown"),

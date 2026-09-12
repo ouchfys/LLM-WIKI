@@ -53,9 +53,13 @@ class MinerUParser:
             result = self._wait_batch(batch_id, path.name)
         archive = self._download_archive(str(result.get("full_zip_url") or ""))
         markdown, provider_metadata = _read_archive(archive)
+        provider_figures = provider_metadata.pop("_figures", [])
+        provider_tables = provider_metadata.pop("_tables", [])
         if len(markdown.strip()) < 1000:
             raise MinerUError("MinerU result did not contain a usable full.md")
         parsed = _from_markdown(markdown, source_key=source_key, source_path=str(path))
+        parsed.figures = _merge_provider_figures(parsed.figures, provider_figures, source_key)
+        _enrich_tables(parsed.tables, provider_tables)
         parsed.metadata.update({
             "parser": "mineru-vlm",
             "processing_time_s": round(time.perf_counter() - started, 3),
@@ -191,7 +195,182 @@ def _read_archive(content: bytes) -> tuple[str, dict[str, Any]]:
     preferred = next((item for item in markdown_files if Path(item.filename).name == "full.md"), None)
     selected = preferred or max(markdown_files, key=lambda item: item.file_size)
     markdown = bundle.read(selected).decode("utf-8", errors="replace")
-    return markdown, {"archive_files": len(members), "markdown_file": selected.filename}
+    image_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+    image_files = [
+        {"path": item.filename, "size": item.file_size}
+        for item in members
+        if Path(item.filename).suffix.lower() in image_suffixes
+    ]
+    provider_figures, provider_tables = _content_list_artifacts(bundle, members)
+    return markdown, {
+        "archive_files": len(members),
+        "markdown_file": selected.filename,
+        # Keep an asset manifest for replay/audit without extracting the ZIP
+        # into the repository. Figure descriptions are compiled from the
+        # caption and nearby paper text below.
+        "image_files": image_files[:2000],
+        # Internal handoff to parse_file; popped before provider metadata is
+        # persisted in the source packet.
+        "_figures": provider_figures,
+        "_tables": provider_tables,
+    }
+
+
+def _content_list_artifacts(bundle: zipfile.ZipFile, members: list[zipfile.ZipInfo]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    content_file = next(
+        (
+            item for item in members
+            if Path(item.filename).name.lower() == "content_list.json"
+            or (
+                Path(item.filename).name.lower().endswith("_content_list.json")
+                and not Path(item.filename).name.lower().endswith("_content_list_v2.json")
+            )
+        ),
+        None,
+    )
+    if not content_file or content_file.file_size > 128 * 1024 * 1024:
+        return [], []
+    try:
+        payload = json.loads(bundle.read(content_file).decode("utf-8", errors="replace"))
+    except (ValueError, KeyError):
+        return [], []
+    items = payload if isinstance(payload, list) else payload.get("content_list", []) if isinstance(payload, dict) else []
+    figures, tables = [], []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or item.get("block_type") or "").lower()
+        page = int(item.get("page_idx") or item.get("page") or 0)
+        if "page_idx" in item:
+            page += 1
+        if kind in {"image", "figure"}:
+            figures.append({
+                "asset_path": str(item.get("img_path") or item.get("image_path") or ""),
+                "caption": _join_provider_text(item.get("image_caption") or item.get("caption")),
+                "source_text": _join_provider_text(
+                    item.get("image_footnote") or item.get("footnote") or item.get("text")
+                ),
+                "page": page,
+            })
+        elif kind == "table":
+            tables.append({
+                "caption": _clean_table_caption(item.get("table_caption") or item.get("caption")),
+                "page": page,
+                "body": str(item.get("table_body") or item.get("body") or ""),
+            })
+    return figures, tables
+
+
+def _join_provider_text(value: Any) -> str:
+    if isinstance(value, list):
+        return " ".join(" ".join(str(item).split()) for item in value if str(item).strip())
+    return " ".join(str(value or "").split())
+
+
+def _clean_table_caption(value: Any) -> str:
+    """Keep one numbered caption when MinerU groups adjacent captions."""
+    text = _join_provider_text(value)
+    matches = list(re.finditer(r"\bTable\s+\d+[A-Za-z]?\b", text, flags=re.IGNORECASE))
+    if len(matches) >= 2:
+        text = text[:matches[1].start()]
+    return text.strip()
+
+
+def _merge_provider_figures(
+    markdown_figures: list[dict[str, Any]],
+    provider_figures: list[dict[str, Any]],
+    source_key: str,
+) -> list[dict[str, Any]]:
+    merged = [dict(item) for item in markdown_figures]
+    by_asset = {str(item.get("asset_path") or "").replace("\\", "/"): item for item in merged}
+    for index, provider in enumerate(provider_figures):
+        asset = str(provider.get("asset_path") or "").replace("\\", "/")
+        target = by_asset.get(asset) if asset else (merged[index] if index < len(merged) else None)
+        if target is None:
+            ref = f"mineru/figure/provider/{index}"
+            element_id = stable_evidence_id(source_key, "figure", ref, index)
+            target = {
+                "figure_id": f"fig-{element_id[3:]}",
+                "element_id": element_id,
+                "asset_path": asset,
+                "caption": "",
+                "section_path": [],
+                "page": 0,
+                "source_text": "",
+                "metadata": {"source_locator_kind": "mineru_content_list", "source_ref": ref},
+            }
+            merged.append(target)
+            if asset:
+                by_asset[asset] = target
+        if provider.get("caption"):
+            target["caption"] = provider["caption"]
+        if provider.get("source_text"):
+            target["source_text"] = " ".join(
+                value for value in (str(target.get("source_text") or ""), str(provider["source_text"])) if value
+            )[:2400]
+        if provider.get("page"):
+            target["page"] = int(provider["page"])
+    return merged
+
+
+def _enrich_tables(tables: list[dict[str, Any]], provider_tables: list[dict[str, Any]]) -> None:
+    raw_captions = [str(table.get("caption") or "") for table in tables]
+    provider_numbers = {
+        number
+        for provider in provider_tables
+        if (number := _caption_number(str(provider.get("caption") or "")))
+    }
+    orphan_captions = [
+        caption for caption in raw_captions
+        if (number := _caption_number(caption)) and number not in provider_numbers
+    ]
+    unused = set(range(len(provider_tables)))
+    equal_counts = len(tables) == len(provider_tables)
+    missing_caption_targets = []
+    for index, table in enumerate(tables):
+        table_tokens = _table_tokens(str(table.get("markdown") or ""))
+        scored = []
+        for provider_index in unused:
+            body = str(provider_tables[provider_index].get("body") or "")
+            provider_tokens = _table_tokens(body)
+            if not table_tokens or not provider_tokens:
+                continue
+            overlap = len(table_tokens & provider_tokens) / max(1, min(len(table_tokens), len(provider_tokens)))
+            scored.append((overlap, provider_index))
+        best_score, best_index = max(scored, default=(0.0, -1))
+        if best_score < 0.35:
+            # Older MinerU bundles may omit table_body. Positional fallback is
+            # safe only when both sequences have identical lengths.
+            best_index = index if equal_counts and index in unused else -1
+        if best_index < 0:
+            continue
+        unused.discard(best_index)
+        provider = provider_tables[best_index]
+        if provider.get("caption"):
+            table["caption"] = provider["caption"]
+        else:
+            missing_caption_targets.append(table)
+        if provider.get("page"):
+            table["page"] = int(provider["page"])
+            for cell in table.get("cells") or []:
+                cell["page"] = int(provider["page"])
+    # MinerU occasionally emits a table body before another table's caption.
+    # content_list still identifies the bodies correctly but can omit one
+    # caption. An otherwise-unused numbered caption can then be paired with the
+    # only content-matched table that lacks one.
+    if len(orphan_captions) == len(missing_caption_targets):
+        for table, caption in zip(missing_caption_targets, orphan_captions):
+            table["caption"] = caption
+
+
+def _table_tokens(value: str) -> set[str]:
+    text = BeautifulSoup(value or "", "html.parser").get_text(" ", strip=True).lower()
+    return set(re.findall(r"[a-z][a-z0-9_.-]+|\d+(?:\.\d+)?|[\u4e00-\u9fff]{2,}", text))
+
+
+def _caption_number(value: str) -> str:
+    match = re.search(r"\bTable\s+(\d+[A-Za-z]?)\b", value or "", flags=re.IGNORECASE)
+    return match.group(1).lower() if match else ""
 
 
 def _from_markdown(markdown: str, *, source_key: str, source_path: str) -> ParsedDocument:
@@ -200,6 +379,7 @@ def _from_markdown(markdown: str, *, source_key: str, source_path: str) -> Parse
     blocks = _markdown_blocks(markdown, source_path)
     elements = elements_from_blocks(blocks, source_key)
     tables = _html_tables(markdown, source_key)
+    figures = _markdown_figures(markdown, source_key)
     abstract = ""
     abstract_match = re.search(r"(?:^|\n)#{1,4}\s*Abstract\s*\n(.+?)(?=\n#{1,4}\s|\Z)", markdown, re.I | re.S)
     if abstract_match:
@@ -211,6 +391,7 @@ def _from_markdown(markdown: str, *, source_key: str, source_path: str) -> Parse
         metadata={},
         blocks=blocks,
         elements=elements,
+        figures=figures,
         tables=tables,
     )
 
@@ -225,19 +406,82 @@ def _markdown_blocks(markdown: str, source_path: str) -> list[dict[str, Any]]:
         heading = re.match(r"^#{1,6}\s+(.+)", part)
         if heading:
             current_section = heading.group(1).strip()
+        image = re.search(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)", part)
         blocks.append({
             "page": 0,
             "section": current_section,
-            "block_type": "heading" if heading else "text",
-            "text": part[:6000],
+            "block_type": "heading" if heading else ("figure" if image else "text"),
+            "text": part,
+            "caption": _figure_caption(part, image.group(1) if image else "") if image else "",
             "metadata": {"source": source_path, "source_ref": f"mineru/{index}", "heading_path": [current_section]},
         })
     return blocks
 
 
+def _markdown_figures(markdown: str, source_key: str) -> list[dict[str, Any]]:
+    """Turn MinerU image references into text-grounded figure records.
+
+    The chat model used by the compiler is text-only. We therefore preserve the
+    asset locator and give it the caption plus nearby author-written discussion;
+    the compiler prompt explicitly forbids guessing unseen visual values.
+    """
+    pattern = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
+    figures: list[dict[str, Any]] = []
+    for index, match in enumerate(pattern.finditer(markdown or "")):
+        before = markdown[:match.start()]
+        after = markdown[match.end():]
+        headings = list(re.finditer(r"^#{1,6}\s+(.+?)\s*$", before, re.MULTILINE))
+        section = headings[-1].group(1).strip() if headings else "Body"
+        before_nearby = before[-900:]
+        after_nearby = after[:1200]
+        nearby = (before_nearby + "\n" + after_nearby).strip()
+        nearby = pattern.sub("", nearby)
+        caption = (
+            _figure_caption(after_nearby)
+            or _figure_caption("", match.group(1))
+            or _figure_caption(before_nearby)
+        )
+        source_text = _figure_context(nearby, caption)
+        ref = f"mineru/figure/{index}"
+        element_id = stable_evidence_id(source_key, "figure", ref, index)
+        figures.append({
+            "figure_id": f"fig-{element_id[3:]}",
+            "element_id": element_id,
+            "asset_path": match.group(2).strip(),
+            "caption": caption,
+            "section_path": [section],
+            "page": 0,
+            "source_text": source_text,
+            "metadata": {"source_locator_kind": "mineru_block", "source_ref": ref},
+        })
+    return figures
+
+
+def _figure_caption(text: str, alt: str = "") -> str:
+    caption = re.search(
+        r"(?:^|\n)\s*((?:Figure|Fig\.?|图)\s*[A-Za-z0-9.:-]+[^\n]{0,700})",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if caption:
+        return " ".join(caption.group(1).split())
+    alt = " ".join(str(alt or "").split()).strip()
+    return "" if alt.lower() in {"image", "figure", "img"} else alt
+
+
+def _figure_context(text: str, caption: str) -> str:
+    clean = re.sub(r"<[^>]+>", " ", text or "")
+    clean = re.sub(r"^#{1,6}\s+", "", clean, flags=re.MULTILINE)
+    clean = " ".join(clean.split())
+    if caption and clean.startswith(caption):
+        clean = clean[len(caption):].lstrip(" .:：")
+    return clean[:1800]
+
+
 def _html_tables(markdown: str, source_key: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(markdown, "html.parser")
     records = []
+    raw_tables = list(re.finditer(r"<table\b.*?</table>", markdown or "", flags=re.IGNORECASE | re.DOTALL))
     for index, table in enumerate(soup.find_all("table")):
         grid = []
         for row in table.find_all("tr"):
@@ -263,11 +507,19 @@ def _html_tables(markdown: str, source_key: str) -> list[dict[str, Any]]:
                     "page": 0,
                     "bbox": {},
                 })
+        raw_match = raw_tables[index] if index < len(raw_tables) else None
+        raw_start = raw_match.start() if raw_match else -1
+        raw_end = raw_match.end() if raw_match else -1
+        prefix = markdown[:raw_start] if raw_start >= 0 else ""
+        suffix = markdown[raw_end:] if raw_end >= 0 else ""
+        headings = list(re.finditer(r"^#{1,6}\s+(.+?)\s*$", prefix, re.MULTILINE))
+        section = headings[-1].group(1).strip() if headings else ""
+        caption = _table_caption(suffix[:700]) or _table_caption(prefix[-700:])
         records.append({
             "table_id": table_id,
             "element_id": element_id,
-            "caption": "",
-            "section_path": [],
+            "caption": caption,
+            "section_path": [section] if section else [],
             "page": 0,
             "bbox": {},
             "headers": headers,
@@ -278,3 +530,12 @@ def _html_tables(markdown: str, source_key: str) -> list[dict[str, Any]]:
             "metadata": {"source_locator_kind": "mineru_block", "num_rows": len(grid), "num_cols": width},
         })
     return records
+
+
+def _table_caption(text: str) -> str:
+    matches = re.findall(
+        r"(?:^|\n)\s*((?:Table|Tab\.?|表)\s*[A-Za-z0-9.:-]+[^\n]{0,700})",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    return " ".join(matches[-1].split()) if matches else ""

@@ -28,6 +28,7 @@ def extract_paper_source(
             and cached.elements
             and cached.blocks
             and cached.parser_used in {"arxiv-html", "mineru-vlm", "pymupdf-fallback"}
+            and cached.metadata.get("extraction_schema_version") == "paper-source-v5"
         ):
             cached.metadata = {
                 **cached.metadata,
@@ -40,15 +41,32 @@ def extract_paper_source(
     summary = sanitize_wiki_text(parsed.get("summary") or "")
     if not summary:
         summary = _quick_pdf_abstract(pdf_path)
-    metadata = parsed.get("metadata") or {}
+    metadata = dict(parsed.get("metadata") or {})
+    metadata["extraction_schema_version"] = "paper-source-v5"
     blocks = parsed.get("blocks") or []
     source_document = parsed.get("source_document") if isinstance(parsed.get("source_document"), dict) else {}
     normalized_elements = parsed.get("elements") if isinstance(parsed.get("elements"), list) else []
+    normalized_figures = parsed.get("figures") if isinstance(parsed.get("figures"), list) else []
     normalized_tables = parsed.get("tables") if isinstance(parsed.get("tables"), list) else []
     if not normalized_elements:
         normalized_elements = elements_from_blocks(blocks, source_hash)
     else:
         blocks = _blocks_from_elements(normalized_elements, str(pdf_path))
+    if not normalized_figures:
+        normalized_figures = [
+            {
+                "figure_id": f"fig-{str(element.get('element_id') or '')[3:]}",
+                "element_id": str(element.get("element_id") or ""),
+                "asset_path": str((element.get("metadata") or {}).get("asset_path") or ""),
+                "caption": str(element.get("caption") or ""),
+                "section_path": list(element.get("heading_path") or []),
+                "page": int(element.get("page") or 0),
+                "source_text": str(element.get("text") or ""),
+                "metadata": dict(element.get("metadata") or {}),
+            }
+            for element in normalized_elements
+            if str(element.get("element_type") or "") == "figure" and str(element.get("element_id") or "")
+        ]
     raw_markdown = parsed.get("markdown") or _paper_markdown_from_blocks(title, summary, blocks)
     raw_markdown = sanitize_wiki_text(raw_markdown)
     if not raw_markdown:
@@ -93,6 +111,7 @@ def extract_paper_source(
         # parser-neutral and intentionally small.
         docling_json=source_document,
         elements=[SourceElement(**item) for item in normalized_elements],
+        figures=normalized_figures,
         tables=[SourceTable(**item) for item in normalized_tables],
     )
     if store:
@@ -146,14 +165,12 @@ def _sections_from_blocks(
             SourceSection(
                 section_id=section_id,
                 heading=item["heading"],
-                text=text[:6000],
+                text=text,
                 page_start=item["page_start"],
                 page_end=item["page_end"],
                 evidence_ids=item["evidence_ids"],
             )
         )
-        if len(sections) >= 18:
-            break
 
     if len(sections) <= 1 and raw_markdown:
         sections.extend(_sections_from_markdown(raw_markdown, title))
@@ -164,7 +181,7 @@ def _sections_from_markdown(markdown: str, title: str) -> list[SourceSection]:
     text = sanitize_wiki_text(markdown)
     headings = list(re.finditer(r"^#{1,6}\s+(.+?)\s*$", text, re.MULTILINE))
     sections: list[SourceSection] = []
-    for index, match in enumerate(headings[:18]):
+    for index, match in enumerate(headings):
         heading = match.group(1).strip()
         if heading.lower() == title.lower():
             continue
@@ -172,7 +189,7 @@ def _sections_from_markdown(markdown: str, title: str) -> list[SourceSection]:
         end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
         body = text[start:end].strip()
         if body:
-            sections.append(SourceSection(section_id=_section_id(heading), heading=heading, text=body[:6000]))
+            sections.append(SourceSection(section_id=_section_id(heading), heading=heading, text=body))
     return sections
 
 

@@ -5,7 +5,7 @@ from typing import Any
 
 from system.core.llm_call import invoke_structured
 
-from system.wiki.paper_pipeline.distiller import parse_json_object
+from system.wiki.paper_pipeline.distiller import paper_coverage_issues, parse_json_object
 from system.wiki.paper_pipeline.models import DistilledCandidate, ReviewReport
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 from system.wiki.evidence_verifier import EvidenceVerifier
@@ -71,6 +71,8 @@ class PaperReviewAgent:
 
     def review(self, candidate: DistilledCandidate) -> ReviewReport:
         schema_errors = self._schema_errors(candidate)
+        packet = self.pipeline_store.get_source_packet(candidate.source_packet_id) if candidate.source_packet_id else None
+        schema_errors.extend(paper_coverage_issues(candidate, packet))
         preflight_unsupported = self._unsupported_claims(candidate)
         evidence_results = self.evidence_verifier.bind_and_verify_candidate(candidate)
         verifier_unsupported = [

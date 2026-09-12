@@ -480,6 +480,7 @@ def test_markdown_hides_runtime_audit_fields_but_reindexes_them_losslessly() -> 
         summary="A policy optimization method.",
         content_json={
             "definition": "GRPO is a policy optimization method.",
+            "key_takeaways": ["No critic model is required."],
             "claims": [claim],
             "merge_history": [{"action": "update_existing"}],
             "affected_claims": [{"claim_id": "claim-readable", "action": "add_claim"}],
@@ -494,6 +495,8 @@ def test_markdown_hides_runtime_audit_fields_but_reindexes_them_losslessly() -> 
     assert "<!-- wiki-system " in markdown
     parsed_content = content_json_from_sections(parse_markdown_card(markdown))
     assert parsed_content["claims"][0]["scope"] == {"version": "original"}
+    assert parsed_content["key_takeaways"] == ["No critic model is required."]
+    assert all("wiki-system" not in item for item in parsed_content["key_takeaways"])
     assert parsed_content["merge_history"][0]["action"] == "update_existing"
     assert parsed_content["compiler"]["name"] == "hierarchical-claim-compiler"
 
