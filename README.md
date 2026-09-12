@@ -47,6 +47,8 @@ PDF / arXiv URL
 
 Wiki 检索在页面小节上并行执行 FTS5 关键词召回与 Qwen3-Embedding-0.6B 多语言语义召回，再用 RRF 融合。没有额外 Reranker；最终页面选择交给工具调用 Agent。聊天控制器与最终回答使用 DeepSeek 官方 `deepseek-v4-flash`，论文提炼、核验和合并模型可分别配置。
 
+同一规划步骤中的独立只读工具采用最多 3 路有界并发，完成后仍按模型最初的调用顺序归并 Observation。存在数据依赖的读取保持顺序，例如 `wiki_search -> wiki_open -> table_query` 和 `web_search -> web_fetch`；`project_memory_update` 等写操作始终串行。
+
 前端展示实际发生的搜索、页面读取、表格查询和网页访问，不展示模型私有思维链。
 
 ## 为什么它是 Agent 项目
@@ -74,38 +76,30 @@ QUEUED -> EXTRACTING -> DISTILLING -> VERIFYING
 | 类型 | 内容 | 使用方式 |
 | --- | --- | --- |
 | Wiki 知识库 | Markdown 论文页、主题页及来源证据 | 按问题检索和引用 |
-| 项目记忆 | 项目目标、研究方向、约束、决定、失败经验、里程碑和开放问题 | 固定加载 Markdown 小索引，主题文件按需打开 |
-| 用户记忆 | 明确的持续偏好及其原文证据、来源会话和置信度 | 少量固定注入，并同步成人可读的 `preferences.md` |
+| 项目记忆 | 项目目标、研究方向、约束、决定、失败经验、进度和开放问题 | 新会话固定加载 `purpose.md` 与 Agent 维护的 `MEMORY.md` |
+| 用户记忆 | 用户在设置或引导流程中明确保存的持续偏好 | 少量固定注入，并同步成人可读的 `preferences.md` |
 | 会话记录与上下文 | 原始消息、工具观察、压缩摘要 | 构建本次模型请求，支持历史找回 |
 
-项目记忆采用类似 Codex / Claude Code 的渐进式文件结构，而不是给少量个人记忆部署向量数据库：
+项目记忆采用类似 Coding Agent Notes 的轻量文件结构，而不是给个人端记忆部署向量数据库：
 
 ```text
 .paperwiki/memory/
 ├── preferences.md
 └── projects/<project-id>/
     ├── purpose.md
-    ├── MEMORY.md
-    └── topics/
-        ├── goals.md
-        ├── constraints.md
-        ├── decisions.md
-        ├── open-questions.md
-        ├── milestones.md
-        ├── research-direction.md
-        └── failed-attempts.md
+    └── MEMORY.md
 ```
 
-每个新会话固定读取 `purpose.md` 和紧凑的 `MEMORY.md`。当索引表明某个主题与当前问题有关时，工具调用 Agent 使用 `project_memory_open` 打开对应文件。主题文件不会被当作论文证据；论文事实仍然通过 `wiki_search -> wiki_open` 获取。
+每个新会话固定读取 `purpose.md` 和最多 12,000 字符的 `MEMORY.md`。当用户确认了跨会话仍有价值的目标、约束、决定、进度、失败经验或下一步时，Agent 在正常工具循环中调用 `project_memory_update`，提交完整的新版 Markdown。Python只负责项目路径隔离、大小检查和临时文件加 `os.replace` 的原子替换；超限写入会失败，不会静默截断，也不再运行回答后的记忆抽取模型。
 
-回答完成后，同一个 DeepSeek V4 Flash 模型返回结构化 `memory_patches`，判断本轮是否产生了值得跨会话保留的目标、决定或经验。多数普通问答不产生 Patch。Python 检查目标文件、原文依据、置信度、ID、替代关系和作用域，再原子更新 Markdown；SQLite 保留原始消息、结构化记录和事件，作为来源与审计账本。模型不能通过记忆 Patch 修改 Wiki 或任意路径。
+`MEMORY.md` 是可重写的当前项目状态，不是追加式聊天日志。论文事实仍然通过 `wiki_search -> wiki_open` 进入上下文并写入 Wiki；原始消息和 Compact 摘要仍保存在 SQLite。旧版 SQLite 项目记忆表与 topic 文件只作为已有安装的兼容数据，不再进入新对话的写入主路径。
 
 工具规划和最终回答共享有效历史。预算允许时保留全部有效对话；完整请求接近阈值时，先缩减工具观察，再总结早期历史并保留近期原文。工具结果采用类似 DeepSeek Harness 的两级保护：单条模型可见结果超过 50KB 时立即改成头尾预览；上下文达到压缩阈值后，再把超过 8192 字符的旧工具结果压到前 4096＋后 1024。两级处理都不调用模型。
 
 - DeepSeek V4 Flash 默认按 **1M Token** 窗口配置，另可设置应用运行预算。默认约在窗口的 80% 触发整理。
 - 摘要与覆盖边界原子提交到 SQLite 检查点；原始消息和完整工具结果仍保留。每个工具观察携带 `result_id`、原始大小和省略量，模型可调用历史搜索、原文读取，或用 `read_tool_result` 按 offset 分页、按 query 跳到命中文本附近。
-- DeepSeek V4 Flash 自动把多轮追问改写为独立检索问题，并在回答完成后提出结构化项目记忆 Patch；Python 校验证据、作用域、置信度、去重、TTL 和替代关系后提交。
-- `/purpose` 查看项目目标；`/purpose <自然语言要求>` 结合当前会话更新目标；`/purpose 清除` 清空项目目标。普通对话仍会自动维护项目状态和记忆。
+- DeepSeek V4 Flash 自动把多轮追问改写为独立检索问题；需要跨会话保存项目状态时，在同一 Agent 循环中直接更新 `MEMORY.md`，不增加回答后的模型调用。
+- `/purpose` 查看项目目标；`/purpose <自然语言要求>` 结合当前会话更新目标；`/purpose 清除` 清空项目目标。普通对话中的持久项目状态由 `project_memory_update` 工具维护。
 - `/compact` 手动整理会话；普通聊天和自动压缩不会写入 Wiki。
 - `/wiki <沉淀要求>` 将用户指定的讨论沉淀到知识库，保留论文事实、AI 综合和用户洞见的来源区别。
 - 删除会话会同步删除消息、压缩检查点和工具观察；用户记忆与 Wiki 独立管理。

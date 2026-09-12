@@ -1,8 +1,9 @@
-"""Prompt-facing Markdown memory with validated, atomic file updates.
+"""Prompt-facing Markdown project notes with bounded, atomic file updates.
 
-SQLite remains the provenance and event ledger.  These files are the compact,
-human-readable projection injected into model context, so Wiki knowledge never
-shares this namespace.
+``purpose.md`` and ``MEMORY.md`` are the model-facing source of truth.  The
+older SQLite memory tables and topic projections remain readable for existing
+installations, but new chat turns maintain the compact ``MEMORY.md`` directly.
+Wiki knowledge never shares this namespace.
 """
 
 from __future__ import annotations
@@ -63,10 +64,11 @@ MEMORY_TYPE_TO_TOPIC = {
 
 
 class ProjectMemoryFiles:
-    """Materialize and read a small index plus on-demand topic files."""
+    """Read and atomically maintain project-scoped Markdown notes."""
 
     MAX_PURPOSE_CHARS = 12_000
-    MAX_INDEX_CHARS = 12_000
+    MAX_MEMORY_CHARS = 12_000
+    MAX_INDEX_CHARS = MAX_MEMORY_CHARS  # compatibility name for old callers
     MAX_TOPIC_CHARS = 64_000
     MANUAL_NOTES_HEADING = "## Manual notes"
 
@@ -90,7 +92,41 @@ class ProjectMemoryFiles:
             self.write_purpose(project_id, project_name, purpose, updated_at="")
         index_path = directory / "MEMORY.md"
         if not index_path.exists():
-            self._atomic_write(index_path, self._render_index(project_id, project_name, [], ""))
+            self._atomic_write(index_path, self._default_memory(project_name))
+
+    def write_memory(
+        self,
+        project_id: str,
+        project_name: str,
+        content: str,
+    ) -> Path:
+        """Replace the current project's model-managed notes.
+
+        The model owns the prose and sections.  Python owns only path isolation,
+        size limits and atomic replacement.
+        """
+        directory = self.project_dir(project_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        text = str(content or "").replace("\x00", "").strip()
+        if not text:
+            text = self._default_memory(project_name)
+        elif not re.search(r"(?m)^#\s+Project Memory\s*$", text):
+            text = "# Project Memory\n\n" + text
+        if len(text) > self.MAX_MEMORY_CHARS:
+            raise ValueError(
+                f"MEMORY.md exceeds {self.MAX_MEMORY_CHARS} characters; compact it before writing"
+            )
+        text = text.rstrip() + "\n"
+        path = directory / "MEMORY.md"
+        with self._lock:
+            self._atomic_write(path, text)
+        return path
+
+    def read_memory(self, project_id: str) -> str:
+        return self._read_bounded(
+            self.project_dir(project_id) / "MEMORY.md",
+            self.MAX_MEMORY_CHARS,
+        )
 
     def write_purpose(
         self,
@@ -156,10 +192,15 @@ class ProjectMemoryFiles:
                     path,
                     self._render_topic(project_id, topic, spec, topic_records, updated_at, manual_notes),
                 )
-            self._atomic_write(
-                directory / "MEMORY.md",
-                self._render_index(project_id, project_name, records, updated_at),
-            )
+            # Migrate the old generated index once.  Never overwrite a file that
+            # has already become model-managed notes.
+            memory_path = directory / "MEMORY.md"
+            current = self._read_bounded(memory_path, self.MAX_MEMORY_CHARS)
+            if not current or self._is_legacy_index(current):
+                self._atomic_write(
+                    memory_path,
+                    self._render_memory_from_records(project_name, records),
+                )
 
     def sync_preferences(self, preferences: Iterable[Mapping[str, Any]], *, updated_at: str) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -195,10 +236,7 @@ class ProjectMemoryFiles:
         return path
 
     def read_index(self, project_id: str) -> str:
-        return self._read_bounded(
-            self.project_dir(project_id) / "MEMORY.md",
-            self.MAX_INDEX_CHARS,
-        )
+        return self.read_memory(project_id)
 
     def open_topic(self, project_id: str, topic: str) -> Dict[str, str]:
         topic = str(topic or "").strip().lower().removesuffix(".md")
@@ -219,13 +257,72 @@ class ProjectMemoryFiles:
             self.project_dir(project_id) / "purpose.md",
             self.MAX_PURPOSE_CHARS + 4096,
         )
-        index = self.read_index(project_id)
+        memory = self.read_memory(project_id)
         parts = []
         if purpose:
             parts.append("[PROJECT_PURPOSE_FILE]\n" + purpose)
-        if index:
-            parts.append("[PROJECT_MEMORY_INDEX]\n" + index)
+        if memory:
+            parts.append("[PROJECT_MEMORY_FILE]\n" + memory)
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _default_memory(project_name: str) -> str:
+        return (
+            "# Project Memory\n\n"
+            f"> {project_name} 的跨会话工作状态。由 Agent 在任务过程中直接维护。\n\n"
+            "## Current Goal\n\n暂无记录。\n\n"
+            "## Constraints\n\n暂无记录。\n\n"
+            "## Decisions\n\n暂无记录。\n\n"
+            "## Progress\n\n暂无记录。\n\n"
+            "## Failed Attempts\n\n暂无记录。\n\n"
+            "## Open Questions\n\n暂无记录。\n\n"
+            "## Next Steps\n\n暂无记录。\n\n"
+            "## Boundary\n\n"
+            "- 这里只保存跨会话继续项目所需的目标、约束、决定、进度和经验。\n"
+            "- 论文事实、Claim、Evidence 和综述属于 Wiki 知识库。\n"
+            "- 原始聊天与 compact 摘要属于 SQLite 会话记录。\n"
+        )
+
+    @staticmethod
+    def _is_legacy_index(content: str) -> bool:
+        return "跨会话记忆索引" in content or "paperwiki-memory/v1" in content
+
+    def _render_memory_from_records(
+        self,
+        project_name: str,
+        records: List[Dict[str, Any]],
+    ) -> str:
+        active = [item for item in records if str(item.get("status") or "active") == "active"]
+        sections = [
+            ("Current Goal", {"goal"}),
+            ("Constraints", {"constraint"}),
+            ("Decisions", {"decision"}),
+            ("Progress", {"milestone", "topic", "research_direction"}),
+            ("Failed Attempts", {"failed_attempt"}),
+            ("Open Questions", {"open_question"}),
+            ("Next Steps", set()),
+        ]
+        lines = [
+            "# Project Memory", "",
+            f"> {project_name} 的跨会话工作状态。由 Agent 在任务过程中直接维护。", "",
+        ]
+        for title, memory_types in sections:
+            lines.extend([f"## {title}", ""])
+            values = [
+                self._single_line(item.get("content"))
+                for item in active
+                if str(item.get("memory_type") or "") in memory_types
+                and self._single_line(item.get("content"))
+            ]
+            lines.extend([f"- {value}" for value in values] or ["暂无记录。"])
+            lines.append("")
+        lines.extend([
+            "## Boundary", "",
+            "- 这里只保存跨会话继续项目所需的目标、约束、决定、进度和经验。",
+            "- 论文事实、Claim、Evidence 和综述属于 Wiki 知识库。",
+            "- 原始聊天与 compact 摘要属于 SQLite 会话记录。", "",
+        ])
+        return "\n".join(lines)[: self.MAX_MEMORY_CHARS].rstrip() + "\n"
 
     def _render_index(
         self,

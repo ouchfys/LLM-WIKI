@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable, Optional
 
 from system.wiki.wiki_search_index import WikiSearchIndex
@@ -44,14 +45,24 @@ class WikiResolver:
         allowed_types = [str(item).strip() for item in (page_types or []) if str(item).strip()]
         candidate_limit = max(24, min(int(limit) * 6, 80))
 
-        exact = self._exact_candidates(query, candidate_limit)
-        lexical = self.search_index.search_fts(query, candidate_limit, allowed_types)
-        try:
-            semantic = self.search_index.search_vector(query, candidate_limit, allowed_types)
-        except Exception:
-            # Vector search is an optional recall path. Keyword resolution stays
-            # available during API outages or while embeddings are backfilled.
-            semantic = []
+        # These three recall paths have no data dependency. Execute them in one
+        # bounded read layer, then fuse in the stable order below.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="wiki-recall") as pool:
+            exact_future = pool.submit(self._exact_candidates, query, candidate_limit)
+            lexical_future = pool.submit(
+                self.search_index.search_fts, query, candidate_limit, allowed_types,
+            )
+            semantic_future = pool.submit(
+                self.search_index.search_vector, query, candidate_limit, allowed_types,
+            )
+            exact = exact_future.result()
+            lexical = lexical_future.result()
+            try:
+                semantic = semantic_future.result()
+            except Exception:
+                # Vector search is an optional recall path. Keyword resolution
+                # stays available during API outages or embedding backfills.
+                semantic = []
 
         scores: dict[str, float] = defaultdict(float)
         reasons: dict[str, list[str]] = defaultdict(list)

@@ -4,7 +4,9 @@ import hashlib
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from queue import Queue, Empty, Full
 from threading import Thread, Event
@@ -77,6 +79,24 @@ class AgentToolObservation:
 
 
 class WikiChatService:
+    PROJECT_CONTEXT_BUDGET = 40_000
+    PARALLEL_READ_TOOLS = frozenset({
+        "search_session_history", "read_session_messages",
+        "search_project_history", "read_project_messages", "read_tool_result",
+        "wiki_search", "wiki_open", "wiki_card", "table_query",
+        "evidence_lookup", "web_search", "web_fetch", "resource_recommend",
+    })
+    SERIAL_WRITE_TOOLS = frozenset({"project_memory_update"})
+    TOOL_DEPENDENCIES = frozenset({
+        ("wiki_search", "wiki_open"), ("wiki_search", "wiki_card"),
+        ("wiki_search", "table_query"), ("wiki_search", "evidence_lookup"),
+        ("wiki_open", "table_query"), ("wiki_card", "table_query"),
+        ("wiki_open", "evidence_lookup"), ("wiki_card", "evidence_lookup"),
+        ("web_search", "web_fetch"),
+        ("search_session_history", "read_session_messages"),
+        ("search_project_history", "read_project_messages"),
+    })
+
     def __init__(
         self,
         wiki_store,
@@ -317,28 +337,10 @@ class WikiChatService:
                     with self._runtime_span(recorder, "memory.update", kind="memory") as span:
                         profile_updates = self._update_profile_from_message(message, full_text, cards)
                         span["output"] = {"profile_updates": len(profile_updates)}
-                    saved_message_ids = self._save_turn(
+                    self._save_turn(
                         session_id, message, full_text, citations, resources, profile_updates,
                         self._plan_payload(plan), trace,
                     )
-                    project_updates: List[Dict[str, str]] = []
-                    if saved_message_ids:
-                        with self._runtime_span(recorder, "project_memory.update", kind="memory") as span:
-                            project_updates = self.project_context.maintain_turn(
-                                session_id,
-                                message,
-                                full_text,
-                                evidence_message_ids=saved_message_ids,
-                                cards=cards,
-                            )
-                            span["output"] = {"project_updates": len(project_updates)}
-                    profile_updates.extend(project_updates)
-                    if project_updates and saved_message_ids:
-                        self.session_store.update_message_metadata(
-                            session_id,
-                            saved_message_ids[-1],
-                            {"profile_updates": profile_updates},
-                        )
                     self._complete_chat_runtime(
                         control.run_id, answer=full_text, cards=cards, web_results=web_results, resources=resources,
                     )
@@ -632,9 +634,9 @@ class WikiChatService:
 
         prompt = (
             "Return a strict JSON object for routing a private Wiki chat. Do not answer the user.\n"
-            "Allowed tools: project_memory_open, search_session_history, read_session_messages, search_project_history, read_project_messages, read_tool_result, wiki_search, wiki_open, table_query, evidence_lookup, web_search, web_fetch, resource_recommend.\n"
+            "Allowed tools: project_memory_update, search_session_history, read_session_messages, search_project_history, read_project_messages, read_tool_result, wiki_search, wiki_open, table_query, evidence_lookup, web_search, web_fetch, resource_recommend.\n"
             "Rules:\n"
-            "- The project context contains purpose.md and the small MEMORY.md index. Call project_memory_open only when one indexed topic is relevant and its details are needed. Project memory is not paper evidence.\n"
+            "- The project context contains purpose.md and the complete bounded MEMORY.md. When the user confirms durable project goals, constraints, decisions, progress, failed attempts, open questions, or next steps, call project_memory_update once with the complete revised Markdown. Do not store paper facts, transient formatting requests, or unconfirmed assistant suggestions.\n"
             "- Prefer wiki_search/wiki_open for stable concepts, paper notes, and interview prep already in the user's Wiki.\n"
             "- Compare papers from their opened Wiki pages by default. Use table_query only after wiki_open for explicitly requested exact values, deterministic calculations, metric rankings, or specific cells that the pages do not answer.\n"
             "- Use web_search only for latest/current/mainstream status, GitHub/arXiv/source discovery, or when private Wiki is likely missing.\n"
@@ -645,7 +647,7 @@ class WikiChatService:
         )
         prompt = self.context_budget.compose(prompt, [
             ("User preferences (not knowledge evidence)", self._profile_context(), 1000),
-            ("Project purpose, state and cross-session memory", self._project_context(effective_query or message), 3500),
+            ("Project purpose, state and cross-session memory", self._project_context(effective_query or message), self.PROJECT_CONTEXT_BUDGET),
             ("Earlier summary", lambda cap: self.context_budget.summary_text(history), self.context_budget.policy.summary),
             ("Recent turns", lambda cap: self.context_budget.history_text(history, cap), self.context_budget.policy.history),
             ("Effective query", effective_query, 2048),
@@ -730,28 +732,30 @@ class WikiChatService:
                 if not tool_calls:
                     break
                 used_llm_step = True
-                for call in tool_calls:
+                fresh_calls = [
+                    call for call in tool_calls
+                    if self._tool_signature(call) not in seen_signatures
+                ]
+                for batch in self._tool_execution_batches(fresh_calls):
                     check_run_control()
-                    signature = self._tool_signature(call)
-                    if signature in seen_signatures:
-                        continue
-                    emit(self._tool_running_event(call))
-                    observation = self._execute_agent_tool_call(
-                        call=call,
-                        cards=cards,
-                        web_results=web_results,
-                        resources=resources,
-                        limit=limit,
+                    for call in batch:
+                        emit(self._tool_running_event(call))
+                    batch_observations = self._execute_tool_batch(
+                        batch, cards, web_results, resources, limit,
                     )
-                    observations.append(observation)
-                    seen_signatures.add(signature)
-                    executed_calls.append(ToolCallPlan(
-                        name=call.name,
-                        query=str(call.arguments.get("query") or ""),
-                        reason=call.reason,
-                    ))
-                    emit(self._tool_status_event(observation), record=True)
-                if any(call.name in {"web_fetch", "resource_recommend", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"} for call in tool_calls):
+                    # Workers may finish in any order. Observations, events and
+                    # shared result lists are committed in the model's original
+                    # call order so the next planning step is deterministic.
+                    for call, observation in zip(batch, batch_observations):
+                        observations.append(observation)
+                        seen_signatures.add(self._tool_signature(call))
+                        executed_calls.append(ToolCallPlan(
+                            name=call.name,
+                            query=str(call.arguments.get("query") or ""),
+                            reason=call.reason,
+                        ))
+                        emit(self._tool_status_event(observation), record=True)
+                if any(call.name in {"project_memory_update", "web_fetch", "resource_recommend", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"} for call in tool_calls):
                     break
 
         if not executed_calls:
@@ -808,7 +812,7 @@ class WikiChatService:
             cards
             or web_results
             or self._is_private_scope_query(message)
-            or any(call.name in {"project_memory_open", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"} for call in executed_calls)
+            or any(call.name in {"project_memory_update", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"} for call in executed_calls)
             or not self.web_search
             or not getattr(self.web_search, "available", False)
         ):
@@ -875,6 +879,97 @@ class WikiChatService:
             "events": events,
         }
 
+    @classmethod
+    def _tool_execution_batches(
+        cls, calls: List[AgentToolCall]
+    ) -> List[List[AgentToolCall]]:
+        """Group independent reads while preserving dependency and write order."""
+        batches: List[List[AgentToolCall]] = []
+        current: List[AgentToolCall] = []
+
+        def flush() -> None:
+            nonlocal current
+            if current:
+                batches.append(current)
+                current = []
+
+        for call in calls:
+            if call.name in cls.SERIAL_WRITE_TOOLS or call.name not in cls.PARALLEL_READ_TOOLS:
+                flush()
+                batches.append([call])
+                continue
+            if any(
+                (prior.name, call.name) in cls.TOOL_DEPENDENCIES
+                or (call.name, prior.name) in cls.TOOL_DEPENDENCIES
+                for prior in current
+            ):
+                flush()
+            current.append(call)
+        flush()
+        return batches
+
+    def _execute_tool_batch(
+        self,
+        calls: List[AgentToolCall],
+        cards: List[Dict[str, Any]],
+        web_results: List[Any],
+        resources: List[Dict[str, str]],
+        limit: int,
+    ) -> List[AgentToolObservation]:
+        """Execute one dependency layer and merge effects in call order."""
+        if len(calls) <= 1 or calls[0].name not in self.PARALLEL_READ_TOOLS:
+            return [
+                self._execute_agent_tool_call(call, cards, web_results, resources, limit)
+                for call in calls
+            ]
+
+        snapshots = (list(cards), list(web_results), list(resources))
+        futures = []
+        with ThreadPoolExecutor(max_workers=min(3, len(calls)), thread_name_prefix="wiki-tool") as pool:
+            for call in calls:
+                context = copy_context()
+                futures.append(pool.submit(
+                    context.run,
+                    self._execute_isolated_tool_call,
+                    call,
+                    *snapshots,
+                    limit,
+                ))
+            completed = []
+            for call, future in zip(calls, futures):
+                try:
+                    completed.append(future.result())
+                except Exception as exc:
+                    completed.append((
+                        AgentToolObservation(call.name, str(call.arguments.get("query") or ""), "error", f"tool failed: {exc}"),
+                        list(cards), list(web_results), list(resources),
+                    ))
+
+        ordered: List[AgentToolObservation] = []
+        for call, (observation, local_cards, local_web, local_resources) in zip(calls, completed):
+            self._persist_tool_result(call, observation)
+            self._merge_cards(cards, local_cards)
+            web_results[:] = self._merge_web_results(web_results, local_web)
+            resources[:] = self._merge_resources(resources, local_resources)
+            ordered.append(observation)
+        return ordered
+
+    def _execute_isolated_tool_call(
+        self,
+        call: AgentToolCall,
+        cards: List[Dict[str, Any]],
+        web_results: List[Any],
+        resources: List[Dict[str, str]],
+        limit: int,
+    ) -> tuple[AgentToolObservation, List[Dict[str, Any]], List[Any], List[Dict[str, str]]]:
+        local_cards = list(cards)
+        local_web = list(web_results)
+        local_resources = list(resources)
+        observation = self._execute_traced_tool_call(
+            call, local_cards, local_web, local_resources, limit,
+        )
+        return observation, local_cards, local_web, local_resources
+
     def _next_agent_tool_calls(
         self,
         message: str,
@@ -911,7 +1006,7 @@ class WikiChatService:
         )
         try:
             raw = self._invoke_llm(
-                prompt, operation="llm.plan_next_tools", temperature=0.0, max_tokens=900,
+                prompt, operation="llm.plan_next_tools", temperature=0.0, max_tokens=16000,
             ).strip()
             parsed = self._parse_json_object(raw)
         except Exception as exc:
@@ -1058,7 +1153,7 @@ class WikiChatService:
                 messages=messages,
                 tools=self._native_tool_specs(),
                 temperature=0.0,
-                max_tokens=600,
+                max_tokens=16000,
             )
         except Exception as exc:
             print(f"[WikiChatService] native tool calling failed, falling back to JSON routing: {exc}")
@@ -1079,7 +1174,7 @@ class WikiChatService:
             "You are the tool-use controller for a private Wiki assistant. "
             "Do not answer the user in natural language. Decide whether the next step needs a tool call.\n"
             "Rules:\n"
-            "- The project context contains purpose.md and the small MEMORY.md index. Call project_memory_open only when one indexed topic is relevant and its details are needed. Project memory is not paper evidence.\n"
+            "- The project context contains purpose.md and the complete bounded MEMORY.md. Use project_memory_update only for durable project state confirmed by the user; provide the complete revised Markdown, keep it under 12000 characters, and keep it concise. Project memory is not paper evidence.\n"
             "- For this conversation use search_session_history/read_session_messages; for another conversation in the same project use search_project_history/read_project_messages. Use read_tool_result for a saved result_id.\n"
             "- If an observation says content was omitted, use read_tool_result with its result_id and a short literal query or next_offset before relying on the missing part.\n"
             "- For knowledge questions, call wiki_search first with the effective query. It returns only a small ranked set of compiled Wiki pages "
@@ -1100,7 +1195,7 @@ class WikiChatService:
             json.dumps(self._native_tool_specs(), ensure_ascii=False)) + 192
         user_text = self.context_budget.compose(required, [
             ("User preferences (not knowledge evidence)", self._profile_context(), 1000),
-            ("Project purpose, state and cross-session memory", self._project_context(effective_query or message), 3500),
+            ("Project purpose, state and cross-session memory", self._project_context(effective_query or message), self.PROJECT_CONTEXT_BUDGET),
             ("Previous observations", observation_text, self.context_budget.policy.input_limit),
             ("Earlier summary", lambda cap: self.context_budget.summary_text(history), self.context_budget.policy.summary),
             ("Recent turns", lambda cap: self.context_budget.history_text(history, cap), self.context_budget.policy.history),
@@ -1124,9 +1219,9 @@ class WikiChatService:
         }
         return [
             {"type": "function", "function": {
-                "name": "project_memory_open",
-                "description": "Open one project-memory topic named in MEMORY.md. This is cross-session project context, not paper knowledge or citeable evidence.",
-                "parameters": schema({"topic": {"type": "string", "enum": ["goals", "constraints", "decisions", "open-questions", "milestones", "research-direction", "failed-attempts"]}}, ["topic"])}},
+                "name": "project_memory_update",
+                "description": "Atomically replace the current project's complete MEMORY.md after durable project state is confirmed. Do not store paper knowledge or transient requests.",
+                "parameters": schema({"content": {"type": "string", "description": "Complete concise Markdown beginning with '# Project Memory'."}}, ["content"])}},
             {"type": "function", "function": {
                 "name": "search_session_history", "description": "Search original messages in this conversation, including compacted history. Not a knowledge-base search.",
                 "parameters": schema(query_limit, ["query"])}},
@@ -1244,7 +1339,7 @@ class WikiChatService:
         tool_calls = data.get("tool_calls") or []
         if not isinstance(tool_calls, list):
             return []
-        allowed = {"project_memory_open", "wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}
+        allowed = {"project_memory_update", "wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}
         result: List[AgentToolCall] = []
         for item in tool_calls:
             if not isinstance(item, dict):
@@ -1273,7 +1368,7 @@ class WikiChatService:
                 limit = default_limit
             result.append(AgentToolCall(
                 name=name,
-                arguments={"query": query, "url": url, "sql": sql, "card_ids": card_ids, "limit": max(1, min(limit, 8)), **{k: args[k] for k in ("topic", "start_id", "end_id", "offset", "result_id", "source_session_id") if k in args}},
+                arguments={"query": query, "url": url, "sql": sql, "card_ids": card_ids, "limit": max(1, min(limit, 8)), **{k: args[k] for k in ("content", "start_id", "end_id", "offset", "result_id", "source_session_id") if k in args}},
                 reason="native function calling",
             ))
         return result[:3]
@@ -1311,7 +1406,7 @@ class WikiChatService:
             "Available tools are defined by this schema:\n"
             f"{tool_specs}\n\n"
             "Tool-use rules:\n"
-            "- The project context contains purpose.md and the small MEMORY.md index. Call project_memory_open only when one indexed topic is relevant and its details are needed. Project memory is not paper evidence.\n"
+            "- The project context contains purpose.md and the complete bounded MEMORY.md. Use project_memory_update only for durable project state confirmed by the user; provide the complete revised Markdown, keep it under 12000 characters, and keep it concise. Project memory is not paper evidence.\n"
             "- For this conversation use search_session_history/read_session_messages; for another conversation in the same project use search_project_history/read_project_messages. Use read_tool_result for a saved result_id.\n"
             "- If an observation says content was omitted, use read_tool_result with its result_id and a short literal query or next_offset before relying on the missing part.\n"
             "- For knowledge questions, call wiki_search first with the effective query. It deterministically returns only a small ranked set of compiled Wiki pages and explains each match.\n"
@@ -1326,11 +1421,11 @@ class WikiChatService:
             "- Stop by returning {\"finish\": true, \"tool_calls\": []} when the relevant cards are opened.\n"
             "JSON shape:\n"
             "{\"thought\": string, \"finish\": boolean, "
-            "\"tool_calls\": [{\"name\": string, \"arguments\": {\"query\": string, \"card_ids\": [string], \"url\": string, \"limit\": number}, \"reason\": string}]}\n\n"
+            "\"tool_calls\": [{\"name\": string, \"arguments\": {\"query\": string, \"card_ids\": [string], \"url\": string, \"content\": string, \"limit\": number}, \"reason\": string}]}\n\n"
         )
         return self.context_budget.compose(rules + f"\nStep: {step_index + 1}\nDefault limit: {limit}\nUser message: {message}", [
             ("User preferences (not knowledge evidence)", self._profile_context(), 1000),
-            ("Project purpose, state and cross-session memory", self._project_context(effective_query or message), 3500),
+            ("Project purpose, state and cross-session memory", self._project_context(effective_query or message), self.PROJECT_CONTEXT_BUDGET),
             ("Previous observations", observation_text, self.context_budget.policy.input_limit),
             ("Earlier summary", lambda cap: self.context_budget.summary_text(history), self.context_budget.policy.summary),
             ("Recent turns", lambda cap: self.context_budget.history_text(history, cap), self.context_budget.policy.history),
@@ -1340,7 +1435,7 @@ class WikiChatService:
     @staticmethod
     def _tool_specs() -> List[Dict[str, Any]]:
         return [
-            {"name": "project_memory_open", "arguments": {"topic": "goals|constraints|decisions|open-questions|milestones|research-direction|failed-attempts"}},
+            {"name": "project_memory_update", "arguments": {"content": "complete revised # Project Memory markdown"}},
             {"name": "search_session_history", "arguments": {"query": "literal text", "limit": 5}},
             {"name": "read_session_messages", "arguments": {"start_id": 1, "end_id": 2, "offset": 0}},
             {"name": "search_project_history", "arguments": {"query": "literal text", "limit": 5}},
@@ -1391,7 +1486,7 @@ class WikiChatService:
     ) -> List[AgentToolCall]:
         if not isinstance(data, dict) or data.get("finish") is True:
             return []
-        allowed = {"project_memory_open", "wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}
+        allowed = {"project_memory_update", "wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}
         raw_calls = data.get("tool_calls")
         if raw_calls is None:
             raw_calls = data.get("tools")
@@ -1413,23 +1508,27 @@ class WikiChatService:
                 limit = default_limit
             result.append(AgentToolCall(
                 name=name,
-                arguments={"query": query, "url": url, "sql": sql, "card_ids": card_ids, "limit": max(1, min(limit, 8)), **{k: args[k] for k in ("topic", "start_id", "end_id", "offset", "result_id", "source_session_id") if k in args}},
+                arguments={"query": query, "url": url, "sql": sql, "card_ids": card_ids, "limit": max(1, min(limit, 8)), **{k: args[k] for k in ("content", "start_id", "end_id", "offset", "result_id", "source_session_id") if k in args}},
                 reason=str(item.get("reason") or data.get("thought") or ""),
             ))
         return result[:3]
 
     def _execute_agent_tool_call(self, call, cards, web_results, resources, limit):
         observation = self._execute_traced_tool_call(call, cards, web_results, resources, limit)
+        self._persist_tool_result(call, observation)
+        return observation
+
+    def _persist_tool_result(self, call, observation):
+        """Persist full observations serially, including after parallel reads."""
         control = get_run_control()
         sid = getattr(control, "session_id", "") if control else ""
-        if sid and self.session_store and call.name != "read_tool_result":
+        if sid and self.session_store and call.name not in {"read_tool_result", "project_memory_update"}:
             raw_payload = self._observation_payload(observation)
             observation.result_size_bytes = len(json.dumps(raw_payload, ensure_ascii=False).encode("utf-8"))
             result_id = self.session_store.save_tool_result(sid, call.name, call.arguments, raw_payload)
             if result_id:
                 observation.result_id = int(result_id)
                 observation.summary += f" [result_id={result_id}; read_tool_result 可读取完整工具观察结果]"
-        return observation
 
     def _execute_traced_tool_call(
         self,
@@ -1454,6 +1553,7 @@ class WikiChatService:
             "card_ids": [str(value) for value in (call.arguments.get("card_ids") or [])[:8]],
             "has_url": bool(call.arguments.get("url")),
             "has_sql": bool(call.arguments.get("sql")),
+            "content_chars": len(str(call.arguments.get("content") or "")),
             "reason": str(call.reason or "")[:300],
         }
         with trace.span(
@@ -1486,24 +1586,23 @@ class WikiChatService:
     ) -> AgentToolObservation:
         query = str(call.arguments.get("query") or "").strip()
         call_limit = max(1, min(int(call.arguments.get("limit") or limit), 8))
-        if call.name == "project_memory_open":
+        if call.name == "project_memory_update":
             control = get_run_control()
             sid = getattr(control, "session_id", "") if control else ""
             if not sid or not self.session_store:
                 return AgentToolObservation(call.name, query, "error", "当前项目记忆不可用")
             try:
-                item = self.session_store.open_project_memory_topic(
-                    sid,
-                    str(call.arguments["topic"]),
+                item = self.session_store.write_project_memory(
+                    sid, str(call.arguments["content"])
                 )
             except (KeyError, TypeError, ValueError) as exc:
-                return AgentToolObservation(call.name, query, "error", f"项目记忆主题无效：{exc}")
+                return AgentToolObservation(call.name, query, "error", f"项目记忆更新失败：{exc}")
             return AgentToolObservation(
                 call.name,
-                str(item.get("topic") or ""),
+                "MEMORY.md",
                 "done",
-                "已按 MEMORY.md 索引打开项目记忆主题；它不是论文知识证据",
-                [item],
+                "已原子更新当前项目的 MEMORY.md；它是跨会话工作状态，不是论文知识证据",
+                [{"project_id": item.get("project_id"), "path": item.get("path"), "chars": len(str(item.get("content") or ""))}],
             )
         if call.name in {"search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}:
             control = get_run_control()
@@ -1862,11 +1961,9 @@ class WikiChatService:
 
     @staticmethod
     def _tool_signature(call: AgentToolCall) -> str:
-        query = str(call.arguments.get("query") or "").strip().lower()
-        if call.name == "web_fetch":
-            url = str(call.arguments.get("url") or "").strip().lower()
-            return f"{call.name}:{url or query}"
-        return f"{call.name}:{query}"
+        payload = json.dumps(call.arguments or {}, ensure_ascii=False, sort_keys=True, default=str)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+        return f"{call.name}:{digest}"
 
     @staticmethod
     def _observation_payload(observation: AgentToolObservation) -> Dict[str, Any]:
@@ -1893,7 +1990,7 @@ class WikiChatService:
                 f"status={observation.status}; result_id={observation.result_id or 'none'}; "
                 f"raw_bytes={observation.result_size_bytes or 'unknown'}; summary={observation.summary}"
             ]
-            if observation.tool in {"project_memory_open", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}:
+            if observation.tool in {"project_memory_update", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}:
                 for item_index, item in enumerate(observation.items, start=1):
                     lines.append(f"[Tool Item {item_index}] {json.dumps(item, ensure_ascii=False)}")
                 blocks.append(self.context_budget.bound_tool_result("\n".join(lines), observation.result_id))
@@ -1946,7 +2043,7 @@ class WikiChatService:
                 f"query={observation.get('query', '')}; result_id={result_id or 'none'}; "
                 f"raw_bytes={observation.get('result_size_bytes') or 'unknown'}; summary={observation.get('summary', '')}"
             ]
-            if observation.get("tool") in {"project_memory_open", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}:
+            if observation.get("tool") in {"project_memory_update", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}:
                 for item_index, item in enumerate(observation.get("items") or [], start=1):
                     lines.append(f"[Tool Item {item_index}] {json.dumps(item, ensure_ascii=False)}")
                 blocks.append(self.context_budget.bound_tool_result("\n".join(lines), result_id))
@@ -1977,7 +2074,7 @@ class WikiChatService:
             "search_project_history": "搜索项目历史",
             "read_project_messages": "读取项目历史原文",
             "read_tool_result": "读取工具记录",
-            "project_memory_open": "读取项目记忆",
+            "project_memory_update": "更新项目记忆",
             "wiki_search": "Wiki Search",
             "wiki_open": "Wiki Open",
             "wiki_card": "Wiki Open",
@@ -2076,7 +2173,7 @@ class WikiChatService:
         )
 
     def _normalize_tool_plan(self, data: Dict[str, Any], default_query: str) -> WikiToolPlan:
-        allowed = {"project_memory_open", "wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}
+        allowed = {"project_memory_update", "wiki_search", "wiki_open", "wiki_card", "table_query", "evidence_lookup", "web_search", "web_fetch", "resource_recommend", "search_session_history", "read_session_messages", "search_project_history", "read_project_messages", "read_tool_result"}
         calls: List[ToolCallPlan] = []
         for item in data.get("tools", []) if isinstance(data, dict) else []:
             name = str(item.get("name", "")).strip()
@@ -2377,7 +2474,7 @@ class WikiChatService:
         )
         return self.context_budget.compose(required, [
             ("Tool Observations", observation_text, self.context_budget.policy.input_limit),
-            ("项目目标、状态与跨会话记忆", self._project_context(effective_query or message), 3500),
+            ("项目目标、状态与跨会话记忆", self._project_context(effective_query or message), self.PROJECT_CONTEXT_BUDGET),
             ("已压缩的较早对话", lambda cap: self.context_budget.summary_text(history), self.context_budget.policy.summary),
             ("最近对话", lambda cap: self.context_budget.history_text(history, cap), self.context_budget.policy.history),
             ("强相关 Wiki 笔记", chr(10).join(context_blocks), 12000),
@@ -2397,9 +2494,9 @@ class WikiChatService:
         if not self.learning_profile:
             return []
 
-        # Durable memory is extracted by ProjectContextManager after this turn
-        # has stable message IDs. Interaction events remain an activity log;
-        # keyword matches no longer create user or episodic memories.
+        # Durable project state is maintained explicitly through the
+        # project_memory_update tool. Interaction events remain an activity log;
+        # keyword matches do not create user or project memories.
         for card in cards[:3]:
             self.learning_profile.log_event(
                 "wiki_chat",

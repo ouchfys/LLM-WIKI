@@ -1,6 +1,7 @@
 from system.conversation.context_budget import ContextBudget, ContextPolicy
 import asyncio
-from threading import Event, Thread
+import time
+from threading import Barrier, Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -182,6 +183,50 @@ def test_interrupt_keeps_completed_tool_observations(tmp_path):
     assert service.tool_count == 1
     assert any("不要重新检索" in message and count == 1 for message, count in service.seen_contexts)
     assert runtime.get_run(run_id)["current_state"] == "COMPLETED"
+
+
+def test_independent_read_tools_run_concurrently_but_return_in_call_order():
+    class ParallelChat(WikiChatService):
+        def __init__(self):
+            super().__init__(wiki_store=object(), wiki_resolver=object())
+            self.barrier = Barrier(2)
+            self.finished = []
+
+        def _execute_agent_tool_call_impl(self, call, cards, web_results, resources, limit):
+            self.barrier.wait(timeout=2)
+            if call.arguments["query"] == "first":
+                time.sleep(0.08)
+            self.finished.append(call.arguments["query"])
+            return AgentToolObservation(call.name, call.arguments["query"], "done", call.arguments["query"])
+
+    service = ParallelChat()
+    calls = [
+        AgentToolCall("wiki_search", {"query": "first"}),
+        AgentToolCall("web_search", {"query": "second"}),
+    ]
+    observations = service._execute_tool_batch(calls, [], [], [], 4)
+
+    assert service.finished == ["second", "first"]
+    assert [item.query for item in observations] == ["first", "second"]
+
+
+def test_tool_batches_keep_dependencies_and_writes_serial():
+    calls = [
+        AgentToolCall("wiki_search", {"query": "paper"}),
+        AgentToolCall("wiki_open", {"query": "paper"}),
+        AgentToolCall("web_search", {"query": "paper"}),
+        AgentToolCall("project_memory_update", {"content": "# Project Memory"}),
+        AgentToolCall("search_project_history", {"query": "paper"}),
+    ]
+
+    batches = WikiChatService._tool_execution_batches(calls)
+
+    assert [[call.name for call in batch] for batch in batches] == [
+        ["wiki_search"],
+        ["wiki_open", "web_search"],
+        ["project_memory_update"],
+        ["search_project_history"],
+    ]
 
 
 def test_queue_is_idempotent_and_finalization_fences_late_inputs(tmp_path):

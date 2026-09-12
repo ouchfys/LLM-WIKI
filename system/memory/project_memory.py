@@ -537,7 +537,6 @@ class ProjectMemoryStore:
     def render_project_context(self, session_id: str, query: str = "", memory_limit: int = 6) -> str:
         project_id = self.get_session_project_id(session_id)
         project = self.get_project(project_id) or {}
-        session_state = self.get_session_state(session_id)
         lines = [f"project: {project.get('name') or DEFAULT_PROJECT_NAME}"]
         files = getattr(self, "project_memory_files", None)
         if files is not None:
@@ -548,16 +547,10 @@ class ProjectMemoryStore:
             purpose = str(project.get("purpose") or "").strip()
             if purpose:
                 lines.append("purpose:\n" + purpose)
-        visible = {
-            key: value for key, value in session_state.items()
-            if key not in {"version", "updated_at"} and value not in (None, "", [], {})
-        }
-        if visible:
-            lines.append("[CURRENT_SESSION_STATE]\n" + json.dumps(visible, ensure_ascii=False))
         lines.append(
             "[MEMORY_BOUNDARY]\n"
-            "Project memory is a navigation/state layer, not paper evidence. "
-            "Open a topic file when its index entry is relevant; use Wiki tools for paper knowledge."
+            "MEMORY.md contains cross-session project state, not paper evidence. "
+            "Use Wiki tools for paper knowledge; use original messages or compact summaries for conversation history."
         )
         return "\n".join(lines)
 
@@ -567,6 +560,26 @@ class ProjectMemoryStore:
         if files is None:
             raise ValueError("Project memory files are unavailable")
         return files.open_topic(self.get_session_project_id(session_id), topic)
+
+    def write_project_memory(self, session_id: str, content: str) -> Dict[str, Any]:
+        """Atomically replace the current project's model-managed MEMORY.md."""
+        files = getattr(self, "project_memory_files", None)
+        if files is None:
+            raise ValueError("Project memory files are unavailable")
+        project_id = self.get_session_project_id(session_id)
+        project = self.get_project(project_id)
+        if not project:
+            raise ValueError("Project not found")
+        path = files.write_memory(
+            project_id,
+            str(project.get("name") or DEFAULT_PROJECT_NAME),
+            content,
+        )
+        return {
+            "project_id": project_id,
+            "path": str(path),
+            "content": files.read_memory(project_id),
+        }
 
     def _sync_all_project_memory_files(self) -> None:
         files = getattr(self, "project_memory_files", None)
