@@ -11,7 +11,7 @@ from system.wiki.wiki_chat import WikiChatService
 from system.wiki.wiki_resolver import WikiResolver
 from system.wiki.chunk_index import WikiChunkIndex
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
-from system.agent_runtime import AgentRunStore, ResearchTaskLedgerStore
+from system.agent_runtime import AgentRunStore, ResearchSourceStore, ResearchTaskLedgerStore
 from system.search.resource_recommender import LearningResourceRecommender
 from system.search.web_fetch import WebFetchTool
 from system.search.web_search import WebSearchTool
@@ -214,6 +214,11 @@ def get_research_ledger() -> ResearchTaskLedgerStore:
 
 
 @lru_cache(maxsize=1)
+def get_research_sources() -> ResearchSourceStore:
+    return ResearchSourceStore(db_path=get_wiki_store().db_path)
+
+
+@lru_cache(maxsize=1)
 def get_local_wiki_workspace() -> LocalWikiWorkspace:
     return LocalWikiWorkspace(get_storage_layout().wiki_dir)
 
@@ -253,5 +258,6 @@ def get_wiki_chat() -> WikiChatService:
         runtime=runtime,
         arxiv_service=get_arxiv_service(),
         research_ledger=get_research_ledger(),
+        research_sources=get_research_sources(),
         local_workspace=get_local_wiki_workspace(),
     )

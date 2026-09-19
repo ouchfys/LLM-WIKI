@@ -5,7 +5,7 @@
 PaperWiki 不是“上传 PDF 后问一次问题”的普通 RAG。它主要解决两个工程问题：
 
 1. **新论文如何安全修改已有知识**：结论必须绑定原文证据；普通补充自动合并，矛盾、替代和证据异常进入人工审批。
-2. **长任务如何不依赖模型记忆维持进度**：研究目标、语料覆盖、已读页面、剩余条件和交付物状态持久化在 Runtime 中，即使上下文压缩或服务重启也能继续。
+2. **长任务如何不依赖模型记忆维持进度**：研究计划、确定性阅读批次、结构化阅读记录、覆盖缺口和完成门禁持久化在 Runtime 中，即使上下文压缩或服务重启也能继续。
 
 ![Wiki 对话与工具调用](image/wiki-chat-current.png)
 
@@ -57,9 +57,9 @@ flowchart LR
 
 - 同一步中的独立只读工具最多 3 路并发，Observation 仍按模型最初的调用顺序归并。
 - `wiki_search -> wiki_open`、`web_search -> web_fetch` 等存在数据依赖的调用保持顺序。
-- `project_memory_update`、`arxiv_import_paper` 等写操作串行执行。
+- `project_memory_update`、`arxiv_import_paper`、阅读记录提交和研究资料捕获等写操作串行执行。
 - 论文入库任务通过状态机、checkpoint、worker lease、heartbeat、恢复扫描和幂等提交处理重启与重复执行。
-- 长研究任务使用结构化 Research Ledger 保存阶段、目标论文数、类别覆盖、已选择论文、入库任务、已读 Card、剩余条件和预算；模型上下文不是任务真相。
+- 长研究任务将计划、阅读批次和阅读记录保存到 SQLite；`wiki_open` 只表示页面内容已返回，只有带 Evidence ID 的结构化阅读记录通过 Python 校验后才计入完成。
 
 论文入库状态：
 
@@ -72,8 +72,10 @@ QUEUED -> EXTRACTING -> DISTILLING -> VERIFYING
 长研究任务状态：
 
 ```text
-DISCOVER -> WAIT_INGEST -> VERIFY_CORPUS
-         -> READ_LOCAL_CORPUS -> SYNTHESIZE -> COMPLETE
+PLANNING -> DISCOVER -> WAIT_INGEST -> BUILD_QUEUE
+         -> READING -> CHECK_GATES
+              -> BUILD_QUEUE / TARGETED_DISCOVERY / SYNTHESIZE
+         -> COMPLETE / PAUSED / BUDGET_EXHAUSTED
 ```
 
 ### 3. 知识、记忆、会话与上下文分层
@@ -84,7 +86,8 @@ DISCOVER -> WAIT_INGEST -> VERIFY_CORPUS
 | 项目记忆 | 当前项目目标、约束、决定、进度、失败经验 | 新会话固定读取 `purpose.md` 与 `MEMORY.md` |
 | 用户偏好 | 用户明确保存的长期偏好 | 少量固定注入 |
 | SQLite 会话 | 原始消息、工具结果、Compact 摘要、检查点 | 按 Token 预算组装本轮上下文 |
-| Research Ledger | 长任务阶段、覆盖情况、剩余要求、预算 | Runtime 判断任务是否真的完成 |
+| 长任务状态 | 研究计划、批次、阅读记录、覆盖缺口、预算 | Runtime 分配下一批并判断任务是否真的完成 |
+| 研究资料账本 | 粘贴的 AI 对话、网页观点、候选 Claim 与未决分歧 | 按项目查看，未经核验不进入 Wiki |
 
 项目记忆采用 Coding Agent Notes 式的轻量文件，而不是为个人项目额外部署向量数据库：
 
@@ -98,6 +101,8 @@ DISCOVER -> WAIT_INGEST -> VERIFY_CORPUS
 
 Agent 在工具循环中更新完整的 `MEMORY.md`；Python 只允许写入当前项目的固定路径，并执行大小限制和原子替换。论文知识仍然写入 Wiki，原始对话仍然写入 SQLite，三者不会混用。
 
+当用户直接粘贴带有连续 `User/Assistant` 或“用户/助手”轮次的文本时，系统会保守标记为“疑似 AI 对话”，完整保存原文和内容哈希。无法从文本或元数据确定具体提供方时统一记录为 `unknown`。其中提取的观点初始状态只能是 `candidate`；同一对象、方面和作用域下出现不同说法时保留为未决分歧，不会直接覆盖 Wiki。用户可以通过 API 修正来源类型和提供方，修正不会改变原始内容哈希。
+
 上下文按 Token 预算管理。预算充足时保留有效历史；接近阈值时先回收旧工具输出，再压缩早期对话并保留最近原文。单条工具结果超过 50 KB 时，完整结果保存在 SQLite，当前 Prompt 只放头尾预览和 `result_id`；Agent 可以通过 `read_tool_result` 分页恢复原文。Compact 保存的是派生摘要和覆盖边界，不删除原始消息。
 
 ## 一次实际研究会发生什么
@@ -110,11 +115,14 @@ Agent 在工具循环中更新完整的 `MEMORY.md`；Python 只允许写入当�
   -> Agent 搜索或导入论文
   -> 入库 Runtime 解析、核验并编译 Wiki Card
   -> Ledger 检查论文数量与主题覆盖
-  -> Agent 分页读取本地 Corpus，而不是反复搜索同几篇论文
+  -> Runtime 根据覆盖缺口分配下一批 3～5 篇未读论文
+  -> Agent 读取批次内 Card，并为每篇提交 Claim、Evidence、实验设置和信息增益
+  -> Python 校验 Card、批次、维度和 Evidence 归属后才标记完成
   -> 上下文接近预算时回收工具结果并 Compact 旧对话
-  -> Ledger 继续保存已读页面与剩余要求
+  -> Ledger 继续保存阅读记录、未决冲突、覆盖缺口和下一批
+  -> 最近批次仍出现新类别或冲突时继续阅读或定向发现
   -> Agent 生成读者报告与证据附录
-  -> Runtime 根据 Ledger 判断是否真正完成
+  -> Runtime 只有在篇数、覆盖、Evidence、信息饱和与预算门禁通过后才允许完成
 ```
 
 如果此时新开会话，原聊天内容不会整段注入；新会话会读取同项目的 `purpose.md` 和 `MEMORY.md`。用户继续长研究任务时，Runtime 会重新关联同项目未完成的 Ledger，再按需检索 Wiki。服务重启后，论文任务和研究进度也从持久化状态恢复。
@@ -134,7 +142,7 @@ Wiki 在 Markdown 小节上并行执行 SQLite FTS5 与 Qwen3-Embedding-0.6B 跨
 | Wiki Chat 引用可靠性 | 100% | 30 题答案复核 |
 | Wiki Chat 通过率 | 83.33% | 当前保留基线 |
 | Verifier 门禁准确率 | 93.57% | 140 条、独立模型裁决的 Silver Set |
-| 自动化测试 | 183 passed | 后端完整测试 |
+| 自动化测试 | 188 passed | 后端完整测试；包含 30 篇确定性批次与中途重建 Store 的恢复用例 |
 | 前端验证 | 通过 | `vue-tsc -b && vite build` |
 
 Verifier 数据集没有人工 Gold 标注，因此 93.57% 只能表述为 Silver Benchmark 结果。三个长任务在 Runtime 重构后尚未重新执行高成本端到端实验，README 不把重构前失败的结果包装成改造后指标。
@@ -224,6 +232,8 @@ docs/                     设计、配置和评测细节
 - 冲突发现依赖候选召回与模型判断，尚不能宣称解决开放域通用矛盾检测。
 - Figure Notes 当前基于图注和邻近正文，文本模型不直接读取图片像素。
 - Research Ledger 当前针对三个明确的长研究协议，不是任意任务的通用工作流引擎。
+- 粘贴内容的自动来源识别只对高置信度多轮格式自动落账；单段 AI 回答仍可能需要 Agent 或用户显式标记。
+- 候选 Claim 的自动归组只确定“同一对象、方面和作用域值得比较”，语义关系仍需模型核验或人工处理。
 - 问答可以恢复消息、工具结果与 Compact 检查点，但不会恢复模型中断瞬间的隐藏推理栈。
 - 当前存储与执行器面向单用户本地运行；大规模多用户部署需要替换向量索引和任务传输层。
 

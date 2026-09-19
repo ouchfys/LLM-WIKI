@@ -16,6 +16,7 @@ from starlette.concurrency import iterate_in_threadpool
 from backend.deps import (
     get_chunk_index,
     get_maintenance_llm,
+    get_research_sources,
     get_session_store,
     get_summary_llm, get_chat_llm,
     get_web_fetch,
@@ -71,6 +72,20 @@ class CapturePayload(BaseModel):
     source_url: str = ""
     source_type: str = "inspiration"
     tags: list[str] = Field(default_factory=list)
+
+
+class ResearchSourceCapturePayload(BaseModel):
+    session_id: str
+    raw_text: str
+    source_type: str = "auto"
+    origin: str = "unknown"
+    title: str = ""
+    claims: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ResearchSourceCorrectionPayload(BaseModel):
+    source_type: str
+    origin: str = "unknown"
 
 
 class WikiChatPayload(BaseModel):
@@ -2446,6 +2461,65 @@ def chat_with_wiki(
         "tool_plan": result.tool_plan,
         "trace": result.trace,
     }
+
+
+@router.post("/research/sources")
+def capture_research_source(
+    payload: ResearchSourceCapturePayload,
+    sessions=Depends(get_session_store),
+    sources=Depends(get_research_sources),
+):
+    if not payload.raw_text.strip():
+        raise HTTPException(status_code=400, detail="raw_text cannot be empty")
+    session = sessions.get_session(payload.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        return sources.capture(
+            project_id=sessions.get_session_project_id(payload.session_id),
+            raw_text=payload.raw_text,
+            source_type=payload.source_type,
+            origin=payload.origin,
+            title=payload.title,
+            claims=payload.claims,
+            metadata={"session_id": payload.session_id, "capture_mode": "api"},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/research/sources")
+def list_research_sources(
+    session_id: str,
+    limit: int = 50,
+    sessions=Depends(get_session_store),
+    sources=Depends(get_research_sources),
+):
+    session = sessions.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    project_id = sessions.get_session_project_id(session_id)
+    return {
+        "project_id": project_id,
+        "items": sources.list_sources(project_id, limit=limit),
+        "research_state": sources.latest_snapshot(project_id),
+    }
+
+
+@router.patch("/research/sources/{source_id}")
+def correct_research_source(
+    source_id: str,
+    payload: ResearchSourceCorrectionPayload,
+    sources=Depends(get_research_sources),
+):
+    try:
+        return sources.correct_source(
+            source_id, source_type=payload.source_type, origin=payload.origin,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Research source not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/capture")
