@@ -1,7 +1,7 @@
 # PaperWiki 多来源知识维护与长探索任务 Spec
 
 - 状态：Proposed
-- 版本：1.0
+- 版本：1.1
 - 日期：2026-09-20
 - 适用范围：PaperWiki 本地单用户版本
 
@@ -28,6 +28,7 @@ PaperWiki 当前已经具备论文入库、Evidence ID、Verifier、Revision、�
 6. 打开论文页不得等同于读完论文；只有结构化阅读记录验收通过才算完成。
 7. 任务停止必须由覆盖、证据、信息增益、未决冲突和预算共同决定。
 8. Compact、新建会话和服务重启不得丢失任务真实进度。
+9. 用户直接粘贴未声明来源的 AI 对话时，系统必须能够保守识别并按候选资料处理。
 
 ### 2.2 非目标
 
@@ -36,6 +37,8 @@ PaperWiki 当前已经具备论文入库、Evidence ID、Verifier、Revision、�
 3. 不引入 Multi-Agent、LangGraph、向量化用户记忆或新的分布式中间件。
 4. 不把所有聊天自动写入 Wiki。
 5. 不要求一次性支持任意开放域工作流；v1 只服务论文研究任务。
+6. 不根据文风猜测内容来自 ChatGPT、Claude 或其他具体模型；没有明确来源时统一记为 `unknown`。
+7. v1 不要求与通用 Agent 做同条件对照；先完成并验收 PaperWiki 自身的端到端链路。
 
 ## 3. 设计原则
 
@@ -45,6 +48,7 @@ PaperWiki 当前已经具备论文入库、Evidence ID、Verifier、Revision、�
 4. **不静默覆盖**：不一致内容必须形成明确关系或保持 `unresolved`。
 5. **可恢复而非假装无损**：Compact 可以丢失措辞，但不能丢失任务 ID、证据 ID、结论状态、未决问题和下一步。
 6. **先定义验收，再实现功能**：每项能力必须对应可自动检查的场景和指标。
+7. **保守识别来源**：格式信号和模型分类只用于判断内容类型；低置信度时保持 `unknown`，不得把来源识别当成事实核验。
 
 ## 4. 概念模型
 
@@ -85,7 +89,29 @@ candidate
 
 ### K-01 多来源捕获
 
-系统必须允许显式保存以下来源：论文、网页、AI 输出、用户笔记和会话片段。每条来源必须包含 `source_type`、`origin`、`project_id`、`content_hash` 和时间。
+系统必须允许保存以下来源：论文、网页、AI 输出、用户笔记和会话片段。每条来源必须包含 `source_type`、`origin`、`project_id`、`content_hash` 和时间。
+
+来源既可以由用户显式声明，也可以由系统对粘贴内容进行保守分类。分类分为两层：
+
+1. Python 先检查格式信号，例如 `User/Assistant`、`用户/助手` 等角色标签、连续的问答轮次和对话分隔符。
+2. 格式不足以确定时，模型按照固定 Schema 判断内容是 `ai_conversation`、`ai_answer`、`article`、`user_note` 或 `unknown`，并返回置信度、分段结果和判断信号。
+
+模型分类结果必须经过 Schema 校验。系统只能根据文本中明确出现的名称或外部元数据填写具体提供方；不能仅凭语言风格推断是 ChatGPT、Claude 或其他模型。
+
+```json
+{
+  "content_kind": "ai_conversation",
+  "provider": "unknown",
+  "confidence": 0.93,
+  "segments": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ],
+  "signals": ["alternating_role_labels", "multi_turn_structure"]
+}
+```
+
+无论来源是用户声明还是系统识别，原始文本都必须原样保存。来源分类可以修正，但修正不得改变原始内容和 `content_hash`。
 
 #### 场景：粘贴另一个 AI 的回答
 
@@ -94,6 +120,33 @@ candidate
 - Then 系统将其保存为 `ai_output`
 - And 不直接修改 Wiki
 - And 后续从中提取的 Claim 初始状态为 `candidate`
+
+#### 场景：用户未说明来源，直接粘贴多轮 AI 对话
+
+- Given 用户粘贴一段具有连续用户与助手轮次的文本
+- And 用户没有说明这是 AI 对话，也没有说明具体模型
+- When 分类器基于格式规则或通过校验的模型输出给出高置信度的 `ai_conversation`
+- Then 系统保存原始文本并标记 `source_type=ai_conversation`
+- And 记录 `origin=unknown`、检测置信度和分段结果
+- And 向用户显示可更正的“疑似 AI 对话”来源标记
+- And 从中提取的 Claim 只能从 `candidate` 状态开始
+- And 不自动修改 Wiki
+
+#### 场景：只能识别为 AI 内容，不能识别具体提供方
+
+- Given 文本结构明显来自 AI 问答
+- And 文本和元数据没有出现提供方名称
+- When 系统保存该来源
+- Then `source_type` 可以为 `ai_conversation` 或 `ai_answer`
+- But `origin` 必须为 `unknown`
+
+#### 场景：粘贴内容类型不明确
+
+- Given 文本只有单个 `Q:` 标记或同时具有文章与对话特征
+- When 分类置信度低于配置阈值
+- Then 系统按 `unknown` 或 `pasted_text` 保存
+- And 保留原文，不自动拆分角色
+- And 不自动修改 Wiki
 
 ### K-02 候选 Claim 规范化
 
@@ -336,7 +389,7 @@ VERIFIED -> REOPENED（仅带目的的复核）
 
 | 实体 | 关键字段 |
 | --- | --- |
-| research_sources | project_id, source_type, origin, content_hash, raw_ref |
+| research_sources | project_id, source_type, origin, detected_type, detection_confidence, segments_json, content_hash, raw_ref |
 | candidate_claims | subject, aspect, scope, statement, source_id, status |
 | claim_relations | left_claim_id, right_claim_id, relation, decision_source |
 | dispute_groups | subject, aspect, scope, status, resolution |
@@ -389,17 +442,10 @@ v1 只新增以下最小工具集：
 | 已知冲突召回率 | ≥ 90% |
 | 不确定关系错误覆盖旧知识 | 0 次 |
 | Revision 回滚成功率 | 100% |
-
-### 9.3 Baseline
-
-使用相同论文、目标和模型比较：
-
-```text
-Baseline：通用 Agent + MinerU + arXiv MCP + 提示词
-PaperWiki：本 Spec 的计划、阅读记录、证据和知识更新流程
-```
-
-至少比较任务完成率、重复读取率、Evidence 覆盖率、冲突保留率、服务重启恢复和 Token 成本。若 PaperWiki 不能在可重复性或可追溯性上优于 Baseline，不得宣称领域系统带来稳定性收益。
+| 未声明 AI 对话高置信度识别准确率 | ≥ 95% |
+| 普通文章被高置信度误判为 AI 对话 | ≤ 2% |
+| 无明确依据时猜测具体 AI 提供方 | 0 次 |
+| 原始粘贴内容完整保留率 | 100% |
 
 ## 10. 实施顺序
 
@@ -419,7 +465,7 @@ PaperWiki：本 Spec 的计划、阅读记录、证据和知识更新流程
 
 ### Phase 2：多来源知识状态（P1）
 
-1. 支持显式保存 AI 输出和会话片段。
+1. 支持显式保存 AI 输出和会话片段，并保守识别未声明来源的粘贴内容。
 2. 引入候选 Claim 与 dispute group。
 3. 生成研究状态 Markdown 投影。
 4. 审批页展示来源、关系、不确定性和实际 Diff。
@@ -427,8 +473,9 @@ PaperWiki：本 Spec 的计划、阅读记录、证据和知识更新流程
 ### Phase 3：评测与简历口径（P1）
 
 1. 固化多来源冲突集和长任务集。
-2. 运行通用 Agent Baseline。
-3. 只把达到验收线的能力写入 README 和简历。
+2. 增加 AI 对话、普通文章、用户笔记和混合格式的来源分类集。
+3. 跑通本 Spec 的端到端链路与故障恢复场景。
+4. 只把达到验收线的能力写入 README 和简历。
 
 ## 11. 明确删除或降级的旧假设
 
