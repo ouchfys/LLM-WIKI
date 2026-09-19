@@ -11,11 +11,13 @@ from system.wiki.wiki_chat import WikiChatService
 from system.wiki.wiki_resolver import WikiResolver
 from system.wiki.chunk_index import WikiChunkIndex
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
-from system.wiki.table_qa import TableQuestionAnswerer
-from system.agent_runtime import AgentRunStore
+from system.agent_runtime import AgentRunStore, ResearchTaskLedgerStore
 from system.search.resource_recommender import LearningResourceRecommender
 from system.search.web_fetch import WebFetchTool
 from system.search.web_search import WebSearchTool
+from system.discovery.arxiv_service import ArxivMcpService
+from system.storage import get_storage_layout
+from system.wiki.local_workspace import LocalWikiWorkspace
 from system.core.config import (
     DEEPSEEK_CHAT_MODEL,
     SILICONFLOW_FAST_MODEL,
@@ -23,7 +25,6 @@ from system.core.config import (
     SILICONFLOW_MAINTENANCE_MODEL,
     SILICONFLOW_MERGE_MODEL,
     SILICONFLOW_REVIEW_MODEL,
-    SILICONFLOW_SUMMARY_MODEL,
     WEB_SEARCH_MAX_RESULTS,
     WEB_SEARCH_MODE,
     WEB_SEARCH_TIMEOUT_SECONDS,
@@ -72,7 +73,7 @@ def get_paper_index() -> PaperIndexStore:
 
 @lru_cache(maxsize=1)
 def get_chat_llm():
-    """DeepSeek official model for Wiki tool use, table QA, and final answers."""
+    """DeepSeek official model for Wiki tool use and final answers."""
     if DeepSeekChat is None:
         return None
     try:
@@ -97,14 +98,14 @@ def get_fast_llm():
 
 @lru_cache(maxsize=1)
 def get_summary_llm():
-    """Dedicated model for source-to-Wiki summarization and paper compilation."""
-    if SiliconFlowChat is None:
+    """DeepSeek official model for source-to-Wiki summarization and compilation."""
+    if DeepSeekChat is None:
         return None
     try:
-        return SiliconFlowChat(model=SILICONFLOW_SUMMARY_MODEL, temperature=0.0, max_tokens=4096)
+        return DeepSeekChat(model=DEEPSEEK_CHAT_MODEL, temperature=0.0, max_tokens=4096)
     except Exception as exc:
         print(f"[deps] Summary LLM unavailable: {exc}")
-        return get_fast_llm()
+        return get_chat_llm()
 
 
 @lru_cache(maxsize=1)
@@ -203,6 +204,21 @@ def get_resource_recommender() -> LearningResourceRecommender:
 
 
 @lru_cache(maxsize=1)
+def get_arxiv_service() -> ArxivMcpService:
+    return ArxivMcpService()
+
+
+@lru_cache(maxsize=1)
+def get_research_ledger() -> ResearchTaskLedgerStore:
+    return ResearchTaskLedgerStore(db_path=get_wiki_store().db_path)
+
+
+@lru_cache(maxsize=1)
+def get_local_wiki_workspace() -> LocalWikiWorkspace:
+    return LocalWikiWorkspace(get_storage_layout().wiki_dir)
+
+
+@lru_cache(maxsize=1)
 def get_profile_builder() -> ProfileBuilder:
     return ProfileBuilder(
         learning_profile=get_learning_profile(),
@@ -235,8 +251,7 @@ def get_wiki_chat() -> WikiChatService:
         wiki_resolver=get_wiki_resolver(),
         evidence_store=pipeline_store,
         runtime=runtime,
-        table_qa=TableQuestionAnswerer(
-            pipeline_store,
-            llm=get_chat_llm(),
-        ),
+        arxiv_service=get_arxiv_service(),
+        research_ledger=get_research_ledger(),
+        local_workspace=get_local_wiki_workspace(),
     )

@@ -1,0 +1,49 @@
+{
+  "version": "agent_benchmark_reference_sets_v1",
+  "snapshot_date": "2026-09-15",
+  "visibility": "evaluator_only_never_mount_into_task_workspace",
+  "purpose": "Coverage references for grading autonomous discovery. They are not an exhaustive required-answer list and must not be exposed to the tested agent.",
+  "reference_sets": {
+    "kv_cache": [
+      {"arxiv_id": "2609.04263", "title": "Quality Recovery for Quantized KV Caches via Low-Rank Attention Adaptation", "bucket": "quantization_quality_recovery"},
+      {"arxiv_id": "2606.24467", "title": "CompressKV: Semantic-Retrieval-Guided KV-Cache Compression for Resource-Efficient Long-Context LLM Inference", "bucket": "semantic_eviction"},
+      {"arxiv_id": "2603.20397", "title": "KV Cache Optimization Strategies for Scalable and Efficient LLM Inference", "bucket": "survey"},
+      {"arxiv_id": "2512.14946", "title": "EVICPRESS: Joint KV-Cache Compression and Eviction for Efficient LLM Serving", "bucket": "multi_tier_system"},
+      {"arxiv_id": "2412.19442", "title": "A Survey on Large Language Model Acceleration based on KV Cache Management", "bucket": "survey"},
+      {"arxiv_id": "2407.00079", "title": "Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving", "bucket": "disaggregated_serving"},
+      {"arxiv_id": "2406.10774", "title": "Quest: Query-Aware Sparsity for Efficient Long-Context LLM Inference", "bucket": "query_aware_sparsity"},
+      {"arxiv_id": "2406.02069", "title": "PyramidKV: Dynamic KV Cache Compression based on Pyramidal Information Funneling", "bucket": "layerwise_budget"},
+      {"arxiv_id": "2404.14469", "title": "SnapKV: LLM Knows What You are Looking for Before Generation", "bucket": "prompt_observation_eviction"},
+      {"arxiv_id": "2402.02750", "title": "KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache", "bucket": "quantization"},
+      {"arxiv_id": "2401.09670", "title": "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving", "bucket": "prefill_decode_disaggregation"},
+      {"arxiv_id": "2310.07240", "title": "CacheGen: KV Cache Compression and Streaming for Fast Large Language Model Serving", "bucket": "compression_streaming"},
+      {"arxiv_id": "2309.17453", "title": "Efficient Streaming Language Models with Attention Sinks", "bucket": "streaming_eviction"},
+      {"arxiv_id": "2309.06180", "title": "Efficient Memory Management for Large Language Model Serving with PagedAttention", "bucket": "memory_management"},
+      {"arxiv_id": "2306.14048", "title": "H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models", "bucket": "heavy_hitter_eviction"},
+      {"arxiv_id": "2305.17118", "title": "Scissorhands: Exploiting the Persistence of Importance Hypothesis for LLM KV Cache Compression at Test Time", "bucket": "importance_eviction"}
+    ],
+    "agent_harness": [
+      {"arxiv_id": "2609.01736", "title": "Harness Engineering in LLM Tool Use via Agent-Native Reusable Tool Primitives", "bucket": "tool_interfaces"},
+      {"arxiv_id": "2608.14380", "title": "AgentRewind: Recoverable Execution for Long-Horizon LLM Agents", "bucket": "recovery"},
+      {"arxiv_id": "2605.13357", "title": "AI Harness Engineering: A Runtime Substrate for Foundation-Model Software Agents", "bucket": "harness_taxonomy"},
+      {"arxiv_id": "2602.18998", "title": "Benchmark Test-Time Scaling of General LLM Agents", "bucket": "general_agent_evaluation"},
+      {"arxiv_id": "2508.03680", "title": "Agent Lightning: Train ANY AI Agents with Reinforcement Learning", "bucket": "runtime_training_decoupling"},
+      {"arxiv_id": "2506.07982", "title": "Tau2-Bench: Evaluating Conversational Agents in a Dual-Control Environment", "bucket": "task_evaluation"},
+      {"arxiv_id": "2408.04682", "title": "ToolSandbox: A Stateful, Conversational, Interactive Evaluation Benchmark for LLM Tool Use Capabilities", "bucket": "stateful_tool_evaluation"},
+      {"arxiv_id": "2406.13352", "title": "AgentDojo: A Dynamic Environment to Evaluate Prompt Injection Attacks and Defenses for LLM Agents", "bucket": "safety"},
+      {"arxiv_id": "2405.15793", "title": "SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering", "bucket": "agent_computer_interface"},
+      {"arxiv_id": "2403.16971", "title": "AIOS: LLM Agent Operating System", "bucket": "runtime_scheduling"},
+      {"arxiv_id": "2310.08560", "title": "MemGPT: Towards LLMs as Operating Systems", "bucket": "context_memory"},
+      {"arxiv_id": "2308.03688", "title": "AgentBench: Evaluating LLMs as Agents", "bucket": "agent_evaluation"},
+      {"arxiv_id": "2303.11366", "title": "Reflexion: Language Agents with Verbal Reinforcement Learning", "bucket": "reflection_recovery"},
+      {"arxiv_id": "2302.04761", "title": "Toolformer: Language Models Can Teach Themselves to Use Tools", "bucket": "tool_learning"},
+      {"arxiv_id": "2210.03629", "title": "ReAct: Synergizing Reasoning and Acting in Language Models", "bucket": "agent_loop"}
+    ],
+    "agent_harness_official_sources": [
+      {"url": "https://openai.github.io/openai-agents-python/", "source_type": "official_docs"},
+      {"url": "https://docs.langchain.com/oss/python/langgraph/durable-execution", "source_type": "official_docs"},
+      {"url": "https://docs.temporal.io/", "source_type": "official_docs"},
+      {"url": "https://www.anthropic.com/research/building-effective-agents", "source_type": "official_research"}
+    ]
+  }
+}

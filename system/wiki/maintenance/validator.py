@@ -13,6 +13,7 @@ from system.storage import get_object_storage
 
 CURRENT_PAGE_TYPES = {
     "ConceptPage",
+    "TopicPage",
     "PaperPage",
     "MethodPage",
     "ComparePage",

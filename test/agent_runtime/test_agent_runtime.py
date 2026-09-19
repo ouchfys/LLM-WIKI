@@ -26,7 +26,6 @@ from system.wiki.markdown_vault import MarkdownVault
 from system.wiki.paper_pipeline.merger import PaperMergeAgent
 from system.wiki.paper_pipeline.models import SourcePacket, SourceTable
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
-from system.wiki.evidence_verifier import EvidenceVerifier
 from system.wiki.ingestion_jobs import IngestionJobStore
 from system.wiki.revision import WikiRevisionManager
 from system.wiki.wiki_store import WikiStore
@@ -459,7 +458,7 @@ def test_expired_worker_lease_becomes_recoverable_and_restarts_from_source() -> 
         assert restarted["context"]["resume_from_state"] == "EXTRACTING"
 
 
-def test_whole_parser_table_is_resolvable_numeric_evidence() -> None:
+def test_parser_table_is_kept_for_markdown_compilation_without_query_projection() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         store = PaperWikiPipelineStore(db_path=str(Path(tmp) / "table-evidence.db"))
         packet = SourcePacket(
@@ -469,8 +468,6 @@ def test_whole_parser_table_is_resolvable_numeric_evidence() -> None:
             tables=[SourceTable(
                 table_id="table-3", element_id="table-element-3", page=8,
                 caption="Table 3: majority voting uses k = 256 samples for MATH.",
-                headers=[["Model", "MATH"]],
-                rows=[["Minerva 540B, maj1@k", "50 . 3%"]],
                 markdown=(
                     "| Model | MATH |\n| --- | --- |\n"
                     "| Minerva 540B, maj1@k | 50 . 3% |"
@@ -479,18 +476,12 @@ def test_whole_parser_table_is_resolvable_numeric_evidence() -> None:
             )],
         )
         store.upsert_source_packet(packet)
-        matches = store.find_evidence(
+        assert store.find_evidence(
             "source-table", text="Table 3: Minerva 540B, maj1@k: 50.3%", limit=1
-        )
-        assert matches[0]["id"] == "table-3"
-        result = EvidenceVerifier(store).verify_claim(
-            statement="Minerva 540B 在 MATH 上通过多数投票达到 50.3%。",
-            evidence_excerpt="Table 3: Minerva 540B, maj1@k: 50.3%",
-            evidence_ids=["table-3"], structured_required=True,
-        )
-        assert result.result == "supported"
-        assert result.evidence[0]["kind"] == "table"
-        assert result.evidence[0]["page"] == 8
+        ) == []
+        restored = store.get_source_packet("source-table")
+        assert restored is not None
+        assert restored.tables[0].markdown.endswith("| Minerva 540B, maj1@k | 50 . 3% |")
 
 
 def test_pipeline_result_false_is_rejected_not_completed(monkeypatch) -> None:

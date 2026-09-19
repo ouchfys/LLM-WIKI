@@ -287,6 +287,17 @@ class PaperDistiller:
         title = sanitize_wiki_text(str(item.get("title") or "")).strip()
         if not title:
             return None
+        content_json = item.get("content_json") if isinstance(item.get("content_json"), dict) else {}
+        summary = sanitize_wiki_text(str(item.get("summary") or ""))
+        if len(summary) < 20:
+            summary_parts = [
+                sanitize_wiki_text(str(content_json.get(key) or ""))
+                for key in ("research_problem", "problem", "motivation", "method_overview", "key_idea")
+            ]
+            # Each component is already sanitized. Keep the synthesized
+            # one-line summary below the parser-noise detector's long-line
+            # threshold so dense CJK prose is not mistaken for base64 data.
+            summary = " ".join(part for part in summary_parts if part)[:240].strip()
         claims = []
         for claim in item.get("claims") or []:
             if not isinstance(claim, dict):
@@ -322,8 +333,8 @@ class PaperDistiller:
             page_type=page_type,
             title=title,
             aliases=[sanitize_wiki_text(str(alias)) for alias in item.get("aliases") or [] if str(alias).strip()],
-            summary=sanitize_wiki_text(str(item.get("summary") or "")),
-            content_json=item.get("content_json") if isinstance(item.get("content_json"), dict) else {},
+            summary=summary,
+            content_json=content_json,
             claims=claims,
             related_topics=[sanitize_wiki_text(str(topic)) for topic in item.get("related_topics") or [] if str(topic).strip()],
             source_level=item.get("source_level") or "primary",
@@ -639,7 +650,10 @@ def _rank_key_tables(tables: list[Any]) -> list[Any]:
     def score(table: Any) -> tuple[int, int]:
         text = f"{table.caption} {' '.join(table.section_path)} {table.markdown[:1200]}".lower()
         keyword_score = sum(5 for keyword in keywords if keyword in text)
-        size_score = min(8, len(table.rows)) + min(5, len(table.headers[-1]) if table.headers else 0)
+        markdown_lines = [line for line in table.markdown.splitlines() if line.strip().startswith("|")]
+        row_score = min(8, max(0, len(markdown_lines) - 2))
+        column_score = min(5, max(0, markdown_lines[0].count("|") - 1)) if markdown_lines else 0
+        size_score = row_score + column_score
         return keyword_score + size_score, len(table.markdown)
 
     limit = int(os.getenv("PAPERWIKI_DEFAULT_CARD_TABLES", "3"))
@@ -676,7 +690,12 @@ def paper_coverage_issues(candidate: DistilledCandidate, packet: SourcePacket | 
     issues = []
     paper_type = str(content.get("paper_type") or "").lower()
     required_text = {
-        "research_problem": 80,
+        # These are content-unit thresholds rather than raw character counts.
+        # CJK technical prose carries more information per character, so
+        # ``_text_content_units`` counts each CJK ideograph as two units. This
+        # keeps short labels out without rejecting a complete Chinese problem
+        # statement merely because it is one or two raw characters short.
+        "research_problem": 60,
         "motivation": 60,
         "method_overview": 120,
     }
@@ -686,8 +705,8 @@ def paper_coverage_issues(candidate: DistilledCandidate, packet: SourcePacket | 
     ):
         required_text["comparison_to_prior_work"] = 60
     for key, minimum in required_text.items():
-        if len(sanitize_wiki_text(str(content.get(key) or ""))) < minimum:
-            issues.append(f"{key} is missing or too shallow (minimum {minimum} characters)")
+        if _text_content_units(str(content.get(key) or "")) < minimum:
+            issues.append(f"{key} is missing or too shallow (minimum {minimum} content units)")
     for key, minimum in (("contributions", 2), ("key_takeaways", 3)):
         value = content.get(key)
         if not isinstance(value, list) or len([item for item in value if item not in (None, "", {})]) < minimum:
@@ -707,6 +726,14 @@ def paper_coverage_issues(candidate: DistilledCandidate, packet: SourcePacket | 
     if packet and packet.figures and not content.get("figure_notes"):
         issues.append("source contains figures but no figure_notes were attached")
     return issues
+
+
+def _text_content_units(value: str) -> int:
+    """Return a lightweight language-aware measure of substantive text size."""
+    text = sanitize_wiki_text(value)
+    compact = re.sub(r"\s+", "", text)
+    cjk_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", compact))
+    return len(compact) + cjk_count
 
 
 def _candidate_prompt_json(candidate: DistilledCandidate, *, include_artifacts: bool = True) -> str:

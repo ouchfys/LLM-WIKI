@@ -16,6 +16,9 @@ data/*
 /maintenance/
 /test/paper_ingestion_runs/
 /test/paper_ingestion_tonight/
+/test/evaluation/workspaces/
+/test/evaluation/executions/
+/backups/
 *.db
 *.sqlite
 *.sqlite3

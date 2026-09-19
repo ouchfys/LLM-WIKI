@@ -27,7 +27,9 @@ from system.core.config import (
     ARXIV_API_URL,
     ARXIV_MCP_CACHE_DIR,
     ARXIV_MAX_PDF_MB,
+    ARXIV_MAX_ATTEMPTS,
     ARXIV_PDF_BASE_URL,
+    ARXIV_RETRY_BACKOFF_SECONDS,
     ARXIV_REQUEST_INTERVAL_SECONDS,
     ARXIV_TIMEOUT_SECONDS,
     ARXIV_USER_AGENT,
@@ -44,6 +46,11 @@ _MODERN_ID = re.compile(r"^\d{4}\.\d{4,5}(?:v\d+)?$", re.IGNORECASE)
 _LEGACY_ID = re.compile(r"^[a-z0-9][a-z0-9.\-]+/\d{7}(?:v\d+)?$", re.IGNORECASE)
 _SEARCH_SORTS = {"relevance", "lastUpdatedDate", "submittedDate"}
 _SEARCH_ORDERS = {"ascending", "descending"}
+_QUERY_FILLER_WORDS = {
+    "a", "an", "and", "about", "for", "in", "of", "on", "or", "paper", "papers",
+    "research", "the", "to", "with", "using", "large", "language", "model", "models",
+    "llm", "llms", "inference",
+}
 
 
 class ArxivServiceError(RuntimeError):
@@ -158,6 +165,8 @@ class ArxivClient:
         user_agent: str = ARXIV_USER_AGENT,
         timeout_seconds: float = ARXIV_TIMEOUT_SECONDS,
         max_pdf_mb: int = ARXIV_MAX_PDF_MB,
+        max_attempts: int = ARXIV_MAX_ATTEMPTS,
+        retry_backoff_seconds: float = ARXIV_RETRY_BACKOFF_SECONDS,
         session: requests.Session | Any | None = None,
         pacer: RequestPacer | None = None,
     ):
@@ -165,6 +174,8 @@ class ArxivClient:
         self.pdf_base_url = pdf_base_url.rstrip("/")
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.max_pdf_bytes = max(1, int(max_pdf_mb)) * 1024 * 1024
+        self.max_attempts = max(1, int(max_attempts))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.session = session or requests.Session()
         self.headers = {"User-Agent": user_agent, "Accept": "application/atom+xml"}
         self.pacer = pacer or _DEFAULT_PACER
@@ -202,7 +213,37 @@ class ArxivClient:
             "sortBy": sort_by,
             "sortOrder": sort_order,
         })
-        return self.parse_feed(xml_content, fallback_query=search_query)
+        page = self.parse_feed(xml_content, fallback_query=search_query)
+        if page.papers:
+            return page
+
+        # Natural-language tool calls often append evaluation context to the
+        # actual topic (for example, "KV cache quantization low-bit LLM
+        # serving"). Quoting that entire string asks arXiv for an exact phrase
+        # and commonly returns a false empty result. Retry once with the first
+        # few domain-bearing terms; the caller still receives relevance-ranked
+        # primary-source candidates and can refine from there.
+        for broadened in self._broaden_queries(query):
+            if broadened.casefold() == query.casefold():
+                continue
+            broad_search_query = self.build_search_query(
+                broadened,
+                author=author,
+                categories=categories,
+                year_from=year_from,
+                year_to=year_to,
+            )
+            broad_xml = self._get_atom({
+                "search_query": broad_search_query,
+                "start": start,
+                "max_results": max_results,
+                "sortBy": sort_by,
+                "sortOrder": sort_order,
+            })
+            page = self.parse_feed(broad_xml, fallback_query=broad_search_query)
+            if page.papers:
+                return page
+        return page
 
     def get_paper(self, arxiv_id: str) -> ArxivPaper | None:
         normalized = normalize_arxiv_id(arxiv_id)
@@ -398,22 +439,44 @@ class ArxivClient:
         )
 
     def _get_atom(self, params: dict[str, Any]) -> bytes:
-        self.pacer.wait()
-        try:
-            response = self.session.get(
-                self.api_url,
-                params=params,
-                headers=self.headers,
-                timeout=self.timeout_seconds,
-            )
-            response.raise_for_status()
-            return response.content
-        except requests.RequestException as exc:
-            raise ArxivServiceError(f"arXiv API request failed: {exc}") from exc
+        last_error: requests.RequestException | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            self.pacer.wait()
+            try:
+                response = self.session.get(
+                    self.api_url,
+                    params=params,
+                    headers=self.headers,
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                return response.content
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < self.max_attempts and self.retry_backoff_seconds:
+                    time.sleep(self.retry_backoff_seconds * attempt)
+        raise ArxivServiceError(
+            f"arXiv API request failed after {self.max_attempts} attempt(s): {last_error}"
+        ) from last_error
 
     @staticmethod
     def _escape_query_value(value: str) -> str:
         return value.replace("\\", " ").replace('"', " ").strip()
+
+    @staticmethod
+    def _broaden_queries(value: str) -> list[str]:
+        tokens = re.findall(r"[A-Za-z0-9]+(?:[-.][A-Za-z0-9]+)*", _clean_text(value))
+        meaningful: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            normalized = token.casefold()
+            if normalized in _QUERY_FILLER_WORDS or normalized in seen:
+                continue
+            seen.add(normalized)
+            meaningful.append(token)
+        selected = meaningful or tokens
+        candidates = [" ".join(selected[:3]), " ".join(selected[:2])]
+        return [candidate for index, candidate in enumerate(candidates) if candidate and candidate not in candidates[:index]]
 
     @staticmethod
     def _safe_int(value: str) -> int:

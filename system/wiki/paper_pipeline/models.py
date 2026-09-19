@@ -30,20 +30,6 @@ class SourceElement(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class TableCellEvidence(BaseModel):
-    cell_id: str
-    table_id: str
-    row_index: int = 0
-    column_index: int = 0
-    row_span: int = 1
-    column_span: int = 1
-    text: str = ""
-    row_header: bool = False
-    column_header: bool = False
-    page: int = 0
-    bbox: dict[str, float] = Field(default_factory=dict)
-
-
 class SourceTable(BaseModel):
     table_id: str
     element_id: str
@@ -51,11 +37,8 @@ class SourceTable(BaseModel):
     section_path: list[str] = Field(default_factory=list)
     page: int = 0
     bbox: dict[str, float] = Field(default_factory=dict)
-    headers: list[list[str]] = Field(default_factory=list)
-    rows: list[list[str]] = Field(default_factory=list)
     markdown: str = ""
     docling_ref: str = ""
-    cells: list[TableCellEvidence] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -212,7 +212,7 @@ def test_pressure_pruning_retains_complete_structured_items_from_both_ends():
         f'[Tool Item {i}] {{"id": {i}, "text": "VALUE-{i}-' + ("x" * 45) + '"}'
         for i in range(1, 11)
     )
-    block = f"[Observation 1] tool=table_query; result_id=91; summary=rows\n{items}"
+    block = f"[Observation 1] tool=wiki_open; result_id=91; summary=pages\n{items}"
     pruned = budget._prune_observation_chars(block)
 
     assert len(pruned) <= 600

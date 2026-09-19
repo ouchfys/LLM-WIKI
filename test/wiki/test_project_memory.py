@@ -79,7 +79,10 @@ def test_model_resolves_followup_and_memory_is_updated_directly(tmp_path):
     user_id = store.save_message(session_id, "user", user_text)
     assistant_id = store.save_message(session_id, "assistant", "已按工程约束重新筛选。")
 
-    def invoke(_prompt, operation, _max_tokens):
+    invocation = {}
+
+    def invoke(prompt, operation, max_tokens):
+        invocation.update(prompt=prompt, max_tokens=max_tokens)
         if operation == "memory.resolve_turn":
             return json.dumps({
                 "is_followup": True,
@@ -108,6 +111,8 @@ def test_model_resolves_followup_and_memory_is_updated_directly(tmp_path):
     assert "不能修改 CUDA kernel" in saved["content"]
     assert "回答先说结论" in store.render_project_context(session_id, "QServe")
     assert store.get_session_state(session_id) == {}
+    assert invocation["max_tokens"] == 1024
+    assert "at most 1000 characters" in invocation["prompt"]
 
 
 def test_model_managed_memory_replaces_stale_project_state(tmp_path):

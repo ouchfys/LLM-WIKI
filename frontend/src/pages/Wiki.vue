@@ -59,7 +59,7 @@
                       <p>{{ processStepDetail(step) }}</p>
 
                       <div v-if="step.items?.length" class="process-results">
-                        <template v-for="(item, itemIndex) in step.items" :key="item.card_id || item.cell_id || item.url || `${step.eventId}-${itemIndex}`">
+                        <template v-for="(item, itemIndex) in step.items" :key="item.card_id || item.url || `${step.eventId}-${itemIndex}`">
                           <button
                             v-if="item.card_id"
                             type="button"
@@ -74,12 +74,6 @@
                               命中小节：{{ item.matched_sections.map(section => section.section).filter(Boolean).join(' / ') }}
                             </small>
                           </button>
-
-                          <div v-else-if="step.tool === 'table_query'" class="process-cell-result">
-                            <span>{{ item.row_label || item.source_title }} × {{ item.column_label || '匹配列' }}</span>
-                            <strong>{{ normalizeCellValue(item.value) }}</strong>
-                            <small>{{ item.page ? `第 ${item.page} 页` : item.table_id }}</small>
-                          </div>
 
                           <div v-else class="process-generic-result">
                             <strong>{{ item.title || item.url || '工具结果' }}</strong>
@@ -440,7 +434,6 @@ function processStepTitle(tool: string) {
     wiki_search: '搜索 Wiki',
     wiki_open: '阅读 Wiki 页面',
     wiki_card: '阅读 Wiki 页面',
-    table_query: '核验表格证据',
     evidence_lookup: '核验原文依据',
     web_search: '搜索外部资料',
     web_fetch: '读取网页原文',
@@ -477,7 +470,6 @@ function processStepDetail(step: ToolEvent) {
       wiki_search: `正在用 ${query} 匹配标题、别名与 Wiki 索引。`,
       wiki_open: '正在打开高相关页面，只读取面向用户的 Markdown 正文。',
       wiki_card: '正在打开高相关页面，读取 Markdown 正文与页面关系。',
-      table_query: '正在定位表格、行列和原始单元格证据。',
       evidence_lookup: '正在按需回查来源段落，核验当前关键结论。',
       web_search: `正在搜索 ${query} 的外部信息。`,
       web_fetch: '正在读取候选网页的正文段落。',
@@ -490,7 +482,6 @@ function processStepDetail(step: ToolEvent) {
   if (step.tool === 'wiki_search') return `找到 ${count || step.items?.length || 0} 个候选页面，并保留匹配分与命中原因。`
   if (step.tool === 'wiki_open') return `已读取 ${count || step.items?.length || 0} 个高相关 Wiki 页面。`
   if (step.tool === 'wiki_card') return `已读取 ${count || step.items?.length || 0} 张高相关 Wiki 页面。`
-  if (step.tool === 'table_query') return step.detail || '已定位表格单元格及页码。'
   if (step.tool === 'evidence_lookup') return step.detail || '已按需回查原文段落。'
   if (step.tool === 'context') return '已结合最近对话解析追问指代。'
   if (step.tool === 'conversation_context') return step.detail || '已按用户要求选择相关对话。'
@@ -510,10 +501,6 @@ function formatMatchReason(reason: string | undefined) {
   return reason
     .replace('page_fts', '页面全文命中')
     .replace(/term_overlap:(\d+)\/(\d+)/, '关键词重合 $1/$2')
-}
-
-function normalizeCellValue(value: string | undefined) {
-  return String(value || '—').replace(/\s*\.\s*/g, '.').replace(/\s+%/g, '%')
 }
 
 function openProcessCard(item: ToolEventItem) {
@@ -1661,7 +1648,6 @@ onBeforeUnmount(() => {
 }
 
 .process-card-result,
-.process-cell-result,
 .process-generic-result {
   min-width: 0;
   display: grid;
@@ -1690,8 +1676,7 @@ onBeforeUnmount(() => {
   outline-offset: 2px;
 }
 
-.process-card-result > span,
-.process-cell-result > span {
+.process-card-result > span {
   color: #a8bdb3;
   font-size: 9px;
   font-weight: 750;
@@ -1709,7 +1694,6 @@ onBeforeUnmount(() => {
 }
 
 .process-card-result > small,
-.process-cell-result > small,
 .process-generic-result > small {
   overflow: hidden;
   color: var(--ink-text-muted);
@@ -1717,25 +1701,6 @@ onBeforeUnmount(() => {
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.process-cell-result {
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-}
-
-.process-cell-result > span,
-.process-cell-result > small {
-  grid-column: 1;
-}
-
-.process-cell-result > strong {
-  grid-column: 2;
-  grid-row: 1 / span 2;
-  color: #dce9e3;
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 16px;
-  font-variant-numeric: tabular-nums;
 }
 
 .evidence-rail {

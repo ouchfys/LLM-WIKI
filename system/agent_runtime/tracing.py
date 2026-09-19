@@ -25,6 +25,13 @@ class TraceRecorder:
         self.run_id = run_id
         self.trace_id = run_id
 
+    def _append_event(self, **kwargs) -> dict[str, Any]:
+        """A deliberately deleted run stops tracing instead of breaking its worker."""
+        try:
+            return self.store.append_event(self.run_id, **kwargs)
+        except KeyError:
+            return {}
+
     @contextmanager
     def bind(self) -> Iterator["TraceRecorder"]:
         """Make this recorder available to nested model/tool helpers."""
@@ -94,8 +101,7 @@ class TraceRecorder:
             "started_perf": time.perf_counter(),
             "finished": False,
         }
-        self.store.append_event(
-            self.run_id,
+        self._append_event(
             event_type=f"{kind}.started",
             node_name=name,
             status="running",
@@ -135,8 +141,7 @@ class TraceRecorder:
         outcome = str(status).lower() if status in {"cancelled", "interrupted"} else ("failed" if failed else "completed")
         state["status"] = outcome
         state["error"] = error or str(state.get("error") or "")
-        return self.store.append_event(
-            self.run_id,
+        return self._append_event(
             event_type=f"{state.get('kind', 'node')}.{outcome}",
             node_name=str(state.get("name") or ""),
             status=outcome,
@@ -166,8 +171,7 @@ class TraceRecorder:
         tool_name: str = "",
         error: str = "",
     ) -> dict[str, Any]:
-        return self.store.append_event(
-            self.run_id,
+        return self._append_event(
             event_type=event_type,
             node_name=name,
             status=status,

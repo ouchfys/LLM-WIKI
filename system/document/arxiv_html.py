@@ -270,20 +270,6 @@ def _table_record(node: Tag, source_key: str, ref: str, index: int, heading_path
     caption_node = figure.find("figcaption") if figure else None
     caption = _clean(caption_node.get_text(" ", strip=True) if caption_node else "")
     table_id = f"tbl-{stable_evidence_id(source_key, 'table', ref, index)[3:]}"
-    cells = []
-    for row_index, row in enumerate(grid):
-        for column_index, value in enumerate(row):
-            cells.append({
-                "cell_id": stable_evidence_id(source_key, "table_cell", f"{table_id}:{row_index}:{column_index}"),
-                "table_id": table_id,
-                "row_index": row_index,
-                "column_index": column_index,
-                "text": value,
-                "column_header": row_index == first_header,
-                "row_header": False,
-                "page": 0,
-                "bbox": {},
-            })
     return {
         "table_id": table_id,
         "element_id": "",
@@ -295,7 +281,6 @@ def _table_record(node: Tag, source_key: str, ref: str, index: int, heading_path
         "rows": rows,
         "markdown": matrix_to_markdown(headers, rows),
         "docling_ref": ref,
-        "cells": cells,
         "metadata": {"source_locator_kind": "html_anchor", "source_ref": ref, "num_rows": len(grid), "num_cols": width},
     }
 

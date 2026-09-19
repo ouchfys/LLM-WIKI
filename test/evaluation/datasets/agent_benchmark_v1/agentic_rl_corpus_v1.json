@@ -1,0 +1,223 @@
+{
+  "version": "agentic_rl_corpus_v1",
+  "snapshot_date": "2026-09-15",
+  "paper_count": 30,
+  "selection_policy": "A reproducible, primary-source-verified snapshot of recent and representative Agentic RL work. It is intentionally stratified across surveys, multi-turn algorithms, reward and credit assignment, search/deep-research agents, memory, and training systems; it is not a raw newest-by-date feed.",
+  "provenance": [
+    "https://arxiv.org/abs/2509.02547",
+    "https://arxiv.org/abs/2509.06733",
+    "https://github.com/wenjunli-0/deepresearch-survey"
+  ],
+  "papers": [
+    {
+      "arxiv_id": "2608.03223",
+      "title": "Agentic Reinforcement Learning with Self-Distilled Reward Shaping",
+      "bucket": "reward_credit",
+      "abs_url": "https://arxiv.org/abs/2608.03223",
+      "pdf_url": "https://arxiv.org/pdf/2608.03223"
+    },
+    {
+      "arxiv_id": "2607.01120",
+      "title": "Next-Generation Agentic Reinforcement Learning Systems Enable Self-Evolving Agents",
+      "bucket": "online_rl_systems",
+      "abs_url": "https://arxiv.org/abs/2607.01120",
+      "pdf_url": "https://arxiv.org/pdf/2607.01120"
+    },
+    {
+      "arxiv_id": "2602.00994",
+      "title": "Reasoning and Tool-use Compete in Agentic RL: From Quantifying Interference to Disentangled Tuning",
+      "bucket": "capability_interference",
+      "abs_url": "https://arxiv.org/abs/2602.00994",
+      "pdf_url": "https://arxiv.org/pdf/2602.00994"
+    },
+    {
+      "arxiv_id": "2510.24126",
+      "title": "Reinforcement Learning for Long-Horizon Multi-Turn Search Agents",
+      "bucket": "long_horizon_search",
+      "abs_url": "https://arxiv.org/abs/2510.24126",
+      "pdf_url": "https://arxiv.org/pdf/2510.24126"
+    },
+    {
+      "arxiv_id": "2510.04206",
+      "title": "AgentRL: Scaling Agentic Reinforcement Learning with a Multi-Turn, Multi-Task Framework",
+      "bucket": "multi_task_framework",
+      "abs_url": "https://arxiv.org/abs/2510.04206",
+      "pdf_url": "https://arxiv.org/pdf/2510.04206"
+    },
+    {
+      "arxiv_id": "2510.01132",
+      "title": "A Practitioner's Guide to Multi-turn Agentic Reinforcement Learning",
+      "bucket": "training_recipe",
+      "abs_url": "https://arxiv.org/abs/2510.01132",
+      "pdf_url": "https://arxiv.org/pdf/2510.01132"
+    },
+    {
+      "arxiv_id": "2509.08755",
+      "title": "AgentGym-RL: Training LLM Agents for Long-Horizon Decision Making through Multi-Turn Reinforcement Learning",
+      "bucket": "environment_curriculum",
+      "abs_url": "https://arxiv.org/abs/2509.08755",
+      "pdf_url": "https://arxiv.org/pdf/2509.08755"
+    },
+    {
+      "arxiv_id": "2509.02547",
+      "title": "The Landscape of Agentic Reinforcement Learning for LLMs: A Survey",
+      "bucket": "survey",
+      "abs_url": "https://arxiv.org/abs/2509.02547",
+      "pdf_url": "https://arxiv.org/pdf/2509.02547"
+    },
+    {
+      "arxiv_id": "2509.06733",
+      "title": "Reinforcement Learning Foundations for Deep Research Systems: A Survey",
+      "bucket": "survey",
+      "abs_url": "https://arxiv.org/abs/2509.06733",
+      "pdf_url": "https://arxiv.org/pdf/2509.06733"
+    },
+    {
+      "arxiv_id": "2508.18669",
+      "title": "MUA-RL: Multi-turn User-interacting Agent Reinforcement Learning for agentic tool use",
+      "bucket": "user_tool_interaction",
+      "abs_url": "https://arxiv.org/abs/2508.18669",
+      "pdf_url": "https://arxiv.org/pdf/2508.18669"
+    },
+    {
+      "arxiv_id": "2508.07976",
+      "title": "Beyond Ten Turns: Unlocking Long-Horizon Agentic Search with Large-Scale Asynchronous RL",
+      "bucket": "long_horizon_search",
+      "abs_url": "https://arxiv.org/abs/2508.07976",
+      "pdf_url": "https://arxiv.org/pdf/2508.07976"
+    },
+    {
+      "arxiv_id": "2508.10874",
+      "title": "SSRL: Self-Search Reinforcement Learning",
+      "bucket": "search_rl",
+      "abs_url": "https://arxiv.org/abs/2508.10874",
+      "pdf_url": "https://arxiv.org/pdf/2508.10874"
+    },
+    {
+      "arxiv_id": "2508.03680",
+      "title": "Agent Lightning: Train ANY AI Agents with Reinforcement Learning",
+      "bucket": "training_system",
+      "abs_url": "https://arxiv.org/abs/2508.03680",
+      "pdf_url": "https://arxiv.org/pdf/2508.03680"
+    },
+    {
+      "arxiv_id": "2508.20404",
+      "title": "AWorld: Orchestrating the Training Recipe for Agentic AI",
+      "bucket": "training_system",
+      "abs_url": "https://arxiv.org/abs/2508.20404",
+      "pdf_url": "https://arxiv.org/pdf/2508.20404"
+    },
+    {
+      "arxiv_id": "2507.19849",
+      "title": "Agentic Reinforced Policy Optimization",
+      "bucket": "policy_optimization",
+      "abs_url": "https://arxiv.org/abs/2507.19849",
+      "pdf_url": "https://arxiv.org/pdf/2507.19849"
+    },
+    {
+      "arxiv_id": "2507.02962",
+      "title": "RAG-R1: Incentivizing the Search and Reasoning Capabilities of LLMs through Multi-query Parallelism",
+      "bucket": "parallel_search_rl",
+      "abs_url": "https://arxiv.org/abs/2507.02962",
+      "pdf_url": "https://arxiv.org/pdf/2507.02962"
+    },
+    {
+      "arxiv_id": "2507.02592",
+      "title": "WebSailor: Navigating Super-human Reasoning for Web Agent",
+      "bucket": "search_data_curriculum",
+      "abs_url": "https://arxiv.org/abs/2507.02592",
+      "pdf_url": "https://arxiv.org/pdf/2507.02592"
+    },
+    {
+      "arxiv_id": "2506.15841",
+      "title": "MEM1: Learning to Synergize Memory and Reasoning for Efficient Long-Horizon Agents",
+      "bucket": "learned_memory",
+      "abs_url": "https://arxiv.org/abs/2506.15841",
+      "pdf_url": "https://arxiv.org/pdf/2506.15841"
+    },
+    {
+      "arxiv_id": "2505.24298",
+      "title": "AReaL: A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning",
+      "bucket": "training_system",
+      "abs_url": "https://arxiv.org/abs/2505.24298",
+      "pdf_url": "https://arxiv.org/pdf/2505.24298"
+    },
+    {
+      "arxiv_id": "2505.24332",
+      "title": "DeepDiver: Adaptive Search Intensity Scaling via Open-Web Reinforcement Learning",
+      "bucket": "adaptive_search",
+      "abs_url": "https://arxiv.org/abs/2505.24332",
+      "pdf_url": "https://arxiv.org/pdf/2505.24332"
+    },
+    {
+      "arxiv_id": "2505.22648",
+      "title": "WebDancer: Towards Autonomous Information Seeking Agency",
+      "bucket": "search_data_curriculum",
+      "abs_url": "https://arxiv.org/abs/2505.22648",
+      "pdf_url": "https://arxiv.org/pdf/2505.22648"
+    },
+    {
+      "arxiv_id": "2505.22501",
+      "title": "EvolveSearch: An Iterative Self-Evolving Search Agent",
+      "bucket": "self_evolving_search",
+      "abs_url": "https://arxiv.org/abs/2505.22501",
+      "pdf_url": "https://arxiv.org/pdf/2505.22501"
+    },
+    {
+      "arxiv_id": "2505.17005",
+      "title": "R1-Searcher++: Incentivizing the Dynamic Knowledge Acquisition of LLMs via Reinforcement Learning",
+      "bucket": "search_rl",
+      "abs_url": "https://arxiv.org/abs/2505.17005",
+      "pdf_url": "https://arxiv.org/pdf/2505.17005"
+    },
+    {
+      "arxiv_id": "2505.15107",
+      "title": "StepSearch: Igniting LLMs Search Ability via Step-Wise Proximal Policy Optimization",
+      "bucket": "stepwise_rl",
+      "abs_url": "https://arxiv.org/abs/2505.15107",
+      "pdf_url": "https://arxiv.org/pdf/2505.15107"
+    },
+    {
+      "arxiv_id": "2505.14146",
+      "title": "s3: You Don't Need That Much Data to Train a Search Agent via RL",
+      "bucket": "sample_efficiency",
+      "abs_url": "https://arxiv.org/abs/2505.14146",
+      "pdf_url": "https://arxiv.org/pdf/2505.14146"
+    },
+    {
+      "arxiv_id": "2505.11821",
+      "title": "Reinforcing Multi-Turn Reasoning in LLM Agents via Fine-Grained Reward Structure and Credit Assignment",
+      "bucket": "reward_credit",
+      "abs_url": "https://arxiv.org/abs/2505.11821",
+      "pdf_url": "https://arxiv.org/pdf/2505.11821"
+    },
+    {
+      "arxiv_id": "2505.04588",
+      "title": "ZeroSearch: Incentivize the Search Capability of LLMs without Searching",
+      "bucket": "simulated_search",
+      "abs_url": "https://arxiv.org/abs/2505.04588",
+      "pdf_url": "https://arxiv.org/pdf/2505.04588"
+    },
+    {
+      "arxiv_id": "2504.20073",
+      "title": "RAGEN: Understanding Self-Evolution in LLM Agents via Multi-Turn Reinforcement Learning",
+      "bucket": "training_stability",
+      "abs_url": "https://arxiv.org/abs/2504.20073",
+      "pdf_url": "https://arxiv.org/pdf/2504.20073"
+    },
+    {
+      "arxiv_id": "2504.03160",
+      "title": "DeepResearcher: Scaling Deep Research via Reinforcement Learning in Real-world Environments",
+      "bucket": "deep_research_rl",
+      "abs_url": "https://arxiv.org/abs/2504.03160",
+      "pdf_url": "https://arxiv.org/pdf/2504.03160"
+    },
+    {
+      "arxiv_id": "2503.09516",
+      "title": "Search-R1: Training LLMs to Reason and Leverage Search Engines with Reinforcement Learning",
+      "bucket": "search_rl",
+      "abs_url": "https://arxiv.org/abs/2503.09516",
+      "pdf_url": "https://arxiv.org/pdf/2503.09516"
+    }
+  ]
+}

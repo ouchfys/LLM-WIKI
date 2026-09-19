@@ -42,6 +42,15 @@ ATOM_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
 </feed>
 """
 
+EMPTY_ATOM_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <opensearch:totalResults>0</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <opensearch:itemsPerPage>0</opensearch:itemsPerPage>
+</feed>
+"""
+
 
 class FakeResponse:
     def __init__(self, *, content: bytes = b"", json_data=None, headers=None, status_code: int = 200):
@@ -79,7 +88,10 @@ class FakeSession:
         self.get_calls.append((url, kwargs))
         if not self.get_responses:
             raise AssertionError("Unexpected GET")
-        return self.get_responses.pop(0)
+        response = self.get_responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     def post(self, url, **kwargs):
         uploaded = kwargs["files"]["file"]
@@ -133,6 +145,58 @@ def test_search_builds_filters_and_parses_rich_metadata() -> None:
     assert "cat:cs.CL OR cat:cs.AI" in params["search_query"]
     assert "../bad" not in params["search_query"]
     assert "submittedDate:[201701010000 TO 202012312359]" in params["search_query"]
+
+
+def test_search_retries_transient_arxiv_timeout() -> None:
+    import requests
+
+    session = FakeSession(get_responses=[requests.ReadTimeout("slow"), FakeResponse(content=ATOM_FEED)])
+    client = ArxivClient(
+        session=session,
+        pacer=RequestPacer(0),
+        max_attempts=2,
+        retry_backoff_seconds=0,
+    )
+
+    page = client.search("attention", max_results=1)
+
+    assert page.papers[0].arxiv_id == "1706.03762v7"
+    assert len(session.get_calls) == 2
+
+
+def test_search_broadens_over_specific_natural_language_query_once() -> None:
+    session = FakeSession(get_responses=[
+        FakeResponse(content=EMPTY_ATOM_FEED),
+        FakeResponse(content=ATOM_FEED),
+    ])
+    client = ArxivClient(session=session, pacer=RequestPacer(0))
+
+    page = client.search("KV cache quantization low-bit LLM serving", max_results=5)
+
+    assert page.papers[0].arxiv_id == "1706.03762v7"
+    assert len(session.get_calls) == 2
+    assert session.get_calls[0][1]["params"]["search_query"] == (
+        'all:"KV cache quantization low-bit LLM serving"'
+    )
+    assert session.get_calls[1][1]["params"]["search_query"] == 'all:"KV cache quantization"'
+
+
+def test_search_deduplicates_terms_and_uses_two_term_fallback() -> None:
+    session = FakeSession(get_responses=[
+        FakeResponse(content=EMPTY_ATOM_FEED),
+        FakeResponse(content=EMPTY_ATOM_FEED),
+        FakeResponse(content=ATOM_FEED),
+    ])
+    client = ArxivClient(session=session, pacer=RequestPacer(0))
+
+    page = client.search(
+        "LLM agent harness, agent loop, tool use, planning, context management",
+        max_results=5,
+    )
+
+    assert page.papers[0].arxiv_id == "1706.03762v7"
+    queries = [call[1]["params"]["search_query"] for call in session.get_calls]
+    assert queries[-2:] == ['all:"agent harness loop"', 'all:"agent harness"']
 
 
 def test_pdf_download_is_validated_hashed_and_cached(tmp_path: Path) -> None:

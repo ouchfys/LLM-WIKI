@@ -339,6 +339,44 @@ class WikiStore:
                 ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def corpus_manifest(
+        self,
+        *,
+        page_type: str = "PaperPage",
+        cursor: int = 0,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Enumerate a stable corpus page; unlike search, this never ranks or repeats."""
+        start = max(0, int(cursor or 0))
+        page_size = max(1, min(int(limit or 50), 100))
+        where = "WHERE page_type=?" if page_type else ""
+        params: list[Any] = [page_type] if page_type else []
+        with closing(self._connect()) as conn:
+            total = int(conn.execute(
+                f"SELECT COUNT(*) FROM wiki_pages {where}", params
+            ).fetchone()[0])
+            rows = conn.execute(
+                f"""SELECT id,title,page_type,markdown_path,summary,source_level,
+                           related_topics_json,updated_at
+                    FROM wiki_pages {where}
+                    ORDER BY lower(title), id LIMIT ? OFFSET ?""",
+                [*params, page_size, start],
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["card_id"] = item.pop("id")
+            item["related_topics"] = self._load_json(item.pop("related_topics_json"))
+            items.append(item)
+        next_cursor = start + len(items) if start + len(items) < total else None
+        return {
+            "total": total,
+            "cursor": start,
+            "next_cursor": next_cursor,
+            "page_type": page_type or "all",
+            "items": items,
+        }
+
     def search_cards(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         query = (query or "").strip()
         if not query:

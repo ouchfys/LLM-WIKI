@@ -20,7 +20,10 @@ class ObjectStorage:
     TENANT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
     def __init__(self, tenant_id: str | None = None):
-        self.repo_root = Path(__file__).resolve().parents[2]
+        configured_workspace = str(getattr(config, "PAPERWIKI_WORKSPACE_ROOT", "") or "").strip()
+        self.repo_root = (
+            Path(configured_workspace) if configured_workspace else Path(__file__).resolve().parents[2]
+        )
         self.backend = (getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
         configured_tenant = getattr(config, "STORAGE_TENANT_ID", "admin") or "admin"
         selected_tenant = configured_tenant if tenant_id is None else tenant_id

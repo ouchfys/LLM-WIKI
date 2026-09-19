@@ -23,12 +23,7 @@ export type ToolEventItem = {
   match_reason?: string
   matched_sections?: Array<{ section?: string; snippet?: string; route?: string }>
   source_title?: string
-  table_id?: string
   page?: number
-  row_label?: string
-  column_label?: string
-  value?: string
-  cell_id?: string
   url?: string
   snippet?: string
   section?: string

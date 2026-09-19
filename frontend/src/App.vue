@@ -209,13 +209,13 @@ async function loadSessions() {
 }
 
 async function deleteSession(sessionId: string) {
-  const ok = window.confirm('删除这条会话记录？长期记忆和个人 Wiki 不会被删除。')
+  const ok = window.confirm('删除这条会话记录及其 Agent 运行轨迹？长期记忆和个人 Wiki 不会被删除。')
   if (!ok) return
 
   try {
     await api.delete(`/wiki/sessions/${sessionId}`)
     sessionNoticeError.value = false
-    sessionNotice.value = '已删除该会话及其全部消息。'
+    sessionNotice.value = '已删除该会话、全部消息及其 Agent 运行轨迹。'
     if (activeSessionId.value === sessionId) {
       localStorage.removeItem('wiki_chat_session_id')
       await router.push({
@@ -233,14 +233,14 @@ async function deleteSession(sessionId: string) {
 
 async function clearAllSessions() {
   if (deletingSessions.value) return
-  const ok = window.confirm('清空所有会话记录？长期记忆、用户画像和个人 Wiki 会保留。')
+  const ok = window.confirm('清空所有会话记录及其 Agent 运行轨迹？长期记忆、用户画像和个人 Wiki 会保留。')
   if (!ok) return
 
   try {
     deletingSessions.value = true
     const { data } = await api.delete<{ deleted: number }>('/wiki/sessions')
     sessionNoticeError.value = false
-    sessionNotice.value = '已从数据库删除 ' + data.deleted + ' 个会话及其消息。Wiki 和长期记忆已保留。'
+    sessionNotice.value = '已从数据库删除 ' + data.deleted + ' 个会话及其 Agent 运行轨迹。Wiki 和长期记忆已保留。'
     localStorage.removeItem('wiki_chat_session_id')
     recentSessions.value = []
     await router.push({

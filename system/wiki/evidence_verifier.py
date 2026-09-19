@@ -1,4 +1,4 @@
-"""Independent verification against persisted source elements and table cells."""
+"""Independent verification against persisted source spans."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ Return strict JSON only:
 CLAIM:
 {claim}
 
-SOURCE EVIDENCE (persisted parser spans/cells):
+SOURCE EVIDENCE (persisted parser spans):
 {evidence}
 """
 
@@ -91,7 +91,13 @@ class EvidenceVerifier:
                 evidence_ids=refs,
                 structured_required=has_structured_evidence,
             )
-            claim.verifier_result = result.semantic_result if result.semantic_result != "not_run" else result.result
+            claim.verifier_result = (
+                result.result
+                if result.result == "legacy_unverified"
+                else result.semantic_result
+                if result.semantic_result != "not_run"
+                else result.result
+            )
             claim.verifier_reason = result.semantic_reason or result.reason
             claim.entailment_score = result.entailment_score
             results.append(result)
@@ -121,7 +127,10 @@ class EvidenceVerifier:
             result.semantic_result = expected
             result.semantic_reason = str(claim.get("verifier_reason") or "")
             result.entailment_score = float(claim.get("entailment_score") or 0.0)
-            if expected not in {"entailed", "supported"}:
+            if expected in {"legacy_unverified", "verification_deferred"}:
+                result.result = "legacy_unverified"
+                result.reason = result.semantic_reason or "semantic verification deferred"
+            elif expected not in {"entailed", "supported"}:
                 result.result = "unsupported"
                 result.reason = f"semantic verifier result is {expected}: {result.semantic_reason}"
         return result
@@ -161,7 +170,13 @@ class EvidenceVerifier:
             return ClaimVerification(statement=statement, result="unsupported", reason=f"numeric value not found in source evidence: {missing}", evidence_ids=evidence_ids, evidence=compact)
         result = ClaimVerification(statement=statement, result="supported", reason="evidence ids resolved and source span was re-read", evidence_ids=evidence_ids, evidence=compact)
         if self.llm:
-            self._semantic_verify(result, statement, compact)
+            strong_deterministic_binding = overlap >= 0.75 and not cross_script
+            self._semantic_verify(
+                result,
+                statement,
+                compact,
+                fallback_allowed=strong_deterministic_binding,
+            )
         return result
 
     def _semantic_verify(
@@ -169,6 +184,8 @@ class EvidenceVerifier:
         result: ClaimVerification,
         statement: str,
         evidence: list[dict[str, Any]],
+        *,
+        fallback_allowed: bool = False,
     ) -> None:
         prompt = SEMANTIC_VERIFICATION_PROMPT.format(
             claim=statement,
@@ -181,8 +198,17 @@ class EvidenceVerifier:
             result.semantic_result = "error"
             result.semantic_reason = f"semantic verifier unavailable: {exc}"
             result.entailment_score = 0.0
-            result.result = "unsupported"
-            result.reason = result.semantic_reason
+            if fallback_allowed:
+                # Preserve strongly bound source text during provider outages,
+                # but label it honestly: semantic verification is deferred.
+                result.result = "legacy_unverified"
+                result.reason = (
+                    "semantic verification deferred; deterministic evidence-id, "
+                    "text-overlap and numeric checks passed"
+                )
+            else:
+                result.result = "unsupported"
+                result.reason = result.semantic_reason
             return
         label = str(payload.get("label") or "insufficient").lower()
         if label not in {"entailed", "contradicted", "insufficient"}:
@@ -210,9 +236,6 @@ class EvidenceVerifier:
             "page": int(item.get("page") or 0),
             "bbox": item.get("bbox") or {},
             "docling_ref": item.get("docling_ref", ""),
-            "table_id": item.get("table_id", ""),
-            "row_index": item.get("row_index"),
-            "column_index": item.get("column_index"),
         }
 
 

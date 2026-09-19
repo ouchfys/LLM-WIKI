@@ -6,6 +6,7 @@ from system.document.evidence import matrix_to_markdown
 from system.wiki.markdown_vault import MarkdownVault
 from system.wiki.paper_pipeline.distiller import PaperDistiller, build_source_context, paper_coverage_issues
 from system.wiki.paper_pipeline.models import DistilledCandidate, SourcePacket, SourceSection, SourceTable
+from system.wiki.wiki_builder import sanitize_wiki_text
 
 
 def _table() -> SourceTable:
@@ -17,8 +18,6 @@ def _table() -> SourceTable:
         caption="Table 2: Main serving results",
         section_path=["Experiments", "Main Results"],
         page=8,
-        headers=headers,
-        rows=rows,
         markdown=matrix_to_markdown(headers, rows),
     )
 
@@ -94,6 +93,58 @@ def test_v2_coverage_gate_rejects_shallow_paper_but_accepts_complete_card():
     complete = _candidate()
     PaperDistiller()._attach_source_artifacts(complete, packet)
     assert paper_coverage_issues(complete, packet) == []
+
+
+def test_v2_research_problem_gate_accepts_substantive_cjk_explanation():
+    packet = SourcePacket(source_id="packet", title="Paper", tables=[_table()])
+    candidate = _candidate()
+    candidate.content_json["research_problem"] = (
+        "现有深度研究系统依赖人工轨迹或静态检索，难以在真实网页环境中学习多轮规划、"
+        "证据获取与答案生成之间的协同策略，因此需要可扩展的端到端强化学习方法。"
+    )
+    PaperDistiller()._attach_source_artifacts(candidate, packet)
+
+    issues = paper_coverage_issues(candidate, packet)
+
+    assert not any(issue.startswith("research_problem") for issue in issues)
+
+
+def test_v2_research_problem_gate_counts_cjk_information_density():
+    packet = SourcePacket(source_id="packet", title="Paper", tables=[_table()])
+    candidate = _candidate()
+    candidate.content_json["research_problem"] = (
+        "如何有效利用稠密的逐轮奖励结构，在GRPO和PPO等RL算法中实现细粒度的信用分配，"
+        "以提升多轮LLM智能体的推理能力。"
+    )
+    PaperDistiller()._attach_source_artifacts(candidate, packet)
+
+    issues = paper_coverage_issues(candidate, packet)
+
+    assert not any(issue.startswith("research_problem") for issue in issues)
+
+
+def test_distiller_recovers_missing_summary_from_structured_paper_content():
+    content = _candidate().content_json
+
+    candidate = PaperDistiller()._candidate_from_payload({
+        "candidate_type": "paper_page",
+        "page_type": "PaperPage",
+        "title": "EvolveSearch",
+        "summary": "",
+        "content_json": content,
+        "claims": [],
+    })
+
+    assert candidate is not None
+    assert len(candidate.summary) >= 20
+    assert content["research_problem"] in candidate.summary
+
+
+def test_sanitizer_keeps_long_cjk_prose_but_drops_ascii_blob_noise():
+    prose = "该方法通过多轮工具交互、细粒度奖励和状态恢复机制提升长时程搜索智能体的可靠性。" * 12
+
+    assert sanitize_wiki_text(prose) == prose
+    assert sanitize_wiki_text("A" * 300) == ""
 
 
 def test_paper_page_and_topic_compilation_use_separate_model_calls():

@@ -352,8 +352,6 @@ def _enrich_tables(tables: list[dict[str, Any]], provider_tables: list[dict[str,
             missing_caption_targets.append(table)
         if provider.get("page"):
             table["page"] = int(provider["page"])
-            for cell in table.get("cells") or []:
-                cell["page"] = int(provider["page"])
     # MinerU occasionally emits a table body before another table's caption.
     # content_list still identifies the bodies correctly but can omit one
     # caption. An otherwise-unused numbered caption can then be paired with the
@@ -494,19 +492,6 @@ def _html_tables(markdown: str, source_key: str) -> list[dict[str, Any]]:
         ref = f"mineru/table/{index}"
         element_id = stable_evidence_id(source_key, "table", ref, index)
         table_id = f"tbl-{element_id[3:]}"
-        cells = []
-        for row_index, row in enumerate(grid):
-            for column_index, value in enumerate(row):
-                cells.append({
-                    "cell_id": stable_evidence_id(source_key, "table_cell", f"{table_id}:{row_index}:{column_index}"),
-                    "table_id": table_id,
-                    "row_index": row_index,
-                    "column_index": column_index,
-                    "text": value,
-                    "column_header": row_index == 0,
-                    "page": 0,
-                    "bbox": {},
-                })
         raw_match = raw_tables[index] if index < len(raw_tables) else None
         raw_start = raw_match.start() if raw_match else -1
         raw_end = raw_match.end() if raw_match else -1
@@ -526,7 +511,6 @@ def _html_tables(markdown: str, source_key: str) -> list[dict[str, Any]]:
             "rows": rows,
             "markdown": matrix_to_markdown(headers, rows),
             "docling_ref": ref,
-            "cells": cells,
             "metadata": {"source_locator_kind": "mineru_block", "num_rows": len(grid), "num_cols": width},
         })
     return records

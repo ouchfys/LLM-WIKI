@@ -114,44 +114,6 @@ class PaperWikiPipelineStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_document_elements_page ON document_elements(source_packet_id, page)")
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS document_tables (
-                    id TEXT PRIMARY KEY,
-                    source_packet_id TEXT NOT NULL,
-                    element_id TEXT NOT NULL,
-                    caption TEXT DEFAULT '',
-                    section_path_json TEXT DEFAULT '[]',
-                    page INTEGER DEFAULT 0,
-                    bbox_json TEXT DEFAULT '{}',
-                    headers_json TEXT DEFAULT '[]',
-                    rows_json TEXT DEFAULT '[]',
-                    markdown TEXT DEFAULT '',
-                    docling_ref TEXT DEFAULT '',
-                    metadata_json TEXT DEFAULT '{}'
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_document_tables_packet ON document_tables(source_packet_id, page)")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS document_table_cells (
-                    id TEXT PRIMARY KEY,
-                    table_id TEXT NOT NULL,
-                    source_packet_id TEXT NOT NULL,
-                    row_index INTEGER NOT NULL,
-                    column_index INTEGER NOT NULL,
-                    row_span INTEGER DEFAULT 1,
-                    column_span INTEGER DEFAULT 1,
-                    text TEXT DEFAULT '',
-                    row_header INTEGER DEFAULT 0,
-                    column_header INTEGER DEFAULT 0,
-                    page INTEGER DEFAULT 0,
-                    bbox_json TEXT DEFAULT '{}'
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_table_cells_lookup ON document_table_cells(table_id, row_index, column_index)")
-            conn.execute(
-                """
                 CREATE TABLE IF NOT EXISTS distilled_candidates (
                     id TEXT PRIMARY KEY,
                     source_packet_id TEXT NOT NULL,
@@ -292,6 +254,54 @@ class PaperWikiPipelineStore:
                 )
                 """
             )
+            # Table contents now live in Markdown Wiki Cards. Remove the retired
+            # query projection and any claim links that pointed only to its rows.
+            table_names = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            legacy_ids: list[str] = []
+            if "document_table_cells" in table_names:
+                legacy_ids.extend(
+                    str(row[0]) for row in conn.execute("SELECT id FROM document_table_cells").fetchall()
+                )
+            if "document_tables" in table_names:
+                legacy_ids.extend(
+                    str(row[0]) for row in conn.execute("SELECT id FROM document_tables").fetchall()
+                )
+            if legacy_ids:
+                for start in range(0, len(legacy_ids), 500):
+                    batch = legacy_ids[start:start + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    conn.execute(
+                        f"DELETE FROM claim_evidence WHERE element_id IN ({placeholders})",
+                        batch,
+                    )
+            conn.execute("DROP TABLE IF EXISTS document_table_cells")
+            conn.execute("DROP TABLE IF EXISTS document_tables")
+            # Older source packets embedded headers, rows, and cell objects in
+            # packet_json. Keep only the exact Markdown needed for replay.
+            for source_id, raw_packet in conn.execute(
+                "SELECT id, packet_json FROM source_packets"
+            ).fetchall():
+                payload = self.load_json(raw_packet)
+                tables = payload.get("tables") if isinstance(payload, dict) else None
+                if not isinstance(tables, list):
+                    continue
+                changed = False
+                for table in tables:
+                    if not isinstance(table, dict):
+                        continue
+                    for key in ("headers", "rows", "cells"):
+                        if key in table:
+                            table.pop(key, None)
+                            changed = True
+                if changed:
+                    conn.execute(
+                        "UPDATE source_packets SET packet_json = ? WHERE id = ?",
+                        (self.dump_json(payload), source_id),
+                    )
             conn.commit()
 
     def upsert_source_packet(self, packet: SourcePacket) -> str:
@@ -357,7 +367,7 @@ class PaperWikiPipelineStore:
         return source_id
 
     def replace_source_evidence(self, packet: SourcePacket) -> None:
-        """Persist an optional parser artifact and its queryable projection."""
+        """Persist an optional parser artifact and its source-span projection."""
         raw_document = self.dump_json(packet.docling_json)
         raw_bytes = raw_document.encode("utf-8")
         document_hash = hashlib.sha256(raw_bytes).hexdigest() if packet.docling_json else ""
@@ -370,8 +380,6 @@ class PaperWikiPipelineStore:
                 content_type="application/json; charset=utf-8",
             )
         with closing(self._connect()) as conn:
-            conn.execute("DELETE FROM document_table_cells WHERE source_packet_id = ?", (packet.source_id,))
-            conn.execute("DELETE FROM document_tables WHERE source_packet_id = ?", (packet.source_id,))
             conn.execute("DELETE FROM document_elements WHERE source_packet_id = ?", (packet.source_id,))
             conn.execute("DELETE FROM source_documents WHERE source_packet_id = ?", (packet.source_id,))
             conn.execute(
@@ -405,27 +413,6 @@ class PaperWikiPipelineStore:
                      element.reading_order, element.text, element.caption, element.docling_ref,
                      self.dump_json(element.metadata)),
                 )
-            for table in packet.tables:
-                conn.execute(
-                    """INSERT INTO document_tables
-                    (id, source_packet_id, element_id, caption, section_path_json, page, bbox_json,
-                     headers_json, rows_json, markdown, docling_ref, metadata_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (table.table_id, packet.source_id, table.element_id, table.caption,
-                     self.dump_json(table.section_path), table.page, self.dump_json(table.bbox),
-                     self.dump_json(table.headers), self.dump_json(table.rows), table.markdown,
-                     table.docling_ref, self.dump_json(table.metadata)),
-                )
-                for cell in table.cells:
-                    conn.execute(
-                        """INSERT INTO document_table_cells
-                        (id, table_id, source_packet_id, row_index, column_index, row_span, column_span,
-                         text, row_header, column_header, page, bbox_json)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (cell.cell_id, table.table_id, packet.source_id, cell.row_index, cell.column_index,
-                         cell.row_span, cell.column_span, cell.text, int(cell.row_header), int(cell.column_header),
-                         cell.page, self.dump_json(cell.bbox)),
-                    )
             conn.commit()
 
     def load_source_document_json(self, source_packet_id: str) -> dict[str, Any]:
@@ -460,24 +447,12 @@ class PaperWikiPipelineStore:
                 f"SELECT *, 'element' AS evidence_kind FROM document_elements WHERE id IN ({placeholders})",
                 evidence_ids,
             ).fetchall()
-            cells = conn.execute(
-                f"SELECT *, 'table_cell' AS evidence_kind FROM document_table_cells WHERE id IN ({placeholders})",
-                evidence_ids,
-            ).fetchall()
-            tables = conn.execute(
-                f"SELECT *, 'table' AS evidence_kind FROM document_tables WHERE id IN ({placeholders})",
-                evidence_ids,
-            ).fetchall()
         result = []
-        for row in [*rows, *cells, *tables]:
+        for row in rows:
             item = dict(row)
             for key in ("bbox_json", "heading_path_json", "metadata_json"):
                 if key in item:
                     item[key[:-5]] = self.load_json(item.pop(key))
-            if item.get("evidence_kind") == "table":
-                caption = str(item.get("caption") or "")
-                markdown = str(item.get("markdown") or "")
-                item["text"] = "\n\n".join(part for part in (caption, markdown) if part)
             result.append(item)
         return result
 
@@ -495,11 +470,6 @@ class PaperWikiPipelineStore:
                    WHERE source_packet_id = ? ORDER BY reading_order LIMIT 500""",
                 (source_packet_id,),
             ).fetchall()
-            tables = conn.execute(
-                """SELECT * FROM document_tables
-                   WHERE source_packet_id = ? ORDER BY page, id""",
-                (source_packet_id,),
-            ).fetchall()
         query_terms = set(re.findall(r"[0-9a-zA-Z\u4e00-\u9fff]+", (text or "").lower()))
         ranked = []
         for row in rows:
@@ -513,51 +483,8 @@ class PaperWikiPipelineStore:
             if score > 0 or (not query_terms and not section_id):
                 item["score"] = score
                 ranked.append(item)
-        for row in tables:
-            item = dict(row)
-            section_path = " ".join(self.load_json(item.get("section_path_json", "[]")))
-            haystack = " ".join(
-                str(value or "") for value in (
-                    section_path, item.get("caption"), item.get("headers_json"),
-                    item.get("rows_json"), item.get("markdown"),
-                )
-            ).lower()
-            terms = set(re.findall(r"[0-9a-zA-Z\u4e00-\u9fff]+", haystack))
-            score = len(query_terms & terms) / max(len(query_terms), 1) if query_terms else 0.0
-            if "table" in (text or "").lower() and "table" in haystack:
-                score += 0.75
-            if section_id and normalize_alias(section_id).replace(" ", "") in normalize_alias(section_path).replace(" ", ""):
-                score += 1.0
-            if score > 0:
-                item["score"] = score
-                item["reading_order"] = int(item.get("page") or 0) * 10000
-                ranked.append(item)
         ranked.sort(key=lambda item: (-item["score"], item["reading_order"]))
         return ranked[: max(1, min(limit, 50))]
-
-    def list_source_tables(self, source_packet_id: str) -> list[dict[str, Any]]:
-        with closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT * FROM document_tables WHERE source_packet_id = ? ORDER BY page, id",
-                (source_packet_id,),
-            ).fetchall()
-            result = []
-            for row in rows:
-                table = dict(row)
-                for key in ("section_path_json", "bbox_json", "headers_json", "rows_json", "metadata_json"):
-                    table[key[:-5]] = self.load_json(table.pop(key, ""))
-                cells = conn.execute(
-                    """SELECT * FROM document_table_cells
-                       WHERE table_id = ? ORDER BY row_index, column_index""",
-                    (table["id"],),
-                ).fetchall()
-                table["cells"] = []
-                for cell_row in cells:
-                    cell = dict(cell_row)
-                    cell["bbox"] = self.load_json(cell.pop("bbox_json", "{}"))
-                    table["cells"].append(cell)
-                result.append(table)
-        return result
 
     def insert_candidate(self, candidate: DistilledCandidate) -> str:
         candidate_id = candidate.id or str(uuid.uuid4())
@@ -1049,23 +976,17 @@ class PaperWikiPipelineStore:
                 claim = dict(claim_row)
                 evidence_rows = conn.execute(
                     """SELECT ce.*, de.source_packet_id, de.element_type, de.page,
-                              de.bbox_json, de.heading_path_json, de.text, de.caption, de.docling_ref,
-                              tc.table_id, tc.row_index, tc.column_index, tc.text AS cell_text,
-                              tc.page AS cell_page, tc.bbox_json AS cell_bbox_json
+                              de.bbox_json, de.heading_path_json, de.text, de.caption, de.docling_ref
                        FROM claim_evidence ce
                        LEFT JOIN document_elements de ON de.id = ce.element_id
-                       LEFT JOIN document_table_cells tc ON tc.id = ce.element_id
                        WHERE ce.claim_id = ? ORDER BY ce.element_id""",
                     (claim["id"],),
                 ).fetchall()
                 claim["evidence"] = []
                 for evidence_row in evidence_rows:
                     item = dict(evidence_row)
-                    is_cell = bool(item.get("table_id"))
-                    item["evidence_kind"] = "table_cell" if is_cell else "element"
-                    item["page"] = item.get("cell_page") if is_cell else item.get("page")
-                    item["text"] = item.get("cell_text") if is_cell else item.get("text")
-                    item["bbox"] = self.load_json(item.get("cell_bbox_json") if is_cell else item.get("bbox_json"))
+                    item["evidence_kind"] = "element"
+                    item["bbox"] = self.load_json(item.get("bbox_json") or "{}")
                     item["heading_path"] = self.load_json(item.get("heading_path_json") or "[]")
                     claim["evidence"].append(item)
                 output.append(claim)
@@ -1147,7 +1068,7 @@ def packet_json(packet: SourcePacket) -> str:
     """Serialize packet metadata without duplicating a large parser artifact.
 
     The lossless artifact lives in object storage; packet_json keeps the
-    normalized elements/tables required by pipeline replay.
+    normalized source material required by pipeline replay.
     """
     if hasattr(packet, "model_dump"):
         payload = packet.model_dump(exclude={"docling_json"})

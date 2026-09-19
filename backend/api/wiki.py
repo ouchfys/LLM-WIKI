@@ -87,14 +87,6 @@ class ApprovalDecisionPayload(BaseModel):
     reason: str = ""
 
 
-class TableQueryPayload(BaseModel):
-    question: str
-    card_ids: list[str] = Field(default_factory=list)
-    source_packet_ids: list[str] = Field(default_factory=list)
-    sql: str = ""
-    limit: int = 6
-
-
 class XhsImportPayload(BaseModel):
     text_or_url: str
     tags: list[str] = Field(default_factory=list)
@@ -2833,30 +2825,6 @@ def get_storage_object(ref: str):
         raise HTTPException(status_code=404, detail="Storage object not found")
     content_type = mimetypes.guess_type(ref)[0] or "application/octet-stream"
     return Response(content=data, media_type=content_type)
-
-
-@router.get("/evidence/sources/{source_packet_id}/tables")
-def list_source_tables(source_packet_id: str, store: WikiStore = Depends(get_wiki_store)):
-    pipeline_store = PaperWikiPipelineStore(db_path=store.db_path)
-    if not pipeline_store.get_source_packet(source_packet_id):
-        raise HTTPException(status_code=404, detail="Source packet not found")
-    return {"source_packet_id": source_packet_id, "items": pipeline_store.list_source_tables(source_packet_id)}
-
-
-@router.post("/evidence/table-query")
-def query_structured_tables(payload: TableQueryPayload, chat: WikiChatService = Depends(get_wiki_chat)):
-    if not chat.table_qa:
-        raise HTTPException(status_code=503, detail="Table QA is unavailable")
-    try:
-        return chat.table_qa.answer(
-            payload.question,
-            card_ids=payload.card_ids,
-            source_packet_ids=payload.source_packet_ids,
-            sql=payload.sql,
-            limit=max(1, min(payload.limit, 20)),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{card_id}/revisions")

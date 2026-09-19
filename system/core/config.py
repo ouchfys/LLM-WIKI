@@ -61,6 +61,12 @@ def _load_dotenv(env_path: str = None):
 # ========== 加载 .env ==========
 _load_dotenv()
 
+# Optional isolated workspace for reproducible evaluation runs. Keeping the
+# database and generated artifacts under one root prevents benchmark traffic
+# from mutating the user's normal PaperWiki workspace.
+PAPERWIKI_WORKSPACE_ROOT = os.environ.get("PAPERWIKI_WORKSPACE_ROOT", "").strip()
+PAPERWIKI_DB_PATH = os.environ.get("PAPERWIKI_DB_PATH", "").strip()
+
 # ========== 硅基流动 API 配置 ==========
 
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
@@ -102,13 +108,6 @@ SILICONFLOW_CHAT_MODEL = os.environ.get(
 SILICONFLOW_FAST_MODEL = os.environ.get(
     "SILICONFLOW_FAST_MODEL",
     "Qwen/Qwen3.5-9B",
-)
-
-# Wiki / paper / source summarization model. Kept separate from the fast router
-# model so ingestion quality can be raised without changing chat/routing.
-SILICONFLOW_SUMMARY_MODEL = os.environ.get(
-    "SILICONFLOW_SUMMARY_MODEL",
-    "deepseek-ai/DeepSeek-V4-Flash",
 )
 
 SILICONFLOW_REVIEW_MODEL = os.environ.get(
@@ -185,6 +184,10 @@ ARXIV_REQUEST_INTERVAL_SECONDS = max(
 ARXIV_TIMEOUT_SECONDS = max(
     1, int(os.environ.get("ARXIV_TIMEOUT_SECONDS", "30"))
 )
+ARXIV_MAX_ATTEMPTS = max(1, int(os.environ.get("ARXIV_MAX_ATTEMPTS", "3")))
+ARXIV_RETRY_BACKOFF_SECONDS = max(
+    0.0, float(os.environ.get("ARXIV_RETRY_BACKOFF_SECONDS", "1.0"))
+)
 ARXIV_MAX_PDF_MB = max(1, int(os.environ.get("ARXIV_MAX_PDF_MB", "50")))
 ARXIV_MCP_CACHE_DIR = os.environ.get("ARXIV_MCP_CACHE_DIR", "")
 LLM_WIKI_API_URL = os.environ.get(
@@ -223,7 +226,8 @@ def get_model_runtime_summary():
         "chat_provider": "deepseek-official",
         "chat_model": DEEPSEEK_CHAT_MODEL,
         "fast_model": SILICONFLOW_FAST_MODEL,
-        "summary_model": SILICONFLOW_SUMMARY_MODEL,
+        "summary_provider": "deepseek-official",
+        "summary_model": DEEPSEEK_CHAT_MODEL,
         "review_model": SILICONFLOW_REVIEW_MODEL,
         "merge_model": SILICONFLOW_MERGE_MODEL,
         "maintenance_model": SILICONFLOW_MAINTENANCE_MODEL,

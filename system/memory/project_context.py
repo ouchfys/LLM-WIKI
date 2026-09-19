@@ -34,6 +34,7 @@ class ProjectContextManager:
 Return strict JSON only: {{"is_followup": boolean, "standalone_query": string, "referenced_context": [string]}}.
 Use purpose.md, MEMORY.md and conversation history to resolve pronouns, omitted paper names, comparison sets, constraints and prior decisions.
 If the message starts a separate topic, set is_followup=false and copy the current message as standalone_query.
+Keep standalone_query concise and at most 1000 characters even when the current message contains long status payloads.
 Do not answer the question and do not invent papers or constraints.
 
 Project context:
@@ -46,7 +47,7 @@ Current message:
 {message}
 """
         try:
-            parsed = _json_object(self.invoke(prompt, "memory.resolve_turn", 450))
+            parsed = _json_object(self.invoke(prompt, "memory.resolve_turn", 1024))
             query = str(parsed.get("standalone_query") or "").strip()
             if query and len(query) <= 4000:
                 return query

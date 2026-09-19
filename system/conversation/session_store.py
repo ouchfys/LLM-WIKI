@@ -15,9 +15,17 @@ from system.memory.project_memory import DEFAULT_PROJECT_ID, ProjectMemoryStore
 
 
 class SessionStore(UserMemoryStore, ProjectMemoryStore):
+    _CHAT_RUNTIME_CHILD_TABLES = (
+        "agent_run_inputs",
+        "agent_events",
+        "agent_checkpoints",
+        "agent_approvals",
+    )
+
     def __init__(self, db_path: str = None, memory_root: str = None):
         base_dir = Path(__file__).resolve().parents[2]
-        path = Path(db_path) if db_path else base_dir / "sessions.db"
+        configured_db = os.getenv("PAPERWIKI_DB_PATH", "").strip()
+        path = Path(db_path) if db_path else Path(configured_db) if configured_db else base_dir / "sessions.db"
         self.db_path = str(path)
         configured_memory_root = memory_root or os.getenv("PAPERWIKI_MEMORY_ROOT", "").strip()
         self.project_memory_files = ProjectMemoryFiles(
@@ -567,8 +575,59 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             return {}
         return self._load_json(row["settings_json"])
 
+    @classmethod
+    def _runtime_session_ids(cls, row: sqlite3.Row) -> set[str]:
+        """Resolve chat ownership from both current and legacy runtime fields."""
+        session_ids: set[str] = set()
+        source_uri = str(row["source_uri"] or "")
+        if source_uri.startswith("session:"):
+            source_session_id = source_uri.removeprefix("session:").strip()
+            if source_session_id and source_session_id != "anonymous":
+                session_ids.add(source_session_id)
+        context = cls._load_json(row["context_json"])
+        context_session_id = str(context.get("session_id") or "").strip()
+        if context_session_id:
+            session_ids.add(context_session_id)
+        return session_ids
+
+    @classmethod
+    def _delete_chat_runtime(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        session_ids: set[str] | None = None,
+        delete_all: bool = False,
+    ) -> int:
+        """Delete Wiki chat traces without touching paper/task audit runs."""
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "agent_runs" not in tables:
+            return 0
+
+        targets = {str(value).strip() for value in (session_ids or set()) if str(value).strip()}
+        run_ids: list[str] = []
+        rows = conn.execute(
+            "SELECT id, source_uri, context_json FROM agent_runs WHERE run_type='wiki_chat'"
+        ).fetchall()
+        for row in rows:
+            owners = cls._runtime_session_ids(row)
+            if delete_all or bool(owners & targets):
+                run_ids.append(str(row["id"]))
+
+        if not run_ids:
+            return 0
+        placeholders = ",".join("?" for _ in run_ids)
+        for table in cls._CHAT_RUNTIME_CHILD_TABLES:
+            if table in tables:
+                conn.execute(f"DELETE FROM {table} WHERE run_id IN ({placeholders})", run_ids)
+        conn.execute(f"DELETE FROM agent_runs WHERE id IN ({placeholders})", run_ids)
+        return len(run_ids)
+
     def clear_session(self, session_id: str) -> None:
         with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM context_checkpoints WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_tool_results WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_state WHERE session_id = ?", (session_id,))
@@ -581,28 +640,33 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
                 """,
                 ("新会话", self._dump_json({}), session_id),
             )
+            self._delete_chat_runtime(conn, session_ids={session_id})
             conn.commit()
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete one chat session and its messages. Long-term memory is untouched."""
+        """Delete one chat and its runtime trace. Long-term memory is untouched."""
         with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT id FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             if not row:
+                conn.rollback()
                 return False
             conn.execute("DELETE FROM session_state WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM context_checkpoints WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_tool_results WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._delete_chat_runtime(conn, session_ids={session_id})
             conn.commit()
         return True
 
     def delete_all_sessions(self) -> int:
-        """Delete all chat sessions and messages. Long-term memory is untouched."""
+        """Delete every chat and Wiki-chat trace. Long-term memory is untouched."""
         with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT COUNT(*) AS count FROM sessions").fetchone()
             count = int(row["count"] if row else 0)
             conn.execute("DELETE FROM context_checkpoints")
@@ -610,5 +674,6 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             conn.execute("DELETE FROM session_state")
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM sessions")
+            self._delete_chat_runtime(conn, delete_all=True)
             conn.commit()
         return count

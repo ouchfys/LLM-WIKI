@@ -50,8 +50,9 @@ class BlockingLLM:
 
 
 class ControlChat(WikiChatService):
-    def __init__(self, runtime, llm):
-        super().__init__(wiki_store=object(), wiki_resolver=object(), runtime=runtime, llm=llm, context_budget=ContextBudget(ContextPolicy()))
+    def __init__(self, runtime, llm, session_store=None):
+        super().__init__(wiki_store=object(), wiki_resolver=object(), runtime=runtime, llm=llm,
+                         session_store=session_store, context_budget=ContextBudget(ContextPolicy()))
         self.saved = []
         self.profile_updates = []
 
@@ -102,6 +103,29 @@ def test_cancel_blocked_provider_returns_promptly_and_discards_late_output(tmp_p
         consumer.join(3)
     assert llm.finished.wait(2)
     assert service.saved == []
+
+
+def test_delete_session_cancels_blocked_worker_without_resurrecting_history(tmp_path):
+    db_path = str(tmp_path / "delete-running.db")
+    sessions = SessionStore(db_path)
+    sessions.ensure_session("session-control")
+    runtime = AgentRunStore(db_path)
+    llm = BlockingLLM(block_plan=True)
+    service = ControlChat(runtime, llm, session_store=sessions)
+    run_id, chunks, consumer = start_stream(service)
+    try:
+        assert llm.entered.wait(2)
+        assert sessions.delete_session("session-control")
+        consumer.join(2)
+        assert not consumer.is_alive(), "deleting a conversation must close its SSE promptly"
+        assert any(item["type"] == "cancelled" for item in chunks)
+        assert runtime.get_run(run_id) is None
+        assert sessions.get_session("session-control") is None
+    finally:
+        llm.release.set()
+    assert llm.finished.wait(2)
+    assert service.saved == service.profile_updates == []
+    assert sessions.get_session("session-control") is None
 
 
 def test_interrupt_replans_after_current_model_call(tmp_path):

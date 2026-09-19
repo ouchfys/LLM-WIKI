@@ -16,12 +16,11 @@ python test/evaluation/scripts/run_agentic_wiki_eval.py \
   --output-dir test/evaluation/runs/current30_run
 ```
 
-## Evidence Verifier / Table QA 240 条 Silver Benchmark
+## Evidence Verifier 140 条 Silver Benchmark
 
 - 数据集：`datasets/evidence_wiki_silver_v1/`
-- 构建：`scripts/build_evidence_wiki_silver_benchmark.py`
 - 运行：`scripts/run_evidence_wiki_silver_benchmark.py`
 - LLM 裁决：`scripts/adjudicate_verifier_silver_benchmark.py`
 - 当前结果：`runs/evidence_wiki_silver_v1/`
 
-Silver 数据由真实持久化 evidence/table cells 自动派生，用于零人工回归；它不是人工 gold benchmark。
+Silver 数据来自真实持久化 evidence spans，并由独立模型裁决，用于零人工回归；它不是人工 gold benchmark。

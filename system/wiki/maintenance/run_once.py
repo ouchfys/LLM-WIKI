@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 from system.wiki.maintenance.runner import WikiMaintenanceRunner
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run one deterministic wiki maintenance cycle.")
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=None,
+        help="SQLite database to maintain. Defaults to the application's standard database.",
+    )
     parser.add_argument("--check-storage", action="store_true", help="Check object storage existence.")
     parser.add_argument("--no-repair-tasks", action="store_true", help="Do not create repair task rows.")
     parser.add_argument("--no-process-repairs", action="store_true", help="Do not process deterministic repair tasks.")
@@ -19,7 +26,7 @@ def main() -> int:
     parser.add_argument("--no-upload-indices", action="store_true", help="Generate local indices only.")
     args = parser.parse_args()
 
-    result = WikiMaintenanceRunner().run_once(
+    result = WikiMaintenanceRunner(db_path=args.db_path).run_once(
         check_storage=args.check_storage,
         create_repair_tasks=not args.no_repair_tasks,
         process_deterministic_repairs=not args.no_process_repairs,

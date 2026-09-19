@@ -47,7 +47,9 @@ class RunControl:
         if not force and monotonic() - self.last_check < 0.1:
             return
         self.last_check = monotonic()
-        run = self.store.get_run(self.run_id) or {}
+        run = self.store.get_run(self.run_id)
+        if not run:
+            raise RunCancelled("Agent run was deleted")
         if run.get("cancel_requested") or run.get("current_state") == "CANCELLED":
             raise RunCancelled("Cancelled by user")
         items = self.store.take_interrupts(self.run_id)

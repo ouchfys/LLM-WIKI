@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from system.agent_runtime.control import RunControl
+from system.agent_runtime.store import AgentRunStore
 from system.conversation.context_budget import ContextBudget, ContextPolicy
 from system.conversation.session_store import SessionStore
 from system.memory.profile_signal_extractor import ProfileSignalExtractor
@@ -82,12 +83,98 @@ def test_checkpoint_recovery_history_search_and_deletion(tmp_path):
 @pytest.mark.parametrize("method", ["clear_session", "delete_all_sessions"])
 def test_all_clear_paths_remove_derived_records(tmp_path, method):
     store, sid = populated(tmp_path)
+    runtime = AgentRunStore(store.db_path)
+    chat_run = runtime.create_run(
+        run_type="wiki_chat",
+        source_uri=f"session:{sid}",
+        context={"session_id": sid},
+    )
+    paper_run = runtime.create_run(run_type="paper_ingestion", source_uri="paper.pdf")
     cutoff = store.get_messages(sid, 100)[1]["id"]
     assert store.commit_context_summary(sid, "summary", cutoff, 0, "")
     result_id = store.save_tool_result(sid, "test", {}, {"raw": "value"})
     getattr(store, method)(sid) if method == "clear_session" else getattr(store, method)()
     assert store.get_context_checkpoints(sid) == []
     assert store.read_tool_result(sid, result_id) == []
+    assert runtime.get_run(chat_run["id"]) is None
+    assert runtime.get_run(paper_run["id"]) is not None
+
+
+def test_delete_session_removes_only_owned_chat_runtime_graph(tmp_path):
+    store = SessionStore(str(tmp_path / "runtime-delete.db"))
+    removed_session = store.create_session("remove")
+    kept_session = store.create_session("keep")
+    runtime = AgentRunStore(store.db_path)
+    removed_run = runtime.create_run(
+        run_type="wiki_chat",
+        source_uri=f"session:{removed_session}",
+        context={"session_id": removed_session},
+    )
+    runtime.transition(removed_run["id"], "CHAT_RUNNING")
+    runtime.enqueue_input(
+        removed_run["id"],
+        kind="followup",
+        content="queued follow-up",
+        input_id="owned-input",
+    )
+    runtime.create_approval(
+        run_id=removed_run["id"],
+        revision_id="owned-revision",
+        page_id="owned-page",
+    )
+    kept_run = runtime.create_run(
+        run_type="wiki_chat",
+        source_uri=f"session:{kept_session}",
+        context={"session_id": kept_session},
+    )
+    paper_run = runtime.create_run(run_type="paper_ingestion", source_uri="paper.pdf")
+
+    assert store.delete_session(removed_session)
+
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute("SELECT 1 FROM agent_runs WHERE id=?", (removed_run["id"],)).fetchone() is None
+        for table in ("agent_events", "agent_checkpoints", "agent_run_inputs", "agent_approvals"):
+            assert conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE run_id=?", (removed_run["id"],)
+            ).fetchone()[0] == 0
+    assert runtime.get_run(kept_run["id"]) is not None
+    assert runtime.get_run(paper_run["id"]) is not None
+
+
+def test_delete_all_sessions_also_removes_legacy_orphan_chat_runs(tmp_path):
+    store = SessionStore(str(tmp_path / "orphan-runtime.db"))
+    runtime = AgentRunStore(store.db_path)
+    orphan = runtime.create_run(
+        run_type="wiki_chat",
+        source_uri="session:already-deleted",
+        context={"session_id": "already-deleted"},
+    )
+    paper_run = runtime.create_run(run_type="paper_ingestion", source_uri="paper.pdf")
+
+    assert store.delete_all_sessions() == 0
+    assert runtime.get_run(orphan["id"]) is None
+    assert runtime.get_run(paper_run["id"]) is not None
+
+
+def test_clear_session_does_not_allow_deleted_run_to_restore_cancel_messages(tmp_path):
+    store = SessionStore(str(tmp_path / "clear-running.db"))
+    session_id = store.create_session("clear")
+    runtime = AgentRunStore(store.db_path)
+    run = runtime.create_run(
+        run_type="wiki_chat",
+        source_uri=f"session:{session_id}",
+        context={"session_id": session_id},
+    )
+    runtime.transition(run["id"], "CHAT_RUNNING")
+    control = RunControl(runtime, run["id"], "unfinished question")
+
+    store.clear_session(session_id)
+    WikiChatService(object(), wiki_resolver=object(), runtime=runtime, session_store=store)._cancel_chat_runtime(
+        control, session_id
+    )
+
+    assert store.get_session(session_id) is not None
+    assert store.get_messages(session_id) == []
 
 
 def test_legacy_database_migration_is_idempotent(tmp_path):

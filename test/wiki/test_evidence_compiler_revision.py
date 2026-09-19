@@ -26,7 +26,6 @@ from system.wiki.paper_pipeline.models import (
 )
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 from system.wiki.revision import RevisionRejectedError, WikiRevisionManager
-from system.wiki.table_qa import ReadOnlyTableEngine, TableQuestionAnswerer, TableResolver
 from system.wiki.wiki_store import WikiStore
 
 
@@ -44,6 +43,11 @@ class CapturingSemanticLLM(FakeSemanticLLM):
     def invoke(self, prompt: str, **kwargs) -> str:
         self.prompt = prompt
         return super().invoke(prompt, **kwargs)
+
+
+class UnavailableSemanticLLM:
+    def invoke(self, prompt: str, **kwargs) -> str:
+        raise RuntimeError("provider unavailable")
 
 
 def _storage() -> None:
@@ -82,16 +86,8 @@ def _packet(source_id: str = "packet-1") -> SourcePacket:
         section_path=["Experiments"],
         page=4,
         bbox={"l": 20, "t": 130, "r": 500, "b": 300},
-        headers=[["Model", "GSM8K"]],
-        rows=[["Model A", "91.2"]],
         markdown="| Model | GSM8K |\n| --- | --- |\n| Model A | 91.2 |",
         docling_ref="table-2",
-        cells=[
-            {"cell_id": "ev-cell-00", "table_id": "tbl-results", "row_index": 0, "column_index": 0, "text": "Model", "column_header": True, "page": 4},
-            {"cell_id": "ev-cell-01", "table_id": "tbl-results", "row_index": 0, "column_index": 1, "text": "GSM8K", "column_header": True, "page": 4},
-            {"cell_id": "ev-cell-10", "table_id": "tbl-results", "row_index": 1, "column_index": 0, "text": "Model A", "row_header": True, "page": 4},
-            {"cell_id": "ev-cell-11", "table_id": "tbl-results", "row_index": 1, "column_index": 1, "text": "91.2", "page": 4},
-        ],
     )
     return SourcePacket(
         source_id=source_id,
@@ -104,15 +100,12 @@ def _packet(source_id: str = "packet-1") -> SourcePacket:
     )
 
 
-def test_structured_evidence_keeps_table_cells_page_bbox_and_headers() -> None:
+def test_source_packet_keeps_table_as_markdown() -> None:
     packet = _packet()
     assert packet.elements[1].page == 4
     assert packet.elements[1].bbox["l"] == 20.0
     assert packet.tables[0].caption == "Table 2: Main results"
-    assert packet.tables[0].headers == [["Model", "GSM8K"]]
-    assert packet.tables[0].rows == [["Model A", "91.2"]]
     assert "| Model | GSM8K |" in packet.tables[0].markdown
-    assert packet.tables[0].cells[-1].cell_id.startswith("ev-")
 
 
 def test_store_and_verifier_reread_persisted_source_and_reject_wrong_number() -> None:
@@ -155,10 +148,33 @@ def test_store_and_verifier_reread_persisted_source_and_reject_wrong_number() ->
         assert semantic.result == "supported" and semantic.semantic_result == "entailed"
         assert contradicted.result == "unsupported" and contradicted.semantic_result == "contradicted"
 
+        deferred = EvidenceVerifier(store, llm=UnavailableSemanticLLM()).verify_claim(
+            statement="Model A reaches 91.2 on GSM8K.",
+            evidence_excerpt="Model A reaches 91.2 on GSM8K.",
+            evidence_ids=[paragraph.element_id],
+            structured_required=True,
+        )
+        assert deferred.result == "legacy_unverified"
+        assert deferred.semantic_result == "error"
+        assert "deferred" in deferred.reason
+
+        persisted_deferred = EvidenceVerifier(store).verify_claim_payload({
+            "id": "deferred-claim",
+            "statement": "Model A reaches 91.2 on GSM8K.",
+            "evidence_excerpt": "Model A reaches 91.2 on GSM8K.",
+            "evidence_ids": [paragraph.element_id],
+            "source_packet_ids": [packet.source_id],
+            "semantic_verification_required": True,
+            "verifier_result": "legacy_unverified",
+            "verifier_reason": "provider unavailable; deterministic binding passed",
+        })
+        assert persisted_deferred.result == "legacy_unverified"
+
         with sqlite3.connect(store.db_path) as conn:
             assert conn.execute("SELECT COUNT(*) FROM source_documents").fetchone()[0] == 1
-            assert conn.execute("SELECT COUNT(*) FROM document_tables").fetchone()[0] == 1
-            assert conn.execute("SELECT COUNT(*) FROM document_table_cells").fetchone()[0] == 4
+            names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            assert "document_tables" not in names
+            assert "document_table_cells" not in names
 
 
 def test_source_hash_upsert_keeps_relational_source_id_authoritative() -> None:
@@ -175,6 +191,65 @@ def test_source_hash_upsert_keeps_relational_source_id_authoritative() -> None:
         assert restored.source_id == "stable-source"
         assert restored.title == "Reparsed Evidence Paper"
         assert restored.docling_json.get("persisted_source_document_id")
+
+
+def test_store_migration_removes_retired_table_projection_and_dangling_links() -> None:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db_path = str(Path(tmp) / "legacy-tables.db")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE document_tables (id TEXT PRIMARY KEY)")
+            conn.execute("CREATE TABLE document_table_cells (id TEXT PRIMARY KEY)")
+            conn.execute(
+                """CREATE TABLE claim_evidence (
+                       claim_id TEXT NOT NULL,
+                       element_id TEXT NOT NULL,
+                       relation TEXT DEFAULT 'supports',
+                       verifier_result TEXT DEFAULT 'unknown',
+                       verifier_reason TEXT DEFAULT '',
+                       verified_at TEXT DEFAULT '',
+                       PRIMARY KEY (claim_id, element_id)
+                   )"""
+            )
+            conn.execute("INSERT INTO document_tables(id) VALUES ('legacy-table')")
+            conn.execute("INSERT INTO document_table_cells(id) VALUES ('legacy-cell')")
+            conn.execute(
+                "INSERT INTO claim_evidence(claim_id, element_id) VALUES ('claim', 'legacy-cell')"
+            )
+            conn.commit()
+
+        store = PaperWikiPipelineStore(db_path=db_path)
+        with sqlite3.connect(db_path) as conn:
+            names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            assert "document_tables" not in names
+            assert "document_table_cells" not in names
+            assert conn.execute("SELECT COUNT(*) FROM claim_evidence").fetchone()[0] == 0
+
+        store.upsert_source_packet(_packet("legacy-packet"))
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT packet_json FROM source_packets WHERE id='legacy-packet'"
+            ).fetchone()
+            payload = store.load_json(row[0])
+            payload["tables"][0].update({
+                "headers": [["Model", "Score"]],
+                "rows": [["A", "91.2"]],
+                "cells": [{"text": "91.2"}],
+            })
+            conn.execute(
+                "UPDATE source_packets SET packet_json=? WHERE id='legacy-packet'",
+                (store.dump_json(payload),),
+            )
+            conn.commit()
+
+        PaperWikiPipelineStore(db_path=db_path)
+        restored = PaperWikiPipelineStore(db_path=db_path).get_source_packet("legacy-packet")
+        assert restored is not None
+        assert restored.tables[0].markdown == "| Model | GSM8K |\n| --- | --- |\n| Model A | 91.2 |"
+        with sqlite3.connect(db_path) as conn:
+            raw = conn.execute(
+                "SELECT packet_json FROM source_packets WHERE id='legacy-packet'"
+            ).fetchone()[0]
+            assert '"headers"' not in raw and '"rows"' not in raw and '"cells"' not in raw
 
 
 def test_verifier_keeps_long_parser_tail_and_normalizes_number_words() -> None:
@@ -541,42 +616,3 @@ def test_revision_rejects_unsupported_claim_without_overwriting_page() -> None:
             pass
         assert wiki.get_card("page-2")["summary"] == "Safe summary."
         assert store.list_revisions("page-2")[0]["review_status"] == "rejected"
-
-
-def test_table_resolver_and_readonly_duckdb_cross_paper_query() -> None:
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        store = PaperWikiPipelineStore(db_path=str(Path(tmp) / "tables.db"))
-        first = _packet("paper-a")
-        second = _packet("paper-b")
-        second.title = "Second Evidence Paper"
-        second.source_hash = "fixture-hash-b"
-        # IDs must be unique across source documents.
-        for index, element in enumerate(second.elements):
-            element.element_id = f"paper-b-element-{index}"
-        second.tables[0].table_id = "paper-b-table"
-        second.tables[0].element_id = "paper-b-table-element"
-        for index, cell in enumerate(second.tables[0].cells):
-            cell.table_id = "paper-b-table"
-            cell.cell_id = f"paper-b-cell-{index}"
-        store.upsert_source_packet(first)
-        store.upsert_source_packet(second)
-
-        resolver = TableResolver(store)
-        resolved = resolver.resolve("GSM8K Model A", limit=5)
-        assert len(resolved) == 2
-        rows = resolver.evidence_rows([item.table_id for item in resolved])
-        query = """SELECT source_title, max(numeric_value) AS best
-                   FROM evidence_cells
-                   WHERE column_label='GSM8K' AND numeric_value IS NOT NULL
-                   GROUP BY source_title ORDER BY source_title"""
-        result = ReadOnlyTableEngine().execute(query, rows)
-        assert len(result) == 2
-        assert all(item["best"] == 91.2 for item in result)
-        try:
-            ReadOnlyTableEngine().execute("SELECT * FROM read_csv_auto('secret.csv')", rows)
-            assert False, "external access must be blocked"
-        except ValueError:
-            pass
-
-        answer = TableQuestionAnswerer(store).answer("GSM8K Model A", limit=5)
-        assert answer["tables"] and answer["rows"] and answer["citations"]

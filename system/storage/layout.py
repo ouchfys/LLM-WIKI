@@ -15,10 +15,18 @@ import re
 from pathlib import Path
 from typing import Any
 
+from system.core import config
+
 
 class StorageLayout:
     def __init__(self, repo_root: str | Path | None = None):
-        self.repo_root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[2]
+        configured_root = str(getattr(config, "PAPERWIKI_WORKSPACE_ROOT", "") or "").strip()
+        self.repo_root = (
+            Path(repo_root)
+            if repo_root
+            else Path(configured_root) if configured_root
+            else Path(__file__).resolve().parents[2]
+        )
 
     @property
     def sources_dir(self) -> Path:

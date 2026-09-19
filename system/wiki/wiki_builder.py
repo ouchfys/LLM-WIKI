@@ -326,7 +326,13 @@ def sanitize_wiki_text(text: str) -> str:
         line = raw_line.strip()
         compact = re.sub(r"\s+", "", line)
         if len(compact) >= 256:
-            allowed = sum(1 for ch in compact if ch.isalnum() or ch in "+/=_-")
+            # Base64/parser blobs are ASCII. ``str.isalnum`` is also true for
+            # CJK ideographs, so using it without an ASCII guard silently
+            # discarded long single-line Chinese technical prose.
+            allowed = sum(
+                1 for ch in compact
+                if ch.isascii() and (ch.isalnum() or ch in "+/=_-")
+            )
             whitespace = sum(1 for ch in raw_line if ch.isspace())
             whitespace_ratio = whitespace / max(len(raw_line), 1)
             if whitespace_ratio < 0.05 and allowed / max(len(compact), 1) > 0.9:

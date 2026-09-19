@@ -23,14 +23,19 @@ from system.storage import get_object_storage
 
 
 DB_TABLES = [
-    "agent_events", "agent_checkpoints", "agent_approvals", "agent_runs",
     "claim_evidence", "wiki_claims", "wiki_revisions",
-    "document_table_cells", "document_tables", "document_elements", "source_documents",
+    "document_elements", "source_documents",
     "wiki_merge_audit", "review_reports", "distilled_candidates",
     "wiki_card_sources", "wiki_card_links", "wiki_aliases", "wiki_chunks",
     "source_packets", "paper_blocks", "papers", "wiki_pages",
     "ingestion_jobs", "wiki_maintenance_candidates", "wiki_repair_tasks",
     "wiki_validation_runs", "wiki_query_insights",
+]
+RUNTIME_CHILD_TABLES = [
+    "agent_events",
+    "agent_checkpoints",
+    "agent_approvals",
+    "agent_run_inputs",
 ]
 LOCAL_GENERATED = [
     REPO_ROOT / "wiki",
@@ -82,7 +87,7 @@ def main() -> int:
     backup_dir = REPO_ROOT / "backups" / f"pre-evidence-reingest-{stamp}"
     backup_dir.mkdir(parents=True, exist_ok=False)
     if db_path.exists():
-        shutil.copy2(db_path, backup_dir / db_path.name)
+        _backup_sqlite(db_path, backup_dir / db_path.name)
     for source in LOCAL_GENERATED:
         if source.exists():
             shutil.copytree(source, backup_dir / source.name, dirs_exist_ok=True)
@@ -121,7 +126,13 @@ def _db_counts(path: Path) -> dict[str, int]:
         return {}
     with sqlite3.connect(path) as conn:
         existing = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        return {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in DB_TABLES if table in existing}
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in DB_TABLES
+            if table in existing
+        }
+        counts.update(_paper_runtime_counts(conn, existing))
+        return counts
 
 
 def _clear_db(path: Path) -> dict[str, int]:
@@ -129,6 +140,7 @@ def _clear_db(path: Path) -> dict[str, int]:
     with sqlite3.connect(path) as conn:
         existing = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         conn.execute("BEGIN IMMEDIATE")
+        deleted.update(_clear_paper_runtime(conn, existing))
         for table in DB_TABLES:
             if table not in existing:
                 continue
@@ -140,6 +152,57 @@ def _clear_db(path: Path) -> dict[str, int]:
                 conn.execute(f"INSERT INTO {fts}({fts}) VALUES ('rebuild')")
         conn.commit()
     return deleted
+
+
+def _paper_run_ids(conn: sqlite3.Connection, existing: set[str]) -> list[str]:
+    if "agent_runs" not in existing:
+        return []
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT id FROM agent_runs WHERE COALESCE(run_type, '') != 'wiki_chat'"
+        ).fetchall()
+    ]
+
+
+def _paper_runtime_counts(conn: sqlite3.Connection, existing: set[str]) -> dict[str, int]:
+    run_ids = _paper_run_ids(conn, existing)
+    counts = {"agent_runs(non_chat)": len(run_ids)}
+    if not run_ids:
+        return counts
+    placeholders = ",".join("?" for _ in run_ids)
+    for table in RUNTIME_CHILD_TABLES:
+        if table in existing:
+            counts[f"{table}(non_chat)"] = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE run_id IN ({placeholders})",
+                run_ids,
+            ).fetchone()[0]
+    return counts
+
+
+def _clear_paper_runtime(conn: sqlite3.Connection, existing: set[str]) -> dict[str, int]:
+    run_ids = _paper_run_ids(conn, existing)
+    deleted = {"agent_runs(non_chat)": len(run_ids)}
+    if not run_ids:
+        return deleted
+    placeholders = ",".join("?" for _ in run_ids)
+    for table in RUNTIME_CHILD_TABLES:
+        if table not in existing:
+            continue
+        count = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE run_id IN ({placeholders})",
+            run_ids,
+        ).fetchone()[0]
+        conn.execute(f"DELETE FROM {table} WHERE run_id IN ({placeholders})", run_ids)
+        deleted[f"{table}(non_chat)"] = count
+    conn.execute(f"DELETE FROM agent_runs WHERE id IN ({placeholders})", run_ids)
+    return deleted
+
+
+def _backup_sqlite(source: Path, destination: Path) -> None:
+    """Create a transactionally consistent backup, including any live WAL pages."""
+    with sqlite3.connect(source) as source_conn, sqlite3.connect(destination) as destination_conn:
+        source_conn.backup(destination_conn)
 
 
 def _file_count(path: Path) -> int:
