@@ -1,77 +1,67 @@
-# PaperWiki（LLM-WIKI）
+# PaperWiki：面向论文知识演进的 Research Agent
 
-> 把论文和研究对话持续编译成可检索、可核验、可更新的个人 Markdown Wiki。
+> 将论文持续编译成可检索、可核验、可更新的 Markdown Wiki，并让长时间研究任务能够被中断、恢复和审计。
 
-PaperWiki 是一个基于 Python 和 Vue 的论文知识库与研究问答应用。系统维护一份可持续更新的 Wiki：新论文进入后会提炼论文页和主题页，判断它是在补充已有知识，还是与旧结论发生冲突；普通新增自动提交，高风险修改才进入审批。用户问问题时，Agent 自己决定搜索和展开 Markdown Wiki 页面，还是在内部资料不足时访问网页。
+PaperWiki 不是“上传 PDF 后问一次问题”的普通 RAG。它主要解决两个工程问题：
+
+1. **新论文如何安全修改已有知识**：结论必须绑定原文证据；普通补充自动合并，矛盾、替代和证据异常进入人工审批。
+2. **长任务如何不依赖模型记忆维持进度**：研究目标、语料覆盖、已读页面、剩余条件和交付物状态持久化在 Runtime 中，即使上下文压缩或服务重启也能继续。
 
 ![Wiki 对话与工具调用](image/wiki-chat-current.png)
 
 ![Markdown 知识库](image/knowledge-vault-current.png)
 
-## 两条 Agent 工作流
+## 项目贡献
 
-### 论文入库与知识维护
+### 1. Evidence-aware Knowledge Compiler
+
+论文不会被直接切块后丢进向量库，而是经过“解析—提炼—回读—核验—合并”流程，编译成可维护的论文页和主题页。
 
 ```text
 PDF / arXiv URL
-  -> 结构解析
-  -> 编译详细论文页
-  -> 从论文页提炼可复用主题
-  -> 回读来源核验
-  -> 与已有 Wiki 合并
-  -> 生成 Markdown 修订版本
-  -> 低风险自动提交 / 高风险冲突审批
+  -> arXiv HTML / MinerU / PyMuPDF 解析路由
+  -> 编译 paper-wiki-v2 论文页
+  -> Claim 绑定稳定 Evidence ID
+  -> Verifier 回读来源判断证据是否支持 Claim
+  -> 召回同一对象、方面和适用条件下的旧结论
+  -> 生成 Markdown Revision
+  -> 普通新增自动提交 / 冲突与替代进入人工审批
   -> 重建检索索引
 ```
 
-解析不再依赖 Docker 服务：
+- **模型负责语义判断**：提炼 Claim、判断证据蕴含关系、识别新旧结论的补充或冲突关系。
+- **Python 负责确定性约束**：状态迁移、Evidence ID 存在性、数字一致性、候选范围、幂等提交、版本 diff 与 rollback。
+- **表格不经过模型转录**：模型只选择 `table_id`，Python 将解析结果中的 Markdown 表格原样回填到 Wiki Card。
+- **图表不猜像素内容**：只根据图注、脚注和相邻正文生成 Figure Notes；来源没有说明的趋势不会补写。
 
-- arXiv 论文优先读取官方结构化 HTML，完整性检查通过后直接使用，通常只需秒级网络和本地转换时间。
-- HTML 缺失或结构不完整、普通用户上传、扫描件会调用 MinerU 精准解析 API。
-- 两条精确路径都失败时才使用 PyMuPDF 文本降级，并在任务中明确标记 `degraded` 和失败原因。
-- 页码和 bbox 是可选定位信息，不参与普通检索，也不会进入 Wiki 正文或模型上下文。
-- MinerU 的结果包只在内存中读取 Markdown、`content_list.json`、表格与图片清单，不在项目目录堆积 zip、截图和中间图片。
+这条边界的目的不是证明小模型能发现整个知识库里的所有矛盾，而是先用检索缩小候选范围，再让模型处理少量语义关系，最后由程序控制写入副作用。
 
-系统保存稳定的 evidence ID，把提炼出的结论绑定到实际来源段落。合并时只有“同一对象、同一方面、适用条件重叠”的新旧结论才进入关系判断，避免仅因关键词相似就制造冲突。
+### 2. 可控、可恢复的 Agent Runtime
 
-论文页采用 `paper-wiki-v2` 结构，覆盖研究问题、动机、贡献、方法总览、组件、执行流程、实验设置、核心结果、消融、局限、与已有工作的差异和面试要点。论文页与主题页分两次模型调用：DeepSeek V4 Flash 先专注编译一份完整论文页，再从编译结果中提炼少量可复用主题，二者不再争抢同一个输出预算。
+PaperWiki 使用单 Agent 的动态 `plan -> call -> observe` 循环。模型可以提出行动，Runtime 决定这些行动能否、何时以及以什么顺序执行。
 
-提炼输入不再固定取“前 6 节、每节 1000 字符”。默认允许最多 320K Token 的论文输入；常规论文会把全部小节、表格和图注交给模型。超出预算时保留完整目录，并按论文小节均衡分配 Token，对方法、实验、结果、消融和限制给予更高权重，避免只保留论文开头。该预算可通过 `PAPERWIKI_PAPER_INPUT_TOKENS` 调整。
+```mermaid
+flowchart LR
+    U[用户目标] --> P[模型规划]
+    P --> G[参数与阶段策略]
+    G --> S[工具调度]
+    S --> T[Wiki / arXiv / Web / Memory]
+    T --> C[上下文管理]
+    C --> P
 
-Card 中的关键表格来自解析结果的确定性回填：模型只选择 `table_id`，Python 按 ID 把 `SourceTable.markdown` 原样写入 Markdown，因此数值不会经过模型转录。表格与正文统一保存在 Wiki Card 中，并通过同一套页面检索和读取链路进入回答上下文，不再维护结构化单元格查询副本。图表则根据 MinerU 的图注、脚注和相邻正文生成 `Figure Notes`，模型只能解释来源文本明确支持的趋势、条件和数值，不能猜测未提供的视觉内容。
-
-生成后会执行覆盖度检查。经验型和系统型论文必须包含方法组件、执行流程、实验设置、至少两项核心结果，并在存在表格或图片时生成对应的 Key Tables 和 Figure Notes；字段缺失会触发一次基于原文的自动修订，仍未通过则进入 `needs_revision`，不会把稀疏卡片当作成功结果提交。
-
-### 面向用户的研究问答
-
-```text
-用户问题
-  -> Agent 判断需要什么信息
-  -> Wiki 小节混合检索
-  -> 按需展开 2～5 个页面
-  -> 阅读 Card 内的正文、结论、实验条件和 Markdown 表格
-  -> 跨页面对齐比较维度与实验口径
-  -> 本地资料不足或问题要求最新信息时才访问网页
-  -> 带引用回答
+    L[(Research Ledger)] --> G
+    S --> R[(Trace / Checkpoint)]
+    C --> R
+    R --> O[报告与证据附录]
 ```
 
-Wiki 检索在页面小节上并行执行 FTS5 关键词召回与 Qwen3-Embedding-0.6B 多语言语义召回，再用 RRF 融合。没有额外 Reranker；最终页面选择交给工具调用 Agent。聊天控制器与最终回答使用 DeepSeek 官方 `deepseek-v4-flash`，论文提炼、核验和合并模型可分别配置。
+- 同一步中的独立只读工具最多 3 路并发，Observation 仍按模型最初的调用顺序归并。
+- `wiki_search -> wiki_open`、`web_search -> web_fetch` 等存在数据依赖的调用保持顺序。
+- `project_memory_update`、`arxiv_import_paper` 等写操作串行执行。
+- 论文入库任务通过状态机、checkpoint、worker lease、heartbeat、恢复扫描和幂等提交处理重启与重复执行。
+- 长研究任务使用结构化 Research Ledger 保存阶段、目标论文数、类别覆盖、已选择论文、入库任务、已读 Card、剩余条件和预算；模型上下文不是任务真相。
 
-同一规划步骤中的独立只读工具采用最多 3 路有界并发，完成后仍按模型最初的调用顺序归并 Observation。存在数据依赖的读取保持顺序，例如 `wiki_search -> wiki_open` 和 `web_search -> web_fetch`；`project_memory_update` 等写操作始终串行。
-
-前端展示实际发生的搜索、页面读取、证据回查和网页访问，不展示模型私有思维链。
-
-## 为什么它是 Agent 项目
-
-项目的重点不在“调用了几个模型”，而在模型决策与工程控制的边界：
-
-- 模型决定调用哪个工具、提炼哪些结论，以及新旧知识之间的语义关系。
-- Python 负责状态迁移、证据存在性和数字一致性检查、文件写入、幂等提交与回滚。
-- 每次论文任务和问答都有 Agent Run，模型调用、工具调用、耗时、Token、错误和重试进入统一 Trace。
-- 论文任务使用 checkpoint、lease、heartbeat 和恢复扫描；服务中断后从已保存状态和不可变来源安全重放。
-- 问答支持停止、运行中补充要求和排队追问，但不为无不可逆副作用的聊天增加论文任务级 checkpoint 成本。
-
-论文任务状态：
+论文入库状态：
 
 ```text
 QUEUED -> EXTRACTING -> DISTILLING -> VERIFYING
@@ -79,18 +69,24 @@ QUEUED -> EXTRACTING -> DISTILLING -> VERIFYING
        -> COMMITTING -> REINDEXING -> COMPLETED
 ```
 
-## 知识库、项目记忆、用户记忆与会话上下文
+长研究任务状态：
 
-四类数据各自维护。所有旧会话和新会话都会自动绑定当前默认研究项目，因此新建对话不会丢失同项目的目标、约束、决定和未解决问题：
+```text
+DISCOVER -> WAIT_INGEST -> VERIFY_CORPUS
+         -> READ_LOCAL_CORPUS -> SYNTHESIZE -> COMPLETE
+```
 
-| 类型 | 内容 | 使用方式 |
+### 3. 知识、记忆、会话与上下文分层
+
+| 层 | 保存内容 | 进入模型的方式 |
 | --- | --- | --- |
-| Wiki 知识库 | Markdown 论文页、主题页及来源证据 | 按问题检索和引用 |
-| 项目记忆 | 项目目标、研究方向、约束、决定、失败经验、进度和开放问题 | 新会话固定加载 `purpose.md` 与 Agent 维护的 `MEMORY.md` |
-| 用户记忆 | 用户在设置或引导流程中明确保存的持续偏好 | 少量固定注入，并同步成人可读的 `preferences.md` |
-| 会话记录与上下文 | 原始消息、工具观察、压缩摘要 | 构建本次模型请求，支持历史找回 |
+| Markdown Wiki | 论文事实、方法、实验、表格、来源证据 | FTS5 与向量混合检索后按页读取 |
+| 项目记忆 | 当前项目目标、约束、决定、进度、失败经验 | 新会话固定读取 `purpose.md` 与 `MEMORY.md` |
+| 用户偏好 | 用户明确保存的长期偏好 | 少量固定注入 |
+| SQLite 会话 | 原始消息、工具结果、Compact 摘要、检查点 | 按 Token 预算组装本轮上下文 |
+| Research Ledger | 长任务阶段、覆盖情况、剩余要求、预算 | Runtime 判断任务是否真的完成 |
 
-项目记忆采用类似 Coding Agent Notes 的轻量文件结构，而不是给个人端记忆部署向量数据库：
+项目记忆采用 Coding Agent Notes 式的轻量文件，而不是为个人项目额外部署向量数据库：
 
 ```text
 .paperwiki/memory/
@@ -100,59 +96,56 @@ QUEUED -> EXTRACTING -> DISTILLING -> VERIFYING
     └── MEMORY.md
 ```
 
-每个新会话固定读取 `purpose.md` 和最多 12,000 字符的 `MEMORY.md`。当用户确认了跨会话仍有价值的目标、约束、决定、进度、失败经验或下一步时，Agent 在正常工具循环中调用 `project_memory_update`，提交完整的新版 Markdown。Python只负责项目路径隔离、大小检查和临时文件加 `os.replace` 的原子替换；超限写入会失败，不会静默截断，也不再运行回答后的记忆抽取模型。
+Agent 在工具循环中更新完整的 `MEMORY.md`；Python 只允许写入当前项目的固定路径，并执行大小限制和原子替换。论文知识仍然写入 Wiki，原始对话仍然写入 SQLite，三者不会混用。
 
-`MEMORY.md` 是可重写的当前项目状态，不是追加式聊天日志。论文事实仍然通过 `wiki_search -> wiki_open` 进入上下文并写入 Wiki；原始消息和 Compact 摘要仍保存在 SQLite。旧版 SQLite 项目记忆表与 topic 文件只作为已有安装的兼容数据，不再进入新对话的写入主路径。
+上下文按 Token 预算管理。预算充足时保留有效历史；接近阈值时先回收旧工具输出，再压缩早期对话并保留最近原文。单条工具结果超过 50 KB 时，完整结果保存在 SQLite，当前 Prompt 只放头尾预览和 `result_id`；Agent 可以通过 `read_tool_result` 分页恢复原文。Compact 保存的是派生摘要和覆盖边界，不删除原始消息。
 
-工具规划和最终回答共享有效历史。预算允许时保留全部有效对话；完整请求接近阈值时，先缩减工具观察，再总结早期历史并保留近期原文。工具结果采用类似 DeepSeek Harness 的两级保护：单条模型可见结果超过 50KB 时立即改成头尾预览；上下文达到压缩阈值后，再把超过 8192 字符的旧工具结果压到前 4096＋后 1024。两级处理都不调用模型。
+## 一次实际研究会发生什么
 
-- DeepSeek V4 Flash 默认按 **1M Token** 窗口配置，另可设置应用运行预算。默认约在窗口的 80% 触发整理。
-- 摘要与覆盖边界原子提交到 SQLite 检查点；原始消息和完整工具结果仍保留。每个工具观察携带 `result_id`、原始大小和省略量，模型可调用历史搜索、原文读取，或用 `read_tool_result` 按 offset 分页、按 query 跳到命中文本附近。
-- DeepSeek V4 Flash 自动把多轮追问改写为独立检索问题；需要跨会话保存项目状态时，在同一 Agent 循环中直接更新 `MEMORY.md`，不增加回答后的模型调用。
-- `/purpose` 查看项目目标；`/purpose <自然语言要求>` 结合当前会话更新目标；`/purpose 清除` 清空项目目标。普通对话中的持久项目状态由 `project_memory_update` 工具维护。
-- `/compact` 手动整理会话；普通聊天和自动压缩不会写入 Wiki。
-- `/wiki <沉淀要求>` 将用户指定的讨论沉淀到知识库，保留论文事实、AI 综合和用户洞见的来源区别。
-- 删除会话会在同一事务中同步删除消息、压缩检查点、工具观察，以及归属于该会话的 Wiki Chat Agent Run、事件、运行 checkpoint、排队输入和审批；论文入库等独立任务的审计记录、用户记忆与 Wiki 均独立保留。
-- 默认 Token 数是带余量的估算，支持配置模型匹配的本地 tokenizer。聊天页面可展开查看请求用量。
+以“从 30 篇 Agentic RL 论文中寻找一个值得继续验证的方向”为例：
 
-## 冲突审批与版本安全
+```text
+用户提出研究目标
+  -> Runtime 创建 Research Ledger
+  -> Agent 搜索或导入论文
+  -> 入库 Runtime 解析、核验并编译 Wiki Card
+  -> Ledger 检查论文数量与主题覆盖
+  -> Agent 分页读取本地 Corpus，而不是反复搜索同几篇论文
+  -> 上下文接近预算时回收工具结果并 Compact 旧对话
+  -> Ledger 继续保存已读页面与剩余要求
+  -> Agent 生成读者报告与证据附录
+  -> Runtime 根据 Ledger 判断是否真正完成
+```
 
-新页面、普通补充和证据加强自动提交。只有以下情况进入 Review Center：
+如果此时新开会话，原聊天内容不会整段注入；新会话会读取同项目的 `purpose.md` 和 `MEMORY.md`。用户继续长研究任务时，Runtime 会重新关联同项目未完成的 Ledger，再按需检索 Wiki。服务重启后，论文任务和研究进度也从持久化状态恢复。
 
-- 新结论与已有结论在同一对象、同一方面和相同适用条件下矛盾；
-- 新来源明确替代旧结论；
-- 证据核验异常或提交前状态已过期。
+## 检索与问答
 
-审批页展示冲突来源、冲突对象、系统建议和最终会造成的 Markdown 变化。正式页面、来源关系和别名在批准前都不改变。提交使用 `pending -> accepted -> committing -> approved`，失败进入可重试的 `commit_failed`；所有修订都可 diff 和 rollback。
+Wiki 在 Markdown 小节上并行执行 SQLite FTS5 与 Qwen3-Embedding-0.6B 跨语言语义召回，再通过 RRF 融合。Agent 根据问题按需展开完整页面，并在本地资料不足或用户明确要求最新信息时访问 Web。
 
-## arXiv MCP
+这与传统 RAG 的关系是：**混合检索仍然是取证手段，Wiki Compiler 和 Runtime 负责知识如何产生、如何更新以及长任务如何可靠执行。**
 
-独立 MCP Server 提供：
+## 评测与验证
 
-- `arxiv_search`：按主题、作者、分类和年份搜索；
-- `arxiv_get_paper`：读取论文元数据；
-- `arxiv_download_pdf`：校验并缓存用户选中的 PDF；
-- `arxiv_import_paper`：提交到同一论文入库 Runtime；
-- `arxiv_ingestion_status`：查询异步进度。
+| 验证项 | 当前结果 | 说明 |
+| --- | ---: | --- |
+| Wiki Chat 30 题检索命中率 | 100% | 冻结回归集 |
+| Wiki Chat Top-1 命中率 | 76.67% | 冻结回归集 |
+| Wiki Chat 引用可靠性 | 100% | 30 题答案复核 |
+| Wiki Chat 通过率 | 83.33% | 当前保留基线 |
+| Verifier 门禁准确率 | 93.57% | 140 条、独立模型裁决的 Silver Set |
+| 自动化测试 | 183 passed | 后端完整测试 |
+| 前端验证 | 通过 | `vue-tsc -b && vite build` |
 
-MCP 不复制入库逻辑。它只负责文献发现与提交，去重、解析路由、核验、合并、审批和恢复仍由 FastAPI 后端统一管理。详见 [arXiv MCP](docs/design/ARXIV_MCP.md)。
+Verifier 数据集没有人工 Gold 标注，因此 93.57% 只能表述为 Silver Benchmark 结果。三个长任务在 Runtime 重构后尚未重新执行高成本端到端实验，README 不把重构前失败的结果包装成改造后指标。
 
-## 当前评测
+## 为什么没有使用 Multi-Agent / LangGraph / Redis
 
-评测已从单点 RAG 指标切换为四个 Agent 端到端指标：
+- 当前论文研究链路共享同一知识状态。多 Agent 会增加上下文复制、协调冲突与模型费用，尚无独立到值得隔离的角色。
+- 当前动态循环和持久化状态机已经能表达任务依赖；迁移到 LangGraph 不会自动提高正确率或恢复能力。
+- 项目面向单用户本地运行，SQLite 同时承担会话、索引、状态和审计存储。多实例部署时才需要迁移任务传输层与向量索引。
 
-| 指标 | 判定内容 |
-| --- | --- |
-| Task Success Rate | 交付物、语料数量、类别覆盖、已读证据和完成声明是否全部通过 |
-| Tool Use Correctness | 工具选择、参数、依赖顺序、证据绑定和重复调用是否正确 |
-| Recovery Success Rate | 注入瞬时故障后是否采取恢复动作，且最终仍达到可接受交付状态 |
-| Policy / Safety Compliance | 是否遵守禁用工具、项目隔离、路径与密钥不泄露等约束 |
-
-三个长任务基线分别是：基于 30 篇固定语料选择 Agentic RL 发文方向；自主建立并研究 KV Cache 技术图谱；研究 Agent Harness 并生成面试指导书。重构前的诊断运行中，三个 base 任务的工具调用判定均通过，但任务完成均未通过；它们暴露的是长任务状态、固定语料穷举、阶段化工具权限和交付物可读性问题，不是单次检索效果问题。
-
-为此，现在为长任务持久化结构化研究账本，用 `corpus_manifest` 分页穷举固定语料，按 `DISCOVER -> WAIT_INGEST -> READ_LOCAL_CORPUS -> SYNTHESIZE` 阶段限制工具，并把读者报告、证据附录与运行审计分开。KV Cache 任务的语料门槛从 8 篇调整为 24 篇，Agent Harness 从 6 篇调整为 15 篇，同时要求每个必要类别达到最小覆盖数，避免“数量达标但研究缺类”。这些改动已通过完整后端测试与前端生产构建，但尚未重跑三个高成本实验，因此不把旧结果当作改造后指标。
-
-在一篇 24 页 arXiv 论文的本地对照实验中，结构化 HTML 下载与转换约 2.84 秒，MinerU VLM 从提交到结果文件约 134.60 秒。它只说明解析路由能减少具备完整 HTML 论文的等待时间，不是跨数据集准确率结论。
+这些是当前规模下的工程取舍，不是对其他架构的否定。
 
 ## 技术栈
 
@@ -160,155 +153,80 @@ MCP 不复制入库逻辑。它只负责文献发现与提交，去重、解析�
 | --- | --- |
 | 前端 | Vue 3、TypeScript、Vite、Naive UI |
 | API | FastAPI、Pydantic |
-| Agent Runtime | SQLite 状态机、checkpoint、lease、heartbeat、trace |
-| 任务执行 | 有界 worker pool、持久化排队、恢复扫描 |
-| 文档解析 | arXiv LaTeXML HTML、MinerU VLM API、PyMuPDF fallback |
-| LLM | DeepSeek 官方 Chat Completions + SiliconFlow 模型分工 |
-| 知识主体 | Markdown Wiki |
-| 项目记忆 | Markdown 索引与主题文件、SQLite 来源账本 |
-| 检索 | SQLite FTS5、Qwen3-Embedding-0.6B、RRF |
-| 表格与图 | Card 内原始 Markdown 表格、Figure Notes |
+| Agent Runtime | Python、SQLite 状态机、checkpoint、lease、heartbeat、trace |
+| 文档解析 | arXiv HTML、MinerU VLM API、PyMuPDF fallback |
+| 模型 | DeepSeek V4 Flash、Qwen 系列模型、Qwen3-Embedding-0.6B |
+| 检索 | SQLite FTS5、向量召回、RRF |
+| 知识主体 | Markdown Wiki + Evidence Ledger |
 | 存储 | 本地文件系统 / 阿里云 OSS 租户前缀 |
-| MCP | MCP Python SDK，stdio / Streamable HTTP |
+| 工具接入 | Function Calling、MCP Python SDK |
 
 ## 快速启动
 
-### 1. 安装
+需要 Python 3.10+ 和 Node.js/npm。
 
 ```powershell
 python -m pip install -r requirements.txt
 python -m pip install --no-deps -e .
+Copy-Item .env.example .env
 ```
 
-### 2. 配置
-
-```powershell
-if (!(Test-Path .env)) { Copy-Item .env.example .env }
-```
-
-至少填写：
-
-```env
-DEEPSEEK_API_KEY=your-deepseek-key
-SILICONFLOW_API_KEY=your-siliconflow-key
-MINERU_API_TOKEN=your-mineru-token
-
-PAPER_PARSER_MODE=auto
-DEEPSEEK_CHAT_MODEL=deepseek-v4-flash
-WIKI_VECTOR_SEARCH_ENABLED=true
-
-STORAGE_BACKEND=local
-STORAGE_TENANT_ID=local-user
-STORAGE_ROOT_PREFIX=users/local-user
-```
-
-`MINERU_API_TOKEN` 未配置时，arXiv HTML 仍可用；普通 PDF 会明确降级到 PyMuPDF。
-
-### 3. 一条命令启动
-
-安装后，在任意 PowerShell 目录运行：
+在 `.env` 中至少配置模型与解析服务密钥，然后运行：
 
 ```powershell
 paperwiki web
 ```
 
-服务就绪后自动打开 `http://127.0.0.1:8000`。Vue 页面和 API 由同一个 FastAPI 进程提供，保留当前项目的 `.env`、`sessions.db` 和知识库；终端保持运行，按 `Ctrl+C` 停止。无需 Docker Desktop。
+程序会构建前端、启动 FastAPI，并打开 `http://127.0.0.1:8000`。前端页面与 API 由同一个本地进程提供；按 `Ctrl+C` 停止。
 
-首次运行会自动安装前端依赖并构建（需要 Node.js/npm）；已有构建且源码未更新时直接启动。检测到前端文件更新会自动重新构建，不需要另开 Vite。也可手动强制构建：
+常用参数：
 
 ```powershell
 paperwiki web --build
+paperwiki web --port 8001
+paperwiki web --no-browser
 ```
 
-可选参数：`paperwiki web --port 8001` 更换端口；`paperwiki web --no-browser` 只启动服务。端口被占用时会提示，不会停止其他程序。
-
-这里的 `pip install -e .` 只把本地源码目录注册为 Python 命令，没有发布 npm 或 PyPI 包。不要删除或移动项目目录；移动后在新目录重新安装。若 PowerShell 找不到命令，将当前 Python 的 Scripts 目录加入用户 PATH 并重开终端；也可在项目根目录运行 `python -m backend.cli web`。
-
-### 开发模式（前端热更新）
-
-需要实时修改页面时，仍可分开启动：
+开发模式：
 
 ```powershell
 python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
-```
-
-另开终端：
-
-```powershell
 cd frontend
 npm run dev
 ```
 
-- Web：`http://127.0.0.1:5173`
-- API：`http://127.0.0.1:8000`
-- Health：`http://127.0.0.1:8000/api/health`
+## 建议演示路径
 
-### 4. 启动 arXiv MCP（可选）
-
-```powershell
-python -m mcp_servers.arxiv_server
-```
-
-或使用 Streamable HTTP：
-
-```powershell
-python -m mcp_servers.arxiv_server --transport streamable-http --host 127.0.0.1 --port 8011
-```
-
-## 使用示例
-
-1. 用中文询问英文论文主题，观察 `wiki_search -> wiki_open` 的真实工具过程。
-2. 追问精确数值或跨论文差异，展示 Agent 打开相关 Wiki Card 并对齐实验条件。
-3. 输入 `/purpose 把当前项目聚焦到无需定制 CUDA kernel 的推理优化`，新建对话后继续追问项目目标。
-4. 讨论后输入 `/wiki 把刚才形成的设计判断沉淀成我的洞见`，在知识库查看新页面。
-5. 输入 `/compact`，继续追问并说明摘要只改变后续上下文，不删除原消息。
-6. 在冲突审批页展示新旧结论、各自来源和 Markdown 更新结果。
-7. 在评测页查看 30 题问答和 140 条 Verifier 回归结果。
-
-## 常用命令
-
-```powershell
-python scripts/ingest_paper_corpus.py --limit 3 --no-maintenance
-python scripts/reindex_wiki_markdown.py --wiki-dir wiki
-python -m pytest -q
-
-cd frontend
-npm run build
-```
+1. 导入一篇包含实验表格的 arXiv 论文，展示解析、Claim 核验和 Markdown Card。
+2. 用中文询问英文论文，展示 `wiki_search -> wiki_open`、混合检索和引用回答。
+3. 导入与已有结论冲突的论文，在 Review Center 查看双方证据和 Markdown diff。
+4. 启动论文入库后中断服务，重启并展示从 checkpoint 恢复。
+5. 输入 `/compact` 后继续追问，说明摘要没有删除 SQLite 中的原始消息。
+6. 新建会话，继续同一研究项目，展示 `purpose.md`、`MEMORY.md` 和 Research Ledger 的分工。
 
 ## 目录
 
 ```text
-backend/                  API、任务恢复和审批接口
-frontend/                 Vue 研究工作台
-mcp_servers/              arXiv 文献入口
-system/agent_runtime/     状态机、任务控制和 Trace
+backend/                  FastAPI、CLI 与审批接口
+frontend/                 Vue 3 研究工作台
+mcp_servers/              arXiv MCP Server
+system/agent_runtime/     任务状态、Research Ledger、Trace 与恢复
 system/document/          HTML / MinerU / PyMuPDF 解析路由
-system/wiki/              检索、核验、编译和版本管理
-system/storage/           本地 / OSS 对象存储
-system/conversation/      会话记录、Token 预算和压缩检查点
-system/memory/            用户偏好、项目状态、跨会话记忆与自动提炼
-.paperwiki/memory/        运行时生成的 purpose、记忆索引与主题文件（不提交 Git）
-scripts/                  入库、迁移和索引维护工具
-test/                     自动化测试与冻结评测集
-docs/                     架构、配置、运行和评测说明
+system/wiki/              检索、核验、知识编译与版本管理
+system/conversation/      会话、Token 预算、工具结果与 Compact 检查点
+system/memory/            用户偏好与项目记忆
+test/evaluation/          冻结数据集、基线结果与 Agent 评测脚本
+docs/                     设计、配置和评测细节
 ```
 
 ## 已知边界
 
-- 语义冲突发现依赖候选召回与模型判断，尚无大规模人工 gold benchmark，不能宣称通用矛盾检测已经解决。
-- Card 直接展示模型选出的关键原始表格。跨论文比较由 Agent 分别阅读相关论文页并对齐指标定义、模型、数据集和实验条件；条件不同不会强行统一指标或给出虚假排名。当前方案面向以叙述为主、表格数量有限的论文语料，不提供大规模关系表聚合能力。
-- Figure Notes 依据 MinerU 输出的图注、脚注和邻近正文生成；当前文本模型不直接读取 ZIP 中的图片像素，因此来源文本没有说明的曲线细节会明确留空。
-- arXiv HTML 不提供 PDF 页码和 bbox；当前产品不需要用户重新阅读原论文，因此它们只是可选审计定位信息。
-- MinerU 是外部 API，耗时与配额受服务状态影响；任务队列和超时会显式暴露，不把等待伪装成模型思考。
-- 当前向量索引适合单用户中小规模知识库；上万页或多用户部署应把候选召回迁移到 pgvector、Qdrant 或 OpenSearch 等 ANN 后端。
-- 本地任务执行器不是分布式队列，多实例部署应替换执行传输层，并继续复用现有 Agent Run 状态机。
-- 已有数据库仍保留少量名为 `docling_json/docling_ref` 的兼容列，用于无损读取旧数据；新运行路径不导入或启动 Docling。
+- 冲突发现依赖候选召回与模型判断，尚不能宣称解决开放域通用矛盾检测。
+- Figure Notes 当前基于图注和邻近正文，文本模型不直接读取图片像素。
+- Research Ledger 当前针对三个明确的长研究协议，不是任意任务的通用工作流引擎。
+- 问答可以恢复消息、工具结果与 Compact 检查点，但不会恢复模型中断瞬间的隐藏推理栈。
+- 当前存储与执行器面向单用户本地运行；大规模多用户部署需要替换向量索引和任务传输层。
 
-## 设计原则
+## 核心设计原则
 
-- Wiki Markdown 是论文知识主体；`.paperwiki/memory` Markdown 是轻量的项目上下文层，两者不共用检索与引用语义。
-- Wiki 检索索引和项目记忆文件都可以从持久化记录重建；SQLite 中的原始会话、来源账本和任务状态需独立备份。
-- 模型负责提议和语义判断，程序负责验证、状态和副作用。
-- 低风险自动提交，只有真正改变旧知识的情况才要求人判断。
-- 解析器是可替换适配层，不让某个文档工具绑死整个 Agent。
+> 模型负责提出语义决策，程序负责验证边界、保存真实状态并控制副作用。
