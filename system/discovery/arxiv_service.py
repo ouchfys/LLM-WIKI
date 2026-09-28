@@ -1,6 +1,6 @@
 """Reusable arXiv discovery, PDF caching, and Wiki-ingestion gateway.
 
-The MCP server and the built-in paper discovery adapter share this module so
+The chat runtime and the built-in paper discovery adapter share this module so
 arXiv parsing, request pacing, and identifier normalization have one source of
 truth. It deliberately does not parse documents itself: imported PDFs are sent to
 the existing FastAPI ingestion endpoint and therefore use the same dedupe,
@@ -17,6 +17,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Literal
 import xml.etree.ElementTree as ET
@@ -36,6 +37,18 @@ from system.core.config import (
     LLM_WIKI_API_URL,
 )
 from system.storage import get_storage_layout
+from system.agent_runtime.control import check_run_control, get_run_control
+
+
+def _wait_seconds(seconds: float) -> None:
+    """Backoff remains interruptible by the active chat's cancellation."""
+    deadline = time.monotonic() + seconds
+    while True:
+        check_run_control()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
 
 
 SortBy = Literal["relevance", "lastUpdatedDate", "submittedDate"]
@@ -143,14 +156,23 @@ class RequestPacer:
         self.interval_seconds = max(0.0, float(interval_seconds))
         self._lock = threading.Lock()
         self._last_request_at = 0.0
+        self._retry_after = 0.0
+
+    def defer(self, seconds: float) -> None:
+        with self._lock:
+            self._retry_after = max(self._retry_after, time.monotonic() + seconds)
 
     def wait(self) -> None:
-        with self._lock:
-            elapsed = time.monotonic() - self._last_request_at
-            remaining = self.interval_seconds - elapsed
-            if self._last_request_at and remaining > 0:
-                time.sleep(remaining)
-            self._last_request_at = time.monotonic()
+        while True:
+            check_run_control()
+            with self._lock:
+                now = time.monotonic()
+                next_request = max(self._retry_after, self._last_request_at + self.interval_seconds if self._last_request_at else 0)
+                remaining = next_request - now
+                if remaining <= 0:
+                    self._last_request_at = now
+                    return
+            _wait_seconds(min(0.2, remaining))
 
 
 _DEFAULT_PACER = RequestPacer(ARXIV_REQUEST_INTERVAL_SECONDS)
@@ -251,6 +273,30 @@ class ArxivClient:
         result = self.parse_feed(xml_content, fallback_query=f"id:{normalized}")
         return result.papers[0] if result.papers else None
 
+    def get_papers(self, arxiv_ids: list[str]) -> list[ArxivPaper]:
+        """Resolve exact identifiers in one arXiv API request.
+
+        arXiv's ``id_list`` accepts a comma-separated list.  Keeping this as a
+        separate operation avoids turning a user-provided bibliography into a
+        sequence of fuzzy topic searches (or one HTTP request per paper).
+        Results are returned in the same order as the requested identifiers;
+        missing identifiers are simply absent.
+        """
+
+        normalized = list(dict.fromkeys(
+            normalize_arxiv_id(arxiv_id) for arxiv_id in arxiv_ids
+        ))
+        if not normalized:
+            return []
+        xml_content = self._get_atom({
+            "id_list": ",".join(normalized),
+            "max_results": len(normalized),
+        })
+        result = self.parse_feed(xml_content, fallback_query=f"id_list:{','.join(normalized)}")
+        key = lambda value: re.sub(r"v\d+$", "", value, flags=re.IGNORECASE).lower()
+        by_id = {key(paper.arxiv_id): paper for paper in result.papers}
+        return [paper for arxiv_id in normalized if (paper := by_id.get(key(arxiv_id)))]
+
     def download_pdf(
         self,
         arxiv_id: str,
@@ -271,17 +317,7 @@ class ArxivClient:
             return self._download_result(normalized, destination, metadata_path, cached=True)
 
         pdf_url = f"{self.pdf_base_url}/{normalized}.pdf"
-        self.pacer.wait()
-        try:
-            response = self.session.get(
-                pdf_url,
-                headers={**self.headers, "Accept": "application/pdf"},
-                timeout=self.timeout_seconds,
-                stream=True,
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise ArxivServiceError(f"arXiv PDF download failed: {exc}") from exc
+        response = self._request(pdf_url, accept="application/pdf", stream=True)
 
         declared_size = int(response.headers.get("Content-Length") or 0)
         if declared_size > self.max_pdf_bytes:
@@ -295,6 +331,7 @@ class ArxivClient:
         try:
             with temporary.open("wb") as output:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    check_run_control()
                     if not chunk:
                         continue
                     written += len(chunk)
@@ -439,24 +476,51 @@ class ArxivClient:
         )
 
     def _get_atom(self, params: dict[str, Any]) -> bytes:
+        response = self._request(self.api_url, params=params)
+        try:
+            return response.content
+        finally:
+            response.close()
+
+    def _request(self, url: str, *, accept: str = "application/atom+xml", **kwargs):
         last_error: requests.RequestException | None = None
+        attempts = 0
         for attempt in range(1, self.max_attempts + 1):
+            attempts = attempt
             self.pacer.wait()
+            response = None
             try:
                 response = self.session.get(
-                    self.api_url,
-                    params=params,
-                    headers=self.headers,
-                    timeout=self.timeout_seconds,
+                    url, headers={**self.headers, "Accept": accept},
+                    timeout=self.timeout_seconds, **kwargs,
                 )
                 response.raise_for_status()
-                return response.content
+                return response
             except requests.RequestException as exc:
                 last_error = exc
-                if attempt < self.max_attempts and self.retry_backoff_seconds:
-                    time.sleep(self.retry_backoff_seconds * attempt)
+                status = response.status_code if response is not None else None
+                delay = self.retry_backoff_seconds * (2 ** (attempt - 1))
+                if response is not None:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = max(delay, float(retry_after))
+                        except (TypeError, ValueError):
+                            try:
+                                until = parsedate_to_datetime(retry_after)
+                                delay = max(delay, (until - datetime.now(timezone.utc)).total_seconds())
+                            except (TypeError, ValueError, OverflowError):
+                                pass
+                    response.close()
+                retryable = status is None or status in {408, 429, 500, 502, 503, 504}
+                if not retryable:
+                    break
+                # Share the cooldown with other requests in this process,
+                # including after this call exhausts its own retry budget.
+                self.pacer.defer(max(0.0, delay))
         raise ArxivServiceError(
-            f"arXiv API request failed after {self.max_attempts} attempt(s): {last_error}"
+            f"arXiv request failed after {attempts} attempt(s): {last_error}. "
+            "Keep successful papers and record this source as unavailable; do not restart per-ID shell retries."
         ) from last_error
 
     @staticmethod
@@ -555,6 +619,11 @@ class WikiIngestionClient:
         if approval_mode not in {"risk", "manual", "auto"}:
             raise ValueError(f"Unsupported approval mode: {approval_mode}")
         try:
+            ownership = {}
+            control = get_run_control()
+            if control and getattr(control, "active_call_id", ""):
+                ownership = {"owner_session_id": control.session_id, "parent_run_id": control.run_id, "request_id": control.active_call_id}
+            check_run_control()
             with path.open("rb") as handle:
                 response = self.session.post(
                     f"{self.base_url}/api/papers/ingest",
@@ -563,6 +632,7 @@ class WikiIngestionClient:
                         "source_url": source_url,
                         "pipeline": pipeline or "wiki_compile",
                         "approval_mode": approval_mode,
+                        **ownership,
                     },
                     timeout=self.timeout_seconds,
                 )
@@ -599,8 +669,8 @@ class WikiIngestionClient:
         return payload
 
 
-class ArxivMcpService:
-    """Small facade used by MCP tool handlers."""
+class ArxivService:
+    """Shared paper discovery and ingestion service for local callers."""
 
     def __init__(
         self,
@@ -632,6 +702,6 @@ class ArxivMcpService:
             "next": (
                 "The PDF already exists in the Wiki."
                 if submitted.get("already_exists")
-                else "Use arxiv_ingestion_status with the returned job_id; parsing and Wiki compilation run asynchronously."
+                else "Use arxiv(action=status) with the returned job_id; parsing and Wiki compilation run asynchronously."
             ),
         }

@@ -11,8 +11,7 @@ from system.storage import get_object_storage, get_storage_layout
 
 class RawSourceVault:
     def __init__(self, base_dir: Optional[str] = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        self.repo_root = repo_root
+        self.repo_root = get_storage_layout().repo_root
         self.base_dir = Path(base_dir) if base_dir else get_storage_layout().sources_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -66,7 +65,10 @@ class RawSourceVault:
         storage_uri = storage.upload_text(storage.key_for_local_path(path), markdown)
         if storage.enabled:
             return storage_uri
-        return path.relative_to(self.repo_root).as_posix()
+        try:
+            return path.relative_to(self.repo_root).as_posix()
+        except ValueError:
+            return str(path.resolve())
 
     @staticmethod
     def _escape(value: Any) -> str:

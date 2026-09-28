@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any
 
 from system.wiki.maintenance.store import WikiMaintenanceStore
@@ -89,8 +90,7 @@ class MaintenanceCandidateProcessor:
     """
 
     def __init__(self, db_path: str | Path | None = None, llm: Any = None):
-        repo_root = Path(__file__).resolve().parents[3]
-        self.db_path = str(Path(db_path) if db_path else repo_root / "sessions.db")
+        self.db_path = str(resolve_database_path(db_path))
         self.llm = llm
         self.store = WikiMaintenanceStore(db_path=self.db_path)
         self.wiki_store = WikiStore(db_path=self.db_path)

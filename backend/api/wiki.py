@@ -1,4 +1,5 @@
-﻿import hashlib
+﻿from typing import Literal
+import hashlib
 import csv
 import json
 import mimetypes
@@ -58,10 +59,10 @@ from system.wiki.revision import WikiRevisionManager
 from system.wiki.wiki_store import WikiStore
 from system.agent_runtime import AgentRunStore, TraceRecorder
 
-REPO_ROOT = _Path(__file__).resolve().parents[2]
 STORAGE_LAYOUT = get_storage_layout()
+REPO_ROOT = STORAGE_LAYOUT.repo_root
 RAW_IMAGE_DIR = STORAGE_LAYOUT.source_dir("images")
-EVALUATION_RUNS_DIR = REPO_ROOT / "test" / "evaluation" / "runs"
+EVALUATION_RUNS_DIR = STORAGE_LAYOUT.queries_dir / "evaluation-runs"
 
 router = APIRouter()
 
@@ -89,9 +90,16 @@ class ResearchSourceCorrectionPayload(BaseModel):
 
 
 class WikiChatPayload(BaseModel):
-    message: str
+    message: str = ""
     session_id: str = ""
     stream: bool = False
+    resume_run_id: str = ""
+    research_mode: bool = False
+    thinking_effort: Optional[Literal["none", "low", "high", "max"]] = None
+
+
+class RecoveryDecisionPayload(BaseModel):
+    decision: str
 
 
 class RevisionRollbackPayload(BaseModel):
@@ -2211,6 +2219,29 @@ def get_chat_session_messages(session_id: str, store=Depends(get_session_store))
     return {"session": session, "items": items}
 
 
+@router.get("/sessions/{session_id}/activity")
+def get_chat_activity(session_id: str, run_id: str = "", after: int = 0, store=Depends(get_session_store)):
+    """Observe a running turn without starting, resuming or cancelling it."""
+    if not store.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    runtime = AgentRunStore(store.db_path)
+    run = runtime.get_active_chat(session_id)
+    if not run:
+        return {"run": None, "events": [], "after": 0}
+    cursor = max(0, after) if run_id == run["id"] else 0
+    events = runtime.list_events(run["id"], after=cursor, limit=500)
+    return {
+        "run": {
+            "id": run["id"], "current_state": run["current_state"],
+            "message": run.get("context", {}).get("request_message", ""),
+            "created_at": run["created_at"], "input_closed": bool(run.get("input_closed")),
+        },
+        "events": [event["output"] for event in events
+                   if event.get("event_type") == "chat.public_event" and isinstance(event.get("output"), dict)],
+        "after": max([cursor] + [int(event["sequence"]) for event in events]),
+    }
+
+
 @router.post("/sessions/{session_id}/compact")
 def compact_chat_session(
     session_id: str,
@@ -2415,6 +2446,28 @@ User instruction:
     return {"ok": True, "answer": answer, "purpose": purpose, "project": updated}
 
 
+@router.get("/sessions/{session_id}/recovery")
+def get_chat_recovery(session_id: str, store=Depends(get_session_store)):
+    from system.agent_runtime.chat_recovery import ChatRecovery
+    if not store.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"items": ChatRecovery(AgentRunStore(store.db_path)).list_for_session(session_id)}
+
+
+@router.post("/sessions/{session_id}/recovery/{run_id}/{call_id}")
+def resolve_chat_write(session_id: str, run_id: str, call_id: str, payload: RecoveryDecisionPayload, store=Depends(get_session_store)):
+    from system.agent_runtime.chat_recovery import ChatRecovery
+    runtime = AgentRunStore(store.db_path)
+    run = runtime.get_run(run_id) or {}
+    if not store.get_session(session_id) or run.get("source_uri") != f"session:{session_id}":
+        raise HTTPException(status_code=404, detail="Session task not found")
+    try:
+        ChatRecovery(runtime).resolve(run_id, call_id, payload.decision)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True}
+
+
 @router.delete("/sessions/{session_id}")
 def delete_chat_session(session_id: str, store=Depends(get_session_store)):
     deleted = store.delete_session(session_id)
@@ -2439,6 +2492,9 @@ def chat_with_wiki(
             stream = chat_service.chat_stream(
                 payload.message,
                 session_id=payload.session_id,
+                **({"resume_run_id": payload.resume_run_id} if payload.resume_run_id else {}),
+                **({"research_mode": True} if payload.research_mode else {}),
+                **({"thinking_effort": payload.thinking_effort} if payload.thinking_effort is not None else {}),
             )
             try:
                 async for chunk in iterate_in_threadpool(stream):
@@ -2452,7 +2508,11 @@ def chat_with_wiki(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    result = chat_service.chat(payload.message, session_id=payload.session_id)
+    if payload.resume_run_id:
+        raise HTTPException(status_code=400, detail="Continue tasks using the streaming endpoint")
+    result = chat_service.chat(payload.message, session_id=payload.session_id,
+                               **({"research_mode": True} if payload.research_mode else {}),
+                               **({"thinking_effort": payload.thinking_effort} if payload.thinking_effort is not None else {}))
     return {
         "answer": result.answer,
         "citations": [citation.__dict__ for citation in result.citations],
@@ -2948,6 +3008,15 @@ def get_card(card_id: str, store: WikiStore = Depends(get_wiki_store)):
     if not card:
         raise HTTPException(status_code=404, detail="Wiki card not found")
     card["obsidian_uri"] = store.vault.card_uri(card.get("markdown_path", ""))
+    if (card.get("content_json") or {}).get("repository_research"):
+        from system.wiki.repository_verification import repository_review_status
+        evidence = PaperWikiPipelineStore(db_path=store.db_path)
+        revision = evidence.get_revision(card.get("current_revision_id") or "")
+        card["repository_review"] = repository_review_status(evidence, revision)
+        if revision and store.vault.read_reference(card.get("markdown_path") or "") != revision.get("full_markdown"):
+            # Local Markdown edits can keep the old revision ID after reindex.
+            # A verdict about that old text does not review the edited article.
+            card["repository_review"].update(status="content_changed", current_version_reviewed=False)
     return card
 
 

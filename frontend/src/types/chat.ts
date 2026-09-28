@@ -40,7 +40,27 @@ export type ToolEvent = {
   query?: string
   reason?: string
   items?: ToolEventItem[]
+  arguments?: Record<string, unknown>
+  output_preview?: unknown
+  duration_ms?: number
+  result_id?: string | number
 }
+
+export type ProgressEvent = {
+  type: 'progress'
+  event_id?: string
+  text: string
+  phase?: string
+  timestamp?: string
+}
+
+export type ToolStatusEvent = Omit<ToolEvent, 'eventId'> & {
+  type: 'tool_status'
+  event_id?: string
+  timestamp?: string
+}
+
+export type TraceTimelineEvent = ProgressEvent | ToolStatusEvent
 
 export type ToolPlan = {
   intent?: string
@@ -62,6 +82,20 @@ export type TraceCard = {
 }
 
 export type AgentTrace = {
+  task_outcome?: {
+    status: 'partial' | 'model_finished'
+    stop_reason: string
+    unfinished_plan_ids: string[]
+    committed_wiki: Array<{ card_id: string; title?: string; repository?: string; revision_id?: string; verified_readback: boolean }>
+  }
+  thinking_effort?: 'none' | 'low' | 'high' | 'max'
+  research_state?: {
+    mode: 'chat' | 'research'
+    status: 'researching' | 'complete' | 'insufficient' | 'conflicted' | 'budget_exhausted' | 'not_required'
+    reason: string
+    questions: Array<{ id: string; question: string; status: 'missing' | 'partial' | 'supported' | 'conflict'; answer: string }>
+  }
+  timeline?: TraceTimelineEvent[]
   context_budget?: {
     input_tokens_estimate?: number
     window?: number
@@ -76,6 +110,11 @@ export type AgentTrace = {
     status: 'running' | 'done' | 'error'
     summary?: string
     items?: ToolEventItem[]
+    event_id?: string
+    arguments?: Record<string, unknown>
+    output_preview?: unknown
+    duration_ms?: number
+    result_id?: string | number
   }>
   retrieved_cards?: TraceCard[]
   web_results?: Array<{ title: string; url: string; snippet?: string }>
@@ -115,6 +154,7 @@ export type ChatMessage = {
   citations?: Citation[]
   resources?: LearningResource[]
   toolEvents?: ToolEvent[]
+  timeline?: TraceTimelineEvent[]
   toolPlan?: ToolPlan
   trace?: AgentTrace
   profileUpdates?: Array<{ signal_type: string; value: string }>
@@ -134,17 +174,20 @@ export type RunInput = {
 }
 
 export type SseChunk =
+  | { type: 'session_updated'; session_id: string; title: string }
+  | ProgressEvent
+  | ToolStatusEvent
   | { type: 'run_started'; run_id: string }
   | { type: 'heartbeat'; run_id: string }
   | { type: 'phase'; phase: string; detail: string }
   | { type: 'answer_reset'; reason: string; input_ids?: string[]; detail?: string }
   | { type: 'cancelled'; run_id: string; message: string }
+  | { type: 'paused'; run_id: string; message: string }
   | { type: 'queue_update'; items: RunInput[] }
   | { type: 'card_list'; citations?: Citation[] }
   | { type: 'resource_list'; resources?: LearningResource[] }
   | { type: 'tool_plan'; plan?: ToolPlan }
   | { type: 'agent_trace'; trace?: AgentTrace }
-  | { type: 'tool_status'; event_id?: string; tool: string; label: string; status: 'running' | 'done' | 'error'; detail?: string; query?: string; reason?: string; items?: ToolEventItem[] }
   | { type: 'token'; text?: string }
   | { type: 'profile'; updates?: Array<{ signal_type: string; value: string }> }
   | { type: 'error'; message?: string }

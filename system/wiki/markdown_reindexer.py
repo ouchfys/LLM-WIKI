@@ -170,6 +170,11 @@ class MarkdownWikiReindexer:
             )
 
     def _upsert_markdown_sources(self, conn: sqlite3.Connection, card: ParsedMarkdownCard) -> None:
+        if (card.system_metadata.get("repository_review") or {}).get("policy") == "author_self_check":
+            # Repository cards retain basic source metadata in Markdown and the
+            # page index, without creating an additional evidence relation.
+            # Historical evidence records are left intact.
+            return
         conn.execute(
             """
             DELETE FROM wiki_card_sources

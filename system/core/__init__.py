@@ -2,5 +2,5 @@
 
 __all__ = [
     "config",
-    "siliconflow_client",
+    "deepseek_client",
 ]

@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from system.core.config import DEEPSEEK_CHAT_MODEL
 from system.core.llm_call import invoke_structured
-from system.core.siliconflow_client import DeepSeekChat
+from system.core.deepseek_client import DeepSeekChat
 
 
 LABELS = {"entailed", "contradicted", "insufficient"}
@@ -29,7 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        default="test/evaluation/datasets/evidence_wiki_silver_v1",
+        required=True,
+        help="Dataset directory containing verifier.jsonl and manifest.json",
     )
     parser.add_argument("--model", default=DEEPSEEK_CHAT_MODEL)
     parser.add_argument("--workers", type=int, default=3)

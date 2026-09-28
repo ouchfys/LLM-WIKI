@@ -4,12 +4,12 @@ import argparse
 import json
 
 from system.core.config import (
-    SILICONFLOW_MAINTENANCE_MODEL,
+    DEEPSEEK_CHAT_MODEL,
     WEB_SEARCH_MAX_RESULTS,
     WEB_SEARCH_MODE,
     WEB_SEARCH_TIMEOUT_SECONDS,
 )
-from system.core.siliconflow_client import SiliconFlowChat
+from system.core.deepseek_client import DeepSeekChat
 from system.search.web_fetch import WebFetchTool
 from system.search.web_search import WebSearchTool
 from system.wiki.maintenance.web_update_agent import WebUpdateAgent
@@ -24,8 +24,8 @@ def main() -> int:
     parser.add_argument("--no-upload", action="store_true")
     args = parser.parse_args()
 
-    llm = None if args.no_llm else SiliconFlowChat(
-        model=SILICONFLOW_MAINTENANCE_MODEL,
+    llm = None if args.no_llm else DeepSeekChat(
+        model=DEEPSEEK_CHAT_MODEL,
         temperature=0.0,
         max_tokens=3200,
     )

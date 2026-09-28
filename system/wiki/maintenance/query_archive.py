@@ -12,7 +12,7 @@ from system.wiki.maintenance.store import WikiMaintenanceStore
 
 
 class QueryArchive:
-    """Archive reusable wiki-chat turns under queries/answered/.
+    """Explicitly archive reusable turns under archives/queries/answered/.
 
     This is a safe first step toward knowledge回流: archived turns are not
     merged into the official wiki until a later insight distiller/reviewer/merge

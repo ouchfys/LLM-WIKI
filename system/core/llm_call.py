@@ -6,13 +6,14 @@ import hashlib
 from typing import Any
 
 from system.agent_runtime.tracing import get_current_trace
+from system.core.thinking import thinking_options
 
 
 def _invoke_with_trace(
     llm: Any,
     prompt: str,
     *,
-    max_tokens: int,
+    max_tokens: int | None,
     temperature: float,
     call,
 ) -> str:
@@ -33,10 +34,10 @@ def _invoke_with_trace(
         },
     ) as span:
         output = call()
-        span["output"] = {
+        span["output"].update({
             "response_chars": len(output),
             "response_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
-        }
+        })
         return output
 
 
@@ -44,8 +45,10 @@ def invoke_structured(
     llm: Any,
     prompt: str,
     *,
-    max_tokens: int,
+    max_tokens: int | None,
     temperature: float = 0.0,
+    max_attempts: int | None = None,
+    thinking: bool = False,
 ) -> str:
     """Request JSON mode when supported without requiring provider-specific kwargs."""
     def call() -> str:
@@ -54,8 +57,9 @@ def invoke_structured(
                 prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                enable_thinking=False,
+                **(thinking_options() if thinking else {"enable_thinking": False}),
                 response_format={"type": "json_object"},
+                **({"max_attempts": max_attempts} if max_attempts is not None else {}),
             )
         except TypeError as exc:
             message = str(exc)

@@ -10,6 +10,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any, Dict, List, Optional
 
 
@@ -17,8 +18,7 @@ class LearningProfileStore:
     """Tracks learning events, weak points, mastered topics, and review schedules."""
 
     def __init__(self, session_store, db_path: str = None):
-        base_dir = Path(__file__).resolve().parents[2]
-        path = Path(db_path) if db_path else base_dir / "sessions.db"
+        path = resolve_database_path(db_path)
         self.db_path = str(path)
         self.store = session_store
         self._init_db()

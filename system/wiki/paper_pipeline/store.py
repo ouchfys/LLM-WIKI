@@ -8,6 +8,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any
 
 from system.storage.layout import get_storage_layout
@@ -17,8 +18,7 @@ from system.wiki.paper_pipeline.models import DistilledCandidate, ReviewReport, 
 
 class PaperWikiPipelineStore:
     def __init__(self, db_path: str = None):
-        repo_root = Path(__file__).resolve().parents[3]
-        path = Path(db_path) if db_path else repo_root / "sessions.db"
+        path = resolve_database_path(db_path)
         self.db_path = str(path)
         self._init_db()
 
@@ -717,10 +717,35 @@ class PaperWikiPipelineStore:
                 """,
                 (card_id,),
             ).fetchall()
+            # Older Markdown imports carry packet provenance but no source_card_id.
+            # Resolve exact provenance only; similar titles are not source evidence.
+            source_papers = conn.execute(
+                """
+                SELECT DISTINCT p.id, p.title
+                FROM wiki_pages p
+                WHERE p.page_type = 'PaperPage' AND p.id != ?
+                  AND EXISTS (
+                    SELECT 1 FROM wiki_card_sources s
+                    WHERE s.card_id = ? AND (
+                      s.source_card_id = p.id OR (
+                        s.source_packet_id NOT IN ('', 'markdown')
+                        AND EXISTS (
+                          SELECT 1 FROM wiki_card_sources ps
+                          WHERE ps.card_id = p.id
+                            AND ps.source_packet_id = s.source_packet_id
+                        )
+                      )
+                    )
+                  )
+                ORDER BY p.title, p.id
+                """,
+                (card_id, card_id),
+            ).fetchall()
         return {
             "outgoing": [dict(row) for row in outgoing],
             "incoming": [dict(row) for row in incoming],
             "sources": [dict(row) for row in sources],
+            "source_papers": [dict(row) for row in source_papers],
         }
 
     def list_aliases(self) -> list[dict[str, Any]]:

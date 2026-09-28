@@ -1,0 +1,1 @@
+研究deepseek harness\codex cli\pi agent\hermes这种开源agent架构的记忆系统，并且分别写入wiki

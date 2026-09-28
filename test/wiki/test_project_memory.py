@@ -46,7 +46,7 @@ def test_project_purpose_and_model_managed_memory_are_shared_without_session_sta
     )
 
     context = store.render_project_context(second, "CUDA kernel")
-    memory_dir = tmp_path / ".paperwiki" / "memory" / "projects" / DEFAULT_PROJECT_ID
+    memory_dir = tmp_path / "memory" / "projects" / DEFAULT_PROJECT_ID
 
     assert "研究低成本 LLM Serving" in context
     assert "暂时排除" in context
@@ -126,7 +126,7 @@ def test_model_managed_memory_replaces_stale_project_state(tmp_path):
     assert "不允许定制 CUDA kernel" not in content
 
 
-def test_agent_memory_tool_updates_only_the_current_project_file(tmp_path):
+def test_retired_memory_tool_cannot_modify_project_memory(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("memory tool")
     service = WikiChatService(
@@ -134,6 +134,7 @@ def test_agent_memory_tool_updates_only_the_current_project_file(tmp_path):
     )
     control = RunControl(None, "", "更新项目状态")
     control.session_id = session_id
+    before = store.project_memory_files.read_memory(DEFAULT_PROJECT_ID)
 
     with control.bind():
         observation = service._execute_agent_tool_call(
@@ -144,20 +145,9 @@ def test_agent_memory_tool_updates_only_the_current_project_file(tmp_path):
             [], [], [], 4,
         )
 
-    assert observation.status == "done"
-    assert "使用 SQLite" in store.project_memory_files.read_memory(DEFAULT_PROJECT_ID)
-    assert not store.search_project_memories(DEFAULT_PROJECT_ID, "SQLite")
-
-    # A later compatibility sync must not replace model-managed notes with the
-    # old generated index/topic projection.
-    store.add_project_memory(
-        DEFAULT_PROJECT_ID,
-        "decision",
-        "legacy compatibility record",
-        source_session_id=session_id,
-    )
-    assert "使用 SQLite" in store.project_memory_files.read_memory(DEFAULT_PROJECT_ID)
-    assert "legacy compatibility record" not in store.project_memory_files.read_memory(DEFAULT_PROJECT_ID)
+    assert observation.status == "error"
+    assert "not registered" in observation.summary
+    assert store.project_memory_files.read_memory(DEFAULT_PROJECT_ID) == before
 
 
 def test_model_managed_memory_rejects_oversize_write_without_truncating(tmp_path):
@@ -178,7 +168,7 @@ def test_model_managed_memory_rejects_oversize_write_without_truncating(tmp_path
 def test_memory_files_preserve_manual_notes_and_reject_invalid_topics(tmp_path):
     store = SessionStore(str(tmp_path / "sessions.db"))
     session_id = store.create_session("memory files")
-    directory = tmp_path / ".paperwiki" / "memory" / "projects" / DEFAULT_PROJECT_ID
+    directory = tmp_path / "memory" / "projects" / DEFAULT_PROJECT_ID
     topic_path = directory / "topics" / "failed-attempts.md"
     topic_path.write_text(
         topic_path.read_text(encoding="utf-8").replace(

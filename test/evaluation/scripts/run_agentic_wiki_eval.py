@@ -25,7 +25,6 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 from agentic_wiki_answer_reviewer import AgenticWikiAnswerReviewer
 
-DEFAULT_DATASET = TEST_EVAL_ROOT / "datasets" / "wiki_chat" / "current_papers_30.csv"
 DEFAULT_API_URL = "http://127.0.0.1:8000/api/wiki/chat"
 DEFAULT_SESSION_ID = "eval-agentic-wiki"
 
@@ -299,7 +298,7 @@ def write_summary_markdown(path: Path, summary: Dict[str, Any], results: Sequenc
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument("--dataset", type=Path, required=True, help="Path to the evaluation CSV for the current corpus")
     parser.add_argument("--api-url", default=DEFAULT_API_URL)
     parser.add_argument("--session-id", default=DEFAULT_SESSION_ID)
     parser.add_argument("--limit", type=int, default=None)

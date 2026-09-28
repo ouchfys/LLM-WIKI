@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from system.core.config import SILICONFLOW_FAST_MODEL
+from system.core.config import DEEPSEEK_CHAT_MODEL
 
 
 class MaintenancePlanner:
@@ -15,7 +15,7 @@ class MaintenancePlanner:
 
     def __init__(self, llm: Any = None):
         self.llm = llm
-        self.model = SILICONFLOW_FAST_MODEL
+        self.model = DEEPSEEK_CHAT_MODEL
 
     def plan(self, report: dict[str, Any]) -> dict[str, Any]:
         if not report.get("errors") and not report.get("warnings"):

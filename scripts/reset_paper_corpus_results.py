@@ -27,6 +27,7 @@ DB_TABLES = [
     "document_elements", "source_documents",
     "wiki_merge_audit", "review_reports", "distilled_candidates",
     "wiki_card_sources", "wiki_card_links", "wiki_aliases", "wiki_chunks",
+    "wiki_search_units",
     "source_packets", "paper_blocks", "papers", "wiki_pages",
     "ingestion_jobs", "wiki_maintenance_candidates", "wiki_repair_tasks",
     "wiki_validation_runs", "wiki_query_insights",
@@ -147,7 +148,7 @@ def _clear_db(path: Path) -> dict[str, int]:
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             conn.execute(f"DELETE FROM {table}")
             deleted[table] = count
-        for fts in ("wiki_pages_fts", "wiki_chunks_fts"):
+        for fts in ("wiki_pages_fts", "wiki_chunks_fts", "wiki_search_units_fts"):
             if fts in existing:
                 conn.execute(f"INSERT INTO {fts}({fts}) VALUES ('rebuild')")
         conn.commit()

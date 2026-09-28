@@ -50,8 +50,13 @@ class RunControl:
         run = self.store.get_run(self.run_id)
         if not run:
             raise RunCancelled("Agent run was deleted")
+        owner = getattr(self, "lease_owner", "")
+        if owner and (run.get("lease_owner") != owner or run.get("lease_expires_at", "") <= self.store.now_iso()):
+            raise RunCancelled("Worker lease expired or was replaced")
         if run.get("cancel_requested") or run.get("current_state") == "CANCELLED":
             raise RunCancelled("Cancelled by user")
+        if run.get("current_state") == "CHAT_INTERRUPTED":
+            raise RunCancelled("Chat interrupted; saved progress can be continued")
         items = self.store.take_interrupts(self.run_id)
         if items:
             raise RunInterrupted(items)
@@ -64,6 +69,8 @@ class RunControl:
                 self.run_id, event_type="input.interrupt.consumed", status="consumed",
                 input_data={"input_id": item["id"], "chars": len(item["content"])},
             )
+        if self.store and self.run_id:
+            self.store.save_chat_cursor(self.run_id, self.message, self.loop_state.get("planner_steps", 0))
 
 
 def get_run_control():

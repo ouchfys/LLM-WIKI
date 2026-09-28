@@ -42,6 +42,9 @@ const internalFields = new Set([
     'source_packet_ids', 'sources', 'aliases', 'links',
     'claims', 'affected_claims', 'compiler', 'markdown_status',
     'review_status_text', 'evidence_updates', 'merge_history',
+    'selected_table_ids',
+    'repository_research',
+    'repository_review',
 ])
 
 export function isReaderContentField(key: string): boolean {

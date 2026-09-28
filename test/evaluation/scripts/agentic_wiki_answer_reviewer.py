@@ -7,12 +7,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from system.core.config import SILICONFLOW_REVIEW_MODEL
+from system.core.config import DEEPSEEK_CHAT_MODEL
 
 try:
-    from system.core.siliconflow_client import SiliconFlowChat
+    from system.core.deepseek_client import DeepSeekChat
 except Exception:
-    SiliconFlowChat = None
+    DeepSeekChat = None
 
 
 @dataclass
@@ -47,10 +47,10 @@ class AgenticWikiAnswerReviewer:
 
     @classmethod
     def create_default(cls) -> "AgenticWikiAnswerReviewer":
-        if SiliconFlowChat is None:
+        if DeepSeekChat is None:
             return cls(llm=None)
         try:
-            return cls(llm=SiliconFlowChat(model=SILICONFLOW_REVIEW_MODEL, temperature=0.0, max_tokens=1200))
+            return cls(llm=DeepSeekChat(model=DEEPSEEK_CHAT_MODEL, temperature=0.0, max_tokens=1200))
         except Exception:
             return cls(llm=None)
 
@@ -170,7 +170,7 @@ class AgenticWikiAnswerReviewer:
     ) -> str:
         return (
             "You are reviewing a private Wiki agent answer. Return only strict JSON.\n"
-            "The API call uses SiliconFlow response_format={\"type\":\"json_object\"}; comply with it.\n"
+            "The API call uses DeepSeek response_format={\"type\":\"json_object\"}; comply with it.\n"
             "Judge whether the final answer is trustworthy and supported, not just whether retrieval returned something.\n"
             "Scores are floats in [0,1]. High unsupported_claim_risk means more hallucination risk.\n"
             "Do not penalize Web Search usage by itself. Treat web_used as a diagnostic only; judge answer quality, correctness, completeness, and grounding.\n"

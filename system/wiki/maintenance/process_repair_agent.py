@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 
-from system.core.config import SILICONFLOW_MAINTENANCE_MODEL
-from system.core.siliconflow_client import SiliconFlowChat
+from system.core.config import DEEPSEEK_CHAT_MODEL
+from system.core.deepseek_client import DeepSeekChat
 from system.wiki.maintenance.repair_agent import WikiRepairAgent
 
 
@@ -15,8 +15,8 @@ def main() -> int:
     parser.add_argument("--no-upload", action="store_true", help="Write local candidate artifacts only.")
     args = parser.parse_args()
 
-    llm = None if args.no_llm else SiliconFlowChat(
-        model=SILICONFLOW_MAINTENANCE_MODEL,
+    llm = None if args.no_llm else DeepSeekChat(
+        model=DEEPSEEK_CHAT_MODEL,
         temperature=0.0,
         max_tokens=3200,
     )

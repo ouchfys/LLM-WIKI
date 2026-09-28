@@ -1,156 +1,306 @@
-# PaperWiki 多来源知识维护与长探索任务 Spec
+# PaperWiki 统一 Agent 循环与渐进式知识读取 Spec
 
 - 状态：Proposed
-- 版本：1.1
-- 日期：2026-09-20
+- 版本：2.0
+- 日期：2026-09-21
 - 适用范围：PaperWiki 本地单用户版本
 
 ## 1. 背景
 
-PaperWiki 当前已经具备论文入库、Evidence ID、Verifier、Revision、审批、版本回滚、Wiki 检索、会话压缩和研究任务进度表。但系统仍有两个未闭环的问题：
+PaperWiki 已经具备论文入库、Wiki Card、证据绑定、Revision、审批、会话压缩和工具调用能力，但运行时逐渐形成了两套行为：
 
-1. 多个 AI、论文和网页给出不一致结论时，缺少统一的候选观点、来源可信度、争议状态和当前接受结论；聊天内容容易被复制到不同对话，来源逐渐丢失。
-2. 长探索任务只记录论文页是否被打开，没有可靠表示论文是否被有效阅读；模型仍可重复打开高相关页面，也缺少可验证的停止条件。
+1. 普通问题走短工具循环；
+2. 少数被关键词识别的研究主题进入专用 `research_plan`、`research_task_status` 和固定阶段状态机。
 
-本 Spec 将 PaperWiki 定位为：
+这种分叉产生了几个直接问题：
 
-> 把易丢失、相互矛盾的多来源讨论，转化为可追溯、可审查、可回滚的研究状态与论文知识；同时让跨大量论文、跨上下文和跨会话的探索任务能够稳定推进。
+- 新研究主题如果没有被 Python 规则识别，就会退回只有少量步骤的普通问答；
+- 模型需要反复搜索 Wiki 才知道本地有哪些论文，容易重复搜索、重复打开同一页面；
+- “页面打开过”“模型有效读过”“任务已经完成”混在一起；
+- 计划和任务进度被设计成领域专用协议，换一个任务类型就需要增加新的路由和状态机；
+- 关键词硬编码承担了本应由模型完成的语义判断，系统对表达变化非常敏感。
+
+本次改造将 PaperWiki 收敛成一个统一、轻量的 Agent Harness：
+
+> 所有请求都进入同一个 plan-call-observe 循环。模型始终知道当前知识库有哪些卡片，按需读取完整内容；简单任务直接完成，复杂任务由模型自动创建和维护可持久化工作计划。Python 不替模型理解任务，只负责工具边界、数据校验、持久化、预算和副作用控制。
 
 ## 2. 目标
 
 ### 2.1 必须实现
 
-1. 区分原始资料、AI 候选观点、研究状态和已接受 Wiki 知识。
-2. 所有候选结论保留来源、作用域、状态和证据关系。
-3. 未经一手来源支持的 AI 输出不得自动成为已验证知识。
-4. 冲突结论不得静默覆盖；必须保留双方来源和处理结果。
-5. 长任务必须先形成结构化研究计划，再由程序分配未读论文批次。
-6. 打开论文页不得等同于读完论文；只有结构化阅读记录验收通过才算完成。
-7. 任务停止必须由覆盖、证据、信息增益、未决冲突和预算共同决定。
-8. Compact、新建会话和服务重启不得丢失任务真实进度。
-9. 用户直接粘贴未声明来源的 AI 对话时，系统必须能够保守识别并按候选资料处理。
+1. 普通问答、论文比较、多论文调研和跨会话长任务使用同一套 Agent 循环。
+2. 每轮请求向模型提供 Wiki Card 的稳定 ID、类型、标题和简述，使模型无需先搜索即可判断要读取哪些卡片。
+3. 完整 Card 内容只在模型调用 `wiki_open` 后进入上下文，形成渐进式披露。
+4. 模型根据任务结构自行判断是否需要显式计划，不依赖主题关键词、固定研究领域或单独的 Planner 模型。
+5. 复杂任务的计划保存为人类可读 Markdown，Compact、新会话和服务重启后可以继续读取。
+6. 计划必须包含目标、对象或来源清单、步骤、完成条件和当前进度。
+7. 计划只是工作清单；论文内容、工具观察、Evidence 和程序状态仍是事实来源。
+8. Python 只执行确定性约束：工具参数校验、ID 存在性、专用持久化工具的固定写入目录与原子写入、调用预算、超时和写操作串行。
+9. 用户粘贴未声明来源的 AI 回答或多轮对话时，系统保守识别其内容类型，作为候选资料保存，不直接写入 Wiki。
+10. Wiki 的长期知识更新继续遵守证据门禁：无一手证据的 AI 输出不能自动成为已验证知识，冲突内容不能静默覆盖。
 
 ### 2.2 非目标
 
-1. 不构建通用真理判断器，不承诺 Verifier 能自动判断所有事实真伪。
-2. 不与 Codex、Claude Code 或 Pi 竞争通用 Agent 能力。
-3. 不引入 Multi-Agent、LangGraph、向量化用户记忆或新的分布式中间件。
-4. 不把所有聊天自动写入 Wiki。
-5. 不要求一次性支持任意开放域工作流；v1 只服务论文研究任务。
-6. 不根据文风猜测内容来自 ChatGPT、Claude 或其他具体模型；没有明确来源时统一记为 `unknown`。
-7. v1 不要求与通用 Agent 做同条件对照；先完成并验收 PaperWiki 自身的端到端链路。
+1. 不增加独立 Planner 模型、固定 Plan-and-Execute 工作流或 Multi-Agent。
+2. 不为 KV Cache、RSI、Agent Harness 等具体主题编写路由关键词。
+3. 不要求用户每次手动执行 `/plan`、`/compact` 或其他命令才能正常完成任务。
+4. 不把 Wiki Card 当作用户记忆；Wiki 是论文知识库。
+5. 不把全部 Card 正文一次性塞入上下文。
+6. 不让模型绕过 PaperWiki 的专用接口直接修改 Wiki 数据库、Evidence、Revision 或项目记忆；通用文件任务允许通过本地终端完成。
+7. 不把模型在计划中勾选“完成”视为真实完成。
+8. v2 不新增通用网页搜索、GitHub 代码阅读、Multi-Agent、LangGraph 或分布式中间件。
 
 ## 3. 设计原则
 
-1. **来源优先**：聊天内容和 AI 输出只是候选资料；论文、官方文档等一手来源优先。
-2. **状态外置**：模型上下文不是任务真相；计划、批次、阅读记录和争议必须持久化。
-3. **模型提议、程序约束**：模型处理语义，Python 控制队列、证据所有权、状态迁移和副作用。
-4. **不静默覆盖**：不一致内容必须形成明确关系或保持 `unresolved`。
-5. **可恢复而非假装无损**：Compact 可以丢失措辞，但不能丢失任务 ID、证据 ID、结论状态、未决问题和下一步。
-6. **先定义验收，再实现功能**：每项能力必须对应可自动检查的场景和指标。
-7. **保守识别来源**：格式信号和模型分类只用于判断内容类型；低置信度时保持 `unknown`，不得把来源识别当成事实核验。
+1. **一个循环**：所有任务使用同一套模型、工具和终止协议，不再维护“普通问答”和“指定主题长研究”两套路由。
+2. **模型做语义判断**：是否计划、读哪些 Card、是否需要补充来源，由模型根据目标和观察结果判断。
+3. **程序守边界**：Python 校验模型提出的动作是否合法，不用关键词替模型判断用户意图。
+4. **目录常驻、正文按需**：模型始终看到知识库地图，只在需要时读取完整 Card。
+5. **计划是便笺，不是真相**：计划帮助模型持续工作；实际工具结果、Evidence 和 Wiki 版本才是事实记录。
+6. **简单任务不过度规划**：一步能回答的问题不创建计划，避免额外延迟和 Token 消耗。
+7. **复杂任务可恢复**：需要完整覆盖、多阶段执行或跨会话延续时，模型必须留下可继续执行的工作计划。
+8. **来源优先**：AI 回答和用户粘贴内容只能先成为候选资料；论文和官方材料优先作为知识证据。
+9. **不静默覆盖**：相互不一致的资料应并列保留来源、适用条件和未决状态。
 
-## 4. 概念模型
+## 4. 统一运行模型
 
-### 4.1 四类内容
-
-| 类型 | 定义 | 是否进入 Wiki |
-| --- | --- | --- |
-| Source Artifact | 论文、网页、AI 回答、用户笔记、原始会话片段 | 否 |
-| Candidate Claim | 从来源中提取的候选观点，带对象、方面、适用条件和来源 | 否 |
-| Research State | 当前目标、已接受事实、争议、开放问题、决定和下一步 | 否 |
-| Accepted Knowledge | 经过证据门禁或人工批准的长期知识 | 是 |
-
-### 4.2 来源级别
+### 4.1 主循环
 
 ```text
-primary_paper / official_document
-  > reputable_web
-  > ai_output / conversation
-  > unsourced_note
+用户请求
+   ↓
+组装上下文
+   ├── 系统规则与工具说明
+   ├── Wiki Card 目录
+   ├── 当前任务计划（如有）
+   ├── 最近会话与 Compact 摘要
+   └── 用户问题
+   ↓
+模型决定下一步
+   ├── 直接回答
+   ├── 创建或更新计划
+   └── 调用一个或多个工具
+   ↓
+Python 校验并执行工具
+   ↓
+观察结果返回模型
+   ↓
+继续循环，直到模型回答或达到明确停止原因
 ```
 
-来源级别只决定默认处理策略，不直接决定结论真伪。
+Runtime 不再先判断任务属于哪个研究主题，也不再为命中特定主题的请求切换专用 Driver。
 
-### 4.3 Claim 状态
+### 4.2 模型何时创建计划
+
+是否需要计划由统一系统提示词约束。建议原文：
 
 ```text
-candidate
-  -> supported
-  -> disputed
-  -> accepted
-  -> rejected
-  -> superseded
+你始终在同一个工具调用循环中工作。
+
+简单问题直接回答，不要创建计划。
+
+当任务具有以下任一特征时，应先创建或更新工作计划：
+1. 涉及多个论文、网页、文件或其他来源；
+2. 用户要求多个交付结果；
+3. 包含多个有依赖关系的执行阶段；
+4. 需要保证某个来源清单被完整处理；
+5. 任务可能持续较长时间或跨越多个会话；
+6. 上下文压缩后仍需继续执行。
+
+计划只记录：目标、待处理来源或对象、执行步骤、完成条件、当前进度和受阻原因。
+每获得一批实质性结果后更新计划。
+计划不能替代工具观察、原始来源或证据。
+未满足完成条件时，不得只根据计划文字声称任务已经完成。
 ```
 
-任何状态变化必须记录操作者、依据、时间和前一状态。
+这些条件是给模型的语义判断示例，不得被翻译成 Python 关键词或固定主题列表。
 
-## 5. 功能需求
+### 4.3 两级规划
 
-### K-01 多来源捕获
+| 任务类型 | 行为 |
+| --- | --- |
+| 简单问答、单 Card 查询、一步工具操作 | 模型在当前循环内直接完成，不写计划文件 |
+| 多来源、多交付物、多阶段、需完整覆盖或可能跨会话的任务 | 模型创建并持续更新持久化计划 |
 
-系统必须允许保存以下来源：论文、网页、AI 输出、用户笔记和会话片段。每条来源必须包含 `source_type`、`origin`、`project_id`、`content_hash` 和时间。
+`/plan` 可以保留为用户强制创建计划的可选入口，但不是正常使用前提。
 
-来源既可以由用户显式声明，也可以由系统对粘贴内容进行保守分类。分类分为两层：
+## 5. Wiki 渐进式披露
 
-1. Python 先检查格式信号，例如 `User/Assistant`、`用户/助手` 等角色标签、连续的问答轮次和对话分隔符。
-2. 格式不足以确定时，模型按照固定 Schema 判断内容是 `ai_conversation`、`ai_answer`、`article`、`user_note` 或 `unknown`，并返回置信度、分段结果和判断信号。
+### 5.1 Card 目录
 
-模型分类结果必须经过 Schema 校验。系统只能根据文本中明确出现的名称或外部元数据填写具体提供方；不能仅凭语言风格推断是 ChatGPT、Claude 或其他模型。
+每轮请求都注入紧凑目录，每张 Card 只包含：
 
 ```json
 {
-  "content_kind": "ai_conversation",
-  "provider": "unknown",
-  "confidence": 0.93,
-  "segments": [
-    {"role": "user", "content": "..."},
-    {"role": "assistant", "content": "..."}
-  ],
-  "signals": ["alternating_role_labels", "multi_turn_structure"]
+  "card_id": "paper-qserve",
+  "page_type": "paper",
+  "title": "QServe: W4A8KV4 Quantization and System Co-design",
+  "summary": "提出 W4A8KV4 与系统协同优化，重点处理 KV4 精度和 GPU 反量化开销。"
 }
 ```
 
-无论来源是用户声明还是系统识别，原始文本都必须原样保存。来源分类可以修正，但修正不得改变原始内容和 `content_hash`。
+要求：
 
-#### 场景：粘贴另一个 AI 的回答
+- `card_id` 稳定且唯一；
+- `summary` 是 1～2 句信息密集的内容摘要，不得使用 Markdown 状态、编译器元数据或内部 ID 堆砌；
+- 当前规模下允许注入全部目录；
+- 当目录超过配置的 Token 预算后，再按类型或主题分层，而不是退回默认 Top-K RAG。
 
-- Given 用户粘贴一段 Claude 或 ChatGPT 的回答
-- When 用户选择“保存为研究资料”
-- Then 系统将其保存为 `ai_output`
-- And 不直接修改 Wiki
-- And 后续从中提取的 Claim 初始状态为 `candidate`
+### 5.2 Card 正文
 
-#### 场景：用户未说明来源，直接粘贴多轮 AI 对话
+模型通过以下工具读取正文：
 
-- Given 用户粘贴一段具有连续用户与助手轮次的文本
-- And 用户没有说明这是 AI 对话，也没有说明具体模型
-- When 分类器基于格式规则或通过校验的模型输出给出高置信度的 `ai_conversation`
-- Then 系统保存原始文本并标记 `source_type=ai_conversation`
-- And 记录 `origin=unknown`、检测置信度和分段结果
-- And 向用户显示可更正的“疑似 AI 对话”来源标记
-- And 从中提取的 Claim 只能从 `candidate` 状态开始
-- And 不自动修改 Wiki
+```text
+wiki_open(card_ids=[...], purpose="...")
+```
 
-#### 场景：只能识别为 AI 内容，不能识别具体提供方
+正文应直接包含人可读的：
 
-- Given 文本结构明显来自 AI 问答
-- And 文本和元数据没有出现提供方名称
-- When 系统保存该来源
-- Then `source_type` 可以为 `ai_conversation` 或 `ai_answer`
-- But `origin` 必须为 `unknown`
+- 论文问题与背景；
+- 核心方法；
+- 实验设置和关键结果；
+- 关键表格的 Markdown 表示；
+- 图片或曲线的文字描述；
+- 局限、适用范围与关联工作；
+- 可追溯来源位置。
 
-#### 场景：粘贴内容类型不明确
+内部编译状态、冗长 Claim 账本、Reviewer 占位字段不得出现在默认正文视图中。
 
-- Given 文本只有单个 `Q:` 标记或同时具有文章与对话特征
-- When 分类置信度低于配置阈值
-- Then 系统按 `unknown` 或 `pasted_text` 保存
-- And 保留原文，不自动拆分角色
-- And 不自动修改 Wiki
+### 5.3 搜索工具定位
 
-### K-02 候选 Claim 规范化
+`wiki_search` 保留为以下场景的补充工具：
 
-模型必须将候选观点输出为结构化 Claim，至少包含：
+- Card 目录过大；
+- 用户只记得正文中的局部术语；
+- 需要跨 Card 找精确数字、公式或短语。
+
+它不再是每个问题必须经过的第一步，也不得因为搜索无结果就判断知识库为空。
+
+## 6. 持久化工作计划
+
+### 6.1 文件位置
+
+计划保存在固定目录：
+
+```text
+.paperwiki/tasks/<task_id>/PLAN.md
+```
+
+模型不能指定任意绝对路径。`task_id` 由 Runtime 创建，计划通过专用工具读写。
+
+### 6.2 最小格式
+
+```markdown
+# Goal
+
+# Sources / Objects
+- [ ] card-or-source-id — purpose
+
+# Steps
+- [ ] step description
+
+# Done When
+- condition
+
+# Progress
+- completed result with source or tool reference
+
+# Blocked / Open Questions
+- unresolved item
+```
+
+格式允许任务按需要增加小节，但上述六个部分必须保留。计划应简短，不能复制整篇论文或完整工具输出。
+
+### 6.3 工具接口
+
+```text
+task_plan_read(task_id?)
+task_plan_write(task_id?, markdown, reason, create_new=false, status="active")
+```
+
+若当前会话没有活动任务，第一次 `task_plan_write` 由 Runtime 创建 `task_id`。跨会话继续任务时，模型可以从活动任务目录选择或由用户自然语言指定。同一会话开始无关的新复杂任务时，模型设置 `create_new=true`；只有完成条件已有工具观察支持时，才可将 `status` 更新为 `completed`。
+
+### 6.4 Python 校验
+
+Runtime 只做以下确定性检查：
+
+1. 文件只能写入 `.paperwiki/tasks/<task_id>/PLAN.md`；
+2. Markdown 大小不能超过配置上限；
+3. 必需标题存在；
+4. 引用的 Card ID、Source ID 或 Evidence ID 如被声明为系统对象，必须真实存在；
+5. 使用临时文件和 `os.replace` 原子更新；
+6. 保存版本号和更新时间，避免并发覆盖；
+7. 计划写入失败不得影响 Wiki 或原始会话数据。
+
+Python 不判断计划内容是否“聪明”，也不根据计划文本自动宣布任务完成。
+
+## 7. 工具调度与重复调用
+
+### 7.1 调度规则
+
+- 相互独立的只读调用可以有界并发；
+- 有数据依赖的调用保持顺序；
+- 写操作串行执行；
+- 返回结果按模型最初提出的调用顺序放回上下文；
+- 每次调用都有超时、取消和 Token/字符预算；
+- 工具错误以结构化观察结果返回模型，由模型决定重试、换工具或说明受阻。
+
+### 7.2 重复读取
+
+Runtime 为同一任务保存通用调用收据：
+
+```json
+{
+  "tool": "wiki_open",
+  "resource_ids": ["paper-qserve"],
+  "purpose": "compare kv quantization",
+  "result_id": 123,
+  "created_at": "..."
+}
+```
+
+处理原则：
+
+- 完全相同的只读调用默认返回已有结果引用和简短预览；
+- 模型可用新的明确 `purpose` 重新读取，例如核对表格数值或解决冲突；
+- 不用业务主题关键词判断两次调用是否重复；
+- 计划中的来源清单和 Progress 让模型知道哪些对象已经处理，但计划勾选本身不能伪造工具收据。
+
+## 8. 上下文管理
+
+每次模型请求按以下顺序组装：
+
+1. 系统规则和可用工具；
+2. Wiki Card 紧凑目录；
+3. 当前活动计划全文或预算内摘要；
+4. 项目目的与少量相关用户偏好；
+5. Compact 产生的较早会话摘要；
+6. 最近原始对话；
+7. 当前用户请求；
+8. 本轮必要工具观察。
+
+优先级原则：
+
+- 当前请求、工具错误和完成条件不能被裁掉；
+- Card 正文只保留当前步骤需要的部分，原始完整结果可按 `result_id` 回读；
+- Compact 只压缩对话表达，不压缩 Wiki、Evidence、计划文件和工具收据；
+- 新会话继续任务时重新加载 Plan 和必要工具收据，不依赖模型“记得”旧对话。
+
+## 9. 多来源内容与知识更新
+
+### 9.1 粘贴内容识别
+
+用户直接粘贴内容时：
+
+1. Python 只识别明显结构信号，例如连续的 `User/Assistant`、`用户/助手` 轮次；
+2. 信号不足时由同一模型按固定 Schema 分类为 `ai_conversation`、`ai_answer`、`article`、`user_note` 或 `unknown`；
+3. 没有明确名称时，具体 AI 提供方必须记录为 `unknown`；
+4. 原文始终完整保存，分类结果可以修正；
+5. AI 内容只能先作为候选资料，不能自动修改 Wiki。
+
+### 9.2 候选观点
+
+从论文、网页、AI 回答或用户笔记提取的观点至少包含：
 
 ```json
 {
@@ -164,335 +314,192 @@ candidate
 }
 ```
 
-Python 必须验证枚举、项目作用域、来源存在性和 Evidence 归属，不得只验证 JSON 格式。
+Python 校验 Schema、项目范围、来源存在性和 Evidence 归属；模型负责判断语义关系。
 
-### K-03 分层证据门禁
+### 9.3 Wiki 更新门禁
 
-Claim 进入 `supported` 或 `accepted` 前必须通过以下门禁：
+- 一手 Evidence 支持的普通新增可以生成 Revision；
+- AI-only 或无来源观点保持 `candidate`；
+- 同一对象、同一方面且适用条件重叠的矛盾内容并列保留并进入审批；
+- Verifier 输出 `uncertain`、解析失败或证据不足时不得自动接受；
+- Markdown Diff 只表示文本变化，审批界面还必须展示来源、Evidence、关系理由和不确定性；
+- 所有已提交 Revision 保持可回滚。
 
-1. Evidence ID 存在且属于声明的来源。
-2. 关键数字、模型名、数据集名等可确定字段与 Evidence 一致。
-3. 语义 Verifier 返回支持，或者人工明确批准。
-4. AI 输出若没有一手来源，不得自动进入 `accepted`。
+## 10. 工具集收敛
 
-Verifier 返回 `uncertain`、输出解析失败或证据不足时必须保持候选状态，不得默认接受。
-
-### K-04 冲突归组
-
-系统必须只在“同一对象、同一方面、适用条件重叠”的候选之间判断关系。允许关系：
-
-```text
-equivalent / supports / complements / contradicts / supersedes / unrelated / uncertain
-```
-
-`contradicts`、`supersedes` 和 `uncertain` 必须进入争议或审批流程，不得静默覆盖。
-
-#### 场景：两个 AI 对 KIVI 位宽描述不同
-
-- Given 两条候选 Claim 的 subject 均为 KIVI，aspect 均为 quantization_bits
-- And 一条声明 2-bit KV Cache，另一条声明 4-bit weight
-- When 系统无法从一手来源同时支持两者
-- Then 创建 dispute group
-- And 保留双方来源和原文
-- And 当前 Wiki 不发生修改
-
-### K-05 Revision 的正确边界
-
-Markdown Diff 只表示文本变化，不代表语义正确。审批界面必须同时展示：
-
-- before / after Markdown；
-- 受影响 Claim；
-- 新旧 Evidence；
-- 关系判断及理由；
-- 自动门禁结果；
-- 未决不确定性。
-
-所有已提交 Revision 必须支持 rollback。
-
-### K-06 研究状态投影
-
-每个项目必须维护一份独立于 Wiki 和聊天记录的研究状态，至少包含：
-
-```markdown
-# Goal
-# Accepted Facts
-# Disputed Claims
-# Decisions
-# Open Questions
-# Next Actions
-```
-
-研究状态可由结构化记录生成人类可读 Markdown。它不得被 Wiki 检索当作论文证据。
-
-### L-01 结构化研究计划
-
-长任务开始时，Planner 必须输出并持久化：
-
-```json
-{
-  "research_questions": [],
-  "dimensions": [
-    {"id": "quantization", "minimum_sources": 3}
-  ],
-  "selection_policy": {},
-  "stop_policy": {
-    "saturation_batches": 2,
-    "max_papers": 30,
-    "max_tool_calls": 100
-  },
-  "deliverable_requirements": []
-}
-```
-
-Python 必须验证最小覆盖、预算和交付要求。自由文本计划不得作为唯一任务状态。
-
-### L-02 确定性论文分配
-
-长任务必须通过 `research_next_batch` 获取下一批论文。Runtime 必须：
-
-1. 从固定候选集中过滤已完成和正在处理的论文；
-2. 优先补足覆盖缺口；
-3. 为批次生成稳定 `batch_id`；
-4. 默认每批分配 3～5 篇；
-5. 同一论文不得同时出现在两个活动批次中。
-
-模型不得通过反复 Top-K 搜索证明“已读完全部语料”。
-
-### L-03 结构化阅读记录
-
-`wiki_open` 成功只表示内容已返回。论文只有在 `submit_paper_reading` 验收通过后才进入 `completed`。
-
-阅读记录必须包含：
-
-```json
-{
-  "task_id": "...",
-  "batch_id": "...",
-  "card_id": "...",
-  "covered_dimensions": [],
-  "claims": [
-    {"statement": "...", "evidence_ids": []}
-  ],
-  "experimental_settings": {},
-  "novelty": "new|supporting|duplicate|irrelevant|uncertain",
-  "conflicts": [],
-  "open_questions": [],
-  "needs_follow_up": false
-}
-```
-
-Python 必须校验 Card、Batch、Evidence 归属和必填字段。
-
-### L-04 重复读取策略
-
-对已经存在有效阅读记录的 Card：
-
-- 默认返回已有记录，不重新展开全文；
-- 只有提供 `reopen_reason` 和目标章节或证据目的时才允许重读；
-- 重读不得覆盖原记录，必须追加新的检查记录。
-
-去重键必须基于 `task_id + card_id + purpose + section`，不能只依赖工具名与完整参数哈希。
-
-### L-05 停止条件
-
-任务进入综合阶段前必须同时满足：
-
-1. 每个必要维度达到 `minimum_sources`；
-2. 所有高优先级论文都有有效阅读记录；
-3. 最近 N 个批次没有出现新方法类别或关键冲突；
-4. 每个交付要求至少有一个受支持 Claim；
-5. 没有阻塞性的未决证据缺口；
-6. 未超过预算，或已明确进入 `BUDGET_EXHAUSTED`。
-
-模型可以提议停止，但只有 Runtime 可以把任务迁移到 `SYNTHESIZE` 或 `COMPLETE`。
-
-### L-06 自动续作与恢复
-
-长任务不得受普通聊天 `max_steps=3` 限制。专用 Driver 必须在每个批次结算后，根据任务状态执行以下之一：
-
-```text
-dispatch_next_batch
-request_targeted_discovery
-enter_synthesis
-pause_for_user
-stop_for_budget
-```
-
-Compact、新会话和服务重启后，Driver 必须从计划、活动批次、阅读记录和剩余门禁恢复，不依赖旧工具文本仍在上下文中。
-
-### C-01 上下文组装
-
-长任务每次请求必须包含：
-
-- 研究目标和计划摘要；
-- 当前批次的 Card ID、标题和阅读目的；
-- 已覆盖维度与缺口；
-- 与当前批次相关的既有 Claim 和争议；
-- 最近阅读记录；
-- 剩余预算和下一门禁。
-
-不得只提供 `opened_count` 而省略当前批次和可恢复进度。
-
-### C-02 Compact
-
-Compact 摘要必须保留：任务 ID、当前阶段、活动批次、已完成数量、覆盖缺口、争议、开放问题和下一动作。原始消息、工具结果和阅读记录继续保存在 SQLite。
-
-### O-01 Trace 与审计
-
-Trace 必须区分：
-
-```text
-page_opened
-reading_submitted
-reading_rejected
-reading_reopened
-claim_supported
-claim_disputed
-revision_proposed
-revision_committed
-task_gate_failed
-task_completed
-```
-
-最终报告必须能够反查使用了哪些阅读记录和 Evidence ID。
-
-## 6. 状态机
-
-### 6.1 长研究任务
-
-```text
-PLANNING
-  -> DISCOVER
-  -> WAIT_INGEST
-  -> BUILD_QUEUE
-  -> READING
-  -> CHECK_GATES
-       -> BUILD_QUEUE
-       -> TARGETED_DISCOVERY
-       -> SYNTHESIZE
-       -> PAUSED
-       -> BUDGET_EXHAUSTED
-  -> COMPLETE
-```
-
-### 6.2 单篇论文阅读
-
-```text
-PENDING -> ASSIGNED -> OPENED -> SUBMITTED -> VERIFIED
-                    \-> FAILED      \-> REJECTED
-VERIFIED -> REOPENED（仅带目的的复核）
-```
-
-## 7. 数据变更
-
-在现有 SQLite 上新增或扩展以下逻辑实体：
-
-| 实体 | 关键字段 |
-| --- | --- |
-| research_sources | project_id, source_type, origin, detected_type, detection_confidence, segments_json, content_hash, raw_ref |
-| candidate_claims | subject, aspect, scope, statement, source_id, status |
-| claim_relations | left_claim_id, right_claim_id, relation, decision_source |
-| dispute_groups | subject, aspect, scope, status, resolution |
-| research_plans | task_id, questions, dimensions, stop_policy, deliverable |
-| reading_batches | task_id, batch_id, status, assigned_card_ids |
-| paper_readings | task_id, card_id, receipt_json, status, prompt_version |
-| research_state_snapshots | project_id, structured_json, markdown, version |
-
-现有 `opened_card_ids` 仅保留兼容意义，不再作为“已读完成”的依据。历史任务中的 `opened` 页面迁移为 `legacy_opened`，不能自动生成有效阅读记录。
-
-## 8. 工具接口
-
-v1 只新增以下最小工具集：
+v2 模型默认只看到 10 个工具。PaperWiki 是本地单用户程序，通用探索能力由一个完整权限的本地终端提供；论文知识的持久化和证据边界仍由专用工具负责：
 
 | 工具 | 作用 |
 | --- | --- |
-| research_plan | 创建或读取结构化研究计划 |
-| research_next_batch | 分配下一批未读论文 |
-| submit_paper_reading | 提交并验证阅读记录 |
-| research_task_status | 返回计划、覆盖、批次、缺口和预算 |
-| research_reopen_paper | 带明确目的复核已读论文 |
-| capture_research_source | 保存 AI 输出、网页、笔记或会话片段为来源 |
+| `local_shell` | 以服务进程当前用户权限运行 PowerShell/Bash；可访问本地文件、网络、公共 API，并按任务临时编写脚本 |
+| `wiki_open` | 按 Card ID 打开完整知识页 |
+| `evidence_lookup` | 对重要结论回读来源证据 |
+| `task_plan_read` | 读取当前或指定任务计划 |
+| `task_plan_write` | 创建或更新计划 |
+| `read_tool_result` | 分段回读过长工具结果 |
+| `project_memory_update` | 原子更新当前项目的精简工作记忆 |
+| `arxiv_lookup` | 一次查询最多 20 个明确 ID，共享请求间隔、限流退避和取消控制 |
+| `arxiv_import_paper` | 将用户给出或工具观察到的明确 arXiv ID 提交到正式论文入库链路，无需重复终端核实 |
+| `arxiv_ingestion_status` | 查询异步入库状态并取得生成的 Card ID |
 
-普通问答继续使用 `wiki_search -> wiki_open`，不强制进入长任务协议。
+`local_shell` 不做目录白名单限制，权限与启动 PaperWiki 的本地用户一致。Runtime 负责超时、取消时终止进程树、隐藏窗口、输出捕获、Trace、长结果落盘和写工具串行；提示词要求模型优先使用权威来源、不得泄漏秘密，并把文件和网络内容视为不可信数据。此边界适合个人本地助手，不应直接照搬到多租户服务器。
 
-## 9. 验收指标
+应删除或退出默认模型工具集：
 
-### 9.1 长任务
+- `web_search`、`web_fetch`、`resource_recommend` 等功能重叠且质量不一致的网络入口；
+- `workspace_list`、`workspace_search`、`workspace_read` 等可被本地终端覆盖的文件入口；
+- `arxiv_search` 等模糊发现入口；明确 ID 的批量查询保留 `arxiv_lookup`，避免临时脚本逐篇请求造成限流和重复验证；
+- 会话搜索等暂时没有形成稳定使用价值的细粒度入口；
+- 仅为三个预设主题服务的研究路由；
+- 把固定领域维度写死在程序中的 `research_plan`；
+- 需要专用批次状态机才能继续工作的 `research_next_batch`；
+- 仅返回“当前研究账本”的 `research_task_status`；
+- 将 `wiki_open` 等同于有效阅读的完成判断。
 
-使用固定 30 篇论文完成一次端到端运行：
+如果已有工具暂时需要兼容，可以保留后端接口，但统一 Agent 不应再依赖它们。
+
+## 11. 典型行为
+
+### 11.1 简单问题
+
+用户：
+
+> QServe 的 KV Cache 使用多少位？
+
+期望：模型从目录识别 QServe Card，调用一次 `wiki_open`，回答并引用来源；不创建计划、不先执行泛化搜索。
+
+### 11.2 多论文长任务
+
+用户：
+
+> 阅读这 11 篇 RSI 论文，解释 RSI，分成三类并总结发展路线。
+
+期望：
+
+1. 模型识别出多来源、多个交付结果和完整覆盖要求；
+2. 创建包含 11 个来源的 Plan；
+3. 需要核实元数据时使用 `arxiv_lookup` 批量查询；用户给出的明确 ID 可直接提交导入，不增加全列表终端核验关卡；
+4. 按论文分别推进导入、读取和 Progress，部分来源失败不阻塞其他论文；429 和超时应记录为服务失败，不得推断论文不存在；
+5. 在 11 篇均有工具收据、三个交付结果均满足后综合回答；
+6. 受预算或来源错误阻塞时记录原因，不伪造完成。
+
+该行为不得依赖程序预先认识“RSI”这一主题。
+
+### 11.3 跨会话继续
+
+用户在新会话中说：
+
+> 继续昨天那份 RSI 调研。
+
+期望：模型读取活动任务列表和对应 `PLAN.md`，恢复未完成来源、完成条件和下一步；无需依赖昨天的完整聊天仍在上下文中。
+
+### 11.4 粘贴其他 AI 的长对话
+
+期望：系统识别为疑似 AI 对话，保存原文并显示可更正的来源类型；模型可提取候选观点和矛盾点，但没有论文证据时不自动修改 Wiki。
+
+## 12. 验收标准
+
+### 12.1 统一循环
 
 | 指标 | 验收线 |
 | --- | ---: |
-| 唯一有效阅读论文数 / 阅读完成数 | 100% |
-| 无理由重复展开率 | ≤ 5% |
-| 阅读记录字段完整率 | 100% |
-| 必要维度覆盖率 | 100% |
-| 报告核心结论 Evidence 覆盖率 | 100% |
-| 注入一次服务重启后的恢复成功率 | 100% |
-| 未满足门禁却宣布完成 | 0 次 |
+| 未配置过的新论文主题能够进入长任务 | 100% |
+| 简单单 Card 问题无计划完成 | ≥ 95% |
+| 多来源完整覆盖任务自动创建 Plan | ≥ 90% |
+| 依赖旧主题关键词才能运行的路径 | 0 条 |
 
-### 9.2 多来源知识维护
-
-构建至少 30 组包含一致、补充、冲突和不可判断关系的样例：
+### 12.2 渐进式读取
 
 | 指标 | 验收线 |
 | --- | ---: |
-| 来源字段完整率 | 100% |
+| 每轮可见 Card 目录覆盖率 | 100% |
+| 单 Card 问题先泛化搜索再打开的比例 | ≤ 10% |
+| 无明确目的的重复全文展开率 | ≤ 5% |
+| Card ID 不存在时被 Python 拦截 | 100% |
+
+### 12.3 计划与恢复
+
+| 指标 | 验收线 |
+| --- | ---: |
+| Plan 必需小节完整率 | 100% |
+| Compact 后计划恢复成功率 | 100% |
+| 新会话继续任务成功率 | 100% |
+| 服务重启后 Plan 文件可读率 | 100% |
+| 仅靠勾选 Plan 伪造工具完成 | 0 次 |
+
+### 12.4 知识安全
+
+| 指标 | 验收线 |
+| --- | ---: |
 | AI-only Claim 自动进入 accepted | 0 次 |
-| 已知冲突召回率 | ≥ 90% |
-| 不确定关系错误覆盖旧知识 | 0 次 |
+| 无来源内容静默覆盖 Wiki | 0 次 |
 | Revision 回滚成功率 | 100% |
-| 未声明 AI 对话高置信度识别准确率 | ≥ 95% |
-| 普通文章被高置信度误判为 AI 对话 | ≤ 2% |
-| 无明确依据时猜测具体 AI 提供方 | 0 次 |
 | 原始粘贴内容完整保留率 | 100% |
 
-## 10. 实施顺序
+## 13. 实施顺序
 
-### Phase 0：冻结范围
+### Phase 1：统一循环与目录注入（P0）
 
-- 停止新增通用 Agent、记忆、Multi-Agent 和 UI 功能。
-- 保留现有论文入库、Wiki、Revision 和问答链路。
+1. 删除或停用固定研究主题路由；
+2. 普通问答和长任务共用一个工具循环；
+3. 为全部 Wiki Card 生成稳定的紧凑目录并注入每轮请求；
+4. 调整系统提示词，让模型优先根据目录选择 Card；
+5. `wiki_search` 降级为补充工具；
+6. 用 QServe 单问答和未预设的 RSI 多论文任务做回归。
 
-### Phase 1：长任务最小闭环（P0）
+### Phase 2：模型维护计划（P0）
 
-1. 增加 `research_plans`、`reading_batches`、`paper_readings`。
-2. 实现 `research_next_batch` 与 `submit_paper_reading`。
-3. 将 `opened_card_ids` 从完成门禁中移除。
-4. 为长任务增加独立 Driver，不再使用三步聊天循环完成整项研究。
-5. 实现覆盖、信息增益和证据缺口门禁。
-6. 跑通一次固定 30 篇论文任务。
+1. 实现 `.paperwiki/tasks/<task_id>/PLAN.md`；
+2. 增加 `task_plan_read` 和 `task_plan_write`；
+3. 加入自动计划提示词；
+4. Compact 和新会话上下文加载活动 Plan；
+5. 增加工具收据复用和明确目的重读；
+6. 验证简单问题不滥用 Plan、复杂任务不会漏写 Plan。
 
-### Phase 2：多来源知识状态（P1）
+### Phase 3：来源与知识维护收口（P1）
 
-1. 支持显式保存 AI 输出和会话片段，并保守识别未声明来源的粘贴内容。
-2. 引入候选 Claim 与 dispute group。
-3. 生成研究状态 Markdown 投影。
-4. 审批页展示来源、关系、不确定性和实际 Diff。
+1. 保留 AI 对话粘贴识别与原文保存；
+2. 将候选观点、Evidence 和 Revision 的边界统一到本 Spec；
+3. 删除面向用户展示的 Wiki Card 编译垃圾字段；
+4. 验证冲突内容不会被静默覆盖。
 
-### Phase 3：评测与简历口径（P1）
+## 14. 明确废弃的旧假设
 
-1. 固化多来源冲突集和长任务集。
-2. 增加 AI 对话、普通文章、用户笔记和混合格式的来源分类集。
-3. 跑通本 Spec 的端到端链路与故障恢复场景。
-4. 只把达到验收线的能力写入 README 和简历。
+1. 长任务必须先由 Python 识别成某个预设主题。
+2. 所有长任务必须使用专用 Planner 模型。
+3. `wiki_search -> corpus_manifest -> research_plan` 是固定前置流程。
+4. 页面打开次数可以代表阅读完成度。
+5. 固定数量、固定领域维度或 `opened_count` 可以单独决定停止。
+6. Compact 摘要可以代替持久化工作计划。
+7. 模型计划必须转换成复杂研究状态机才能可靠执行。
 
-## 11. 明确删除或降级的旧假设
+## 15. 完成定义
 
-1. `wiki_open` 成功不再代表论文已读。
-2. `opened_count == verified_count` 不再代表可以综合。
-3. Verifier 通过不代表事实绝对正确。
-4. Markdown Diff 不代表知识语义正确。
-5. Compact 摘要不承担任务状态存储。
-6. 模型口头声明“完成”不改变任务终态。
+本 Spec 在以下条件全部满足后才能标记完成：
 
-## 12. 完成定义
+1. 任意新主题都能使用统一循环完成简单问答或进入多来源调研；
+2. Card 目录在预算内稳定注入，模型可以直接按 ID 选择知识页；
+3. 简单任务直接完成，复杂任务能够自动创建、更新和恢复 Plan；
+4. 工具收据、Evidence 和 Wiki 版本与计划文件边界清楚；
+5. 旧专用研究路由不再决定核心行为；
+6. Compact、新会话和服务重启场景通过；
+7. AI 粘贴内容、候选观点和 Wiki 已验证知识不会混写；
+8. README 只描述已经通过上述验收的能力。
 
-本 Spec 只有在以下条件全部满足时才能标记完成：
+## 16. 工具契约、长任务与运行记录补强（2026-09-23）
 
-1. 数据迁移可重复执行且不破坏现有 Wiki 与 Revision。
-2. 所有 MUST 需求有自动化测试或冻结评测样例。
-3. 固定 30 篇长任务达到第 9.1 节验收线。
-4. 多来源冲突集达到第 9.2 节验收线。
-5. 服务重启、Compact 和新会话恢复均通过。
-6. README 清楚区分已完成能力、实验能力和已知边界。
+本轮保持单 Agent 与默认九个工具，不新增 Agent Teams。原生 Function Calling
+与 JSON 回退共用工具定义；默认模型可见清单与调用接收白名单一致，旧工具仅通过
+显式兼容入口使用。工具描述说明用途、输入来源、返回结果边界及失败后的下一步。
+
+长任务的计划与真实工具结果每轮重新注入。预算耗尽、重复调用和暂时失败不能
+静默变成“任务完成”；完成检查应结合计划、未完成入库任务与已观察结果。
+检查只能约束程序可观察的事实，不能证明模型已经理解论文或研究结论正确。
+
+界面按时间顺序展示面向用户的进度说明和真实工具事件：紧凑行显示动作、参数摘要、
+状态与耗时，展开后查看参数和结果。进度事件与最终回答分开，历史刷新后可以回放。
+不得把供应商返回的内部 reasoning 内容当作进度说明，也不得生成虚假工具记录。
+
+验收分两层：本地测试覆盖工具契约一致性、调用白名单、失败/重复后的继续行为、
+进度持久化及超长内容回读；真实的十一篇论文任务由用户手动执行，不把模拟测试
+或前端构建通过描述为真实任务已通过。

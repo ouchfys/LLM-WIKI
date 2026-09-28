@@ -13,17 +13,17 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any, Dict, List, Optional
 
-from system.storage import get_object_storage
+from system.storage import get_object_storage, get_storage_layout
 
 
 class WikiChunkIndex:
     """SQLite FTS5 chunk index for all wiki content."""
 
     def __init__(self, db_path: str = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        path = Path(db_path) if db_path else repo_root / "sessions.db"
+        path = resolve_database_path(db_path)
         self.db_path = str(path)
         self._fts_enabled = False
         self._init_db()
@@ -285,10 +285,9 @@ class WikiChunkIndex:
                 return self._sanitize_markdown_for_indexing(text) if text else None
             except Exception:
                 return None
-        repo_root = Path(__file__).resolve().parents[2]
         file_path = Path(path)
         if not file_path.is_absolute():
-            file_path = repo_root / path
+            file_path = get_storage_layout().repo_root / path
         if not file_path.exists():
             return None
         try:

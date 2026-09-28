@@ -40,6 +40,8 @@ class ParsedMarkdownCard:
 
 
 SECTION_TO_FIELD = {
+    "核心解读": "reading_guide",
+    "reading guide": "reading_guide",
     "summary": "summary",
     "problem": "problem",
     "key ideas": "key_idea",
@@ -59,6 +61,37 @@ SECTION_TO_FIELD = {
     "review status": "review_status_text",
     "claims": "claims",
     "knowledge claims": "claims",
+    "摘要": "summary",
+    "结论": "conclusion",
+    "论文类型": "paper_type",
+    "研究问题": "research_problem",
+    "研究动机": "motivation",
+    "主要贡献": "contributions",
+    "方法概览": "method_overview",
+    "方法组成": "method_components",
+    "执行流程": "execution_flow",
+    "实验设置": "experiment_setup",
+    "关键结果": "key_results",
+    "关键表格": "key_tables",
+    "图表解读": "figure_notes",
+    "消融实验": "ablations",
+    "与既有工作的比较": "comparison_to_prior_work",
+    "问题": "problem",
+    "核心观点": "key_idea",
+    "方法": "method",
+    "结果": "results",
+    "发现": "findings",
+    "定义": "definition",
+    "机制": "mechanism",
+    "局限": "limitations",
+    "要点": "key_takeaways",
+    "面试提示": "interview_notes",
+    "补充说明": "notes",
+    "解释": "explanation",
+    "示例": "examples",
+    "相关主题": "links",
+    "对话洞见": "conversation_insights",
+    "待验证问题": "open_questions",
 }
 
 
@@ -80,8 +113,12 @@ def parse_markdown_card(markdown: str) -> ParsedMarkdownCard:
         raise MarkdownCardParseError("Markdown card frontmatter is missing type.")
 
     sections = parse_sections(body)
-    summary = sections.get("Summary", "").strip()
+    summary = (sections.get("摘要") or sections.get("Summary") or "").strip()
     system_metadata = parse_system_metadata(body)
+    if system_metadata.get("repository_research") and not summary:
+        lead = re.sub(r'<small class="repository-snapshot">.*?</small>', "",
+                      sections.get("核心解读") or sections.get("结论") or "", flags=re.DOTALL).strip()
+        summary = re.sub(r"\*\*|`", "", lead.split("。", 1)[0]).strip()[:160]
     hidden_claims = system_metadata.get("claims") if isinstance(system_metadata, dict) else []
     claims = parse_claims(body)
     if not claims and isinstance(hidden_claims, list):
@@ -212,6 +249,8 @@ def content_json_from_sections(card: ParsedMarkdownCard) -> dict[str, Any]:
         content.update(card.system_metadata)
     for heading, value in card.sections.items():
         key = SECTION_TO_FIELD.get(heading.strip().lower()) or _field_key_from_heading(heading)
+        if card.system_metadata.get("repository_research") and key in {"conclusion", "reading_guide"}:
+            value = re.sub(r'<small class="repository-snapshot">.*?</small>', "", value, flags=re.DOTALL).strip()
         if key in {"summary", "claims"}:
             continue
         if key in {"key_takeaways"}:

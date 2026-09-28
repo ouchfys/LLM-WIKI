@@ -217,6 +217,9 @@ const summaryLooksRedundant = computed(() => {
 })
 const recommendation = computed(() => {
   const reasons = selected.value?.decision_context?.risk_reasons || []
+  if (reasons.some(reason => reason.startsWith('claim_relation_'))) {
+    return { tone: 'caution', title: '需要核对新旧结论', text: '新旧结论的比较未能确认可以自动合并。请检查原文与已有知识；比较失败本身不代表两者存在冲突。' }
+  }
   if (!allClaimsVerified.value || reasons.includes('verifier_not_clean')) {
     return { tone: 'reject', title: '建议忽略', text: '至少一条知识变更没有通过自动证据核验，不建议写入正式 Wiki。' }
   }
@@ -234,14 +237,16 @@ const recommendation = computed(() => {
   }
   return { tone: 'accept', title: '建议接受', text: '候选内容已通过自动核验，并为现有 Wiki 增加了新的结论或信息。' }
 })
-const decisionTitle = computed(() => conflictPairs.value.length ? '新论文与已有 Wiki 结论不一致' : '这条历史 proposal 缺少冲突对象')
+const decisionTitle = computed(() => conflictPairs.value.length ? '新论文与已有 Wiki 结论不一致' : '知识更新需要人工核对')
 const decisionExplanation = computed(() => {
   const reasons = selected.value?.decision_context?.risk_reasons || []
   if (conflictPairs.value.length) return `系统找到了 ${conflictPairs.value.length} 组明确的冲突关系，因此暂停自动写入。下面直接展示冲突双方。`
+  if (reasons.some(reason => ['claim_relation_model_failed', 'claim_relation_retrieval_failed', 'claim_relation_model_unavailable'].includes(reason))) return '候选检索或模型比较未完成，系统保留了修改提案并暂停自动写入。这不等于已经发现知识冲突。'
+  if (reasons.includes('claim_relation_unresolved')) return '模型尚不能确定新旧结论的关系，需要核对适用条件和证据后再决定是否合并。'
   if (reasons.includes('verifier_not_clean')) return '至少一条变更没有通过证据验证，因此不能自动写入。'
   return '这是旧版本生成的待审批项，尚未保存可定位的冲突双方；建议忽略后用新流程重新处理。'
 })
-const approveLabel = computed(() => conflictPairs.value.some(pair => pair.relation === 'supersedes') ? '采用新结论' : '保留两个观点')
+const approveLabel = computed(() => conflictPairs.value.some(pair => pair.relation === 'supersedes') ? '采用新结论' : conflictPairs.value.length ? '保留两个观点' : '核对后接受')
 const rejectLabel = computed(() => '保留原结论')
 const flowStates = ['EXTRACTING', 'DISTILLING', 'VERIFYING', 'COMPILING_PROPOSAL', 'AWAITING_APPROVAL', 'COMMITTING', 'COMMIT_FAILED', 'REINDEXING', 'COMPLETED']
 const labels: Record<string, string> = {

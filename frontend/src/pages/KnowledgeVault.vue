@@ -17,7 +17,7 @@
               <span>资料库</span>
               <strong>{{ currentGroup?.label || '资料库' }}</strong>
             </div>
-            <small>{{ allCards.length }} 条</small>
+            <small>{{ currentGroup?.items.length || 0 }} 张</small>
           </div>
 
           <input
@@ -25,7 +25,7 @@
             class="library-search"
             type="search"
             aria-label="搜索知识库"
-            placeholder="搜索论文、概念、方法或关键词"
+            placeholder="搜索论文、主题或关键词"
             @keyup.enter="loadCards"
           />
 
@@ -52,7 +52,7 @@
                       :style="{ '--row-index': index }"
                       @click="selectCard(card)"
                     >
-                      <span>{{ card.title }}</span>
+                      <span v-html="readerInline(card.title)"></span>
                       <small>{{ cardSubtitle(card) }}</small>
                     </button>
                     <p v-if="!group.items.length" key="__empty" class="empty-note">这个分类还没有内容。</p>
@@ -65,23 +65,33 @@
           <div class="library-stats" aria-label="资料库统计">
             <span>{{ allCards.length }} 卡片</span>
             <span>{{ aliasItems.length }} 关键词</span>
-            <span>{{ selectedCard ? typeLabel(selectedCard.page_type) : '-' }}</span>
+    <span>{{ selectedCard ? selectedTypeLabel : '-' }}</span>
           </div>
         </aside>
 
         <main class="vault-reader" aria-label="Reader">
-          <article v-if="selectedCard" class="wiki-document" @click="handleDocumentClick">
+          <article v-if="selectedCard" class="wiki-document">
             <header class="reader-head">
               <div class="reader-meta-line">
-                <span>{{ groupLabelForCard(selectedCard) }}</span>
-                <span>{{ typeLabel(selectedCard.page_type) }}</span>
+                <span>{{ selectedTypeLabel }}</span>
               </div>
-              <h1>{{ selectedCard.title }}</h1>
-              <div class="reader-control-row">
+              <h1 v-html="readerInline(selectedCard.title)"></h1>
+              <p v-if="isRepositoryCard" class="repository-status" aria-label="保存状态">
+                <span>{{ selectedCard.current_revision_id ? '已保存' : '保存状态未确认' }}</span>
+                <span v-if="repositoryReviewLabel(selectedCard.repository_review)">{{ repositoryReviewLabel(selectedCard.repository_review) }}</span>
+              </p>
+              <div v-if="!isRepositoryCard" class="reader-control-row">
                 <span :class="['source-level-chip', selectedCard.source_level || 'neutral']">
                   {{ sourceLevelLabel(selectedCard.source_level) }}
                 </span>
-                <span v-for="topic in selectedCard.related_topics || []" :key="topic" class="reader-tag">{{ topic }}</span>
+
+              </div>
+              <div v-if="sourcePapers.length" class="reader-origin" aria-label="来源论文">
+                <span class="origin-label">来自论文</span>
+                <div v-for="paper in sourcePapers" :key="paper.id" class="origin-paper">
+                  <span>{{ paper.title }}</span>
+                  <button type="button" @click="selectCardById(paper.id)">查看来源论文 ↗</button>
+                </div>
               </div>
               <div class="reader-actions">
                 <button type="button" class="primary-action" @click.stop="askAbout(selectedCard)">基于此页提问</button>
@@ -90,7 +100,7 @@
               </div>
             </header>
 
-            <details class="reader-detail-section">
+            <details v-if="!isRepositoryCard" class="reader-detail-section">
               <summary>关联与来源 <span>查看证据与相关知识</span></summary>
               <div class="detail-stack">
                 <section class="trace-card">
@@ -160,15 +170,31 @@
               </ul>
             </details>
 
+            <section v-if="isRepositoryCard && !readingGuide" class="wiki-section repository-conclusion">
+              <h2>核心解读</h2>
+              <div v-html="readerText(repositoryConclusion)"></div>
+            </section>
             <section v-if="showSummarySection" class="wiki-section">
-              <h2>摘要</h2>
-              <div v-html="linkifiedText(selectedSummary)"></div>
+              <h2>先读这一段</h2>
+              <div v-html="readerText(selectedSummary)"></div>
             </section>
 
-            <section v-for="section in compiledSections" :key="section.key" class="wiki-section">
+            <section v-if="readingGuide" class="wiki-section reading-guide">
+              <div class="reading-guide-label">核心解读</div>
+              <div v-html="readerText(readingGuide)"></div>
+            </section>
+            <section v-for="section in readingSections" :key="section.key" class="wiki-section">
               <h2>{{ section.title }}</h2>
               <div v-html="section.html"></div>
             </section>
+            <div v-if="detailSections.length" class="reading-details">
+              <h2>深入阅读</h2>
+              <p class="detail-hint">方法、实验与原文证据按需展开，完整内容始终保留。</p>
+              <details v-for="section in detailSections" :key="`${selectedCard.id}-${section.key}`" class="wiki-section reader-fold">
+                <summary>{{ section.title }}</summary>
+                <div v-html="section.html"></div>
+              </details>
+            </div>
 
             <section v-if="imagePreviewSources.length" class="wiki-section">
               <h2>图片</h2>
@@ -179,64 +205,22 @@
               </div>
             </section>
 
+            <footer v-if="isRepositoryCard" class="repository-snapshot">
+              代码仓库：<a v-if="repositoryName" :href="repositoryUrl" target="_blank" rel="noreferrer">{{ repositoryName }}</a><span v-else>未记录</span>
+              <span>· 阅读日期（UTC）：{{ repositoryReadDate }}</span>
+              <span>· 版本：<code>{{ repositoryCommit ? repositoryCommit.slice(0, 12) : '未记录' }}</code></span>
+            </footer>
+
           </article>
 
           <div v-else class="reader-empty">
             <span>知识库</span>
             <h1>选择一张卡片开始阅读</h1>
-            <p>论文、概念卡和方法卡会在这里形成可跳转的阅读视图。</p>
+            <p>论文页和主题页会在这里形成可跳转的阅读视图。</p>
           </div>
         </main>
 
-        <aside v-if="selectedCard" class="vault-trace" aria-label="关联与来源追踪">
-          <section class="trace-card">
-            <div class="trace-head">
-              <strong>关联卡片</strong>
-              <small>{{ relatedCards.length || linkedKnowledge.length }}</small>
-            </div>
-            <div v-if="relatedCards.length" class="trace-list">
-              <button v-for="item in relatedCards" :key="item.key" type="button" class="trace-row" @click.stop="selectCardById(item.cardId)">
-                <span>{{ item.title }}</span>
-                <small>{{ relationLabel(item.meta) }}</small>
-              </button>
-            </div>
-            <div v-else-if="linkedKnowledge.length" class="trace-list">
-              <button v-for="item in linkedKnowledge" :key="item.id" type="button" class="trace-row" @click.stop="selectCardById(item.id)">
-                <span>{{ item.title }}</span>
-                <small>{{ typeLabel(item.pageType) }} · {{ relationLabel(item.relationType) }}</small>
-              </button>
-            </div>
-            <p v-else class="empty-note">暂无关联卡片。</p>
-          </section>
 
-          <section class="trace-card">
-            <div class="trace-head">
-              <strong>来源追踪</strong>
-              <small>{{ selectedSourceCount }}</small>
-            </div>
-            <dl class="source-facts">
-              <div><dt>类型</dt><dd>{{ typeLabel(selectedCard.page_type) }}</dd></div>
-              <div><dt>层级</dt><dd>{{ sourceLevelLabel(selectedCard.source_level) }}</dd></div>
-              <div><dt>来源数</dt><dd>{{ selectedSourceCount }}</dd></div>
-            </dl>
-                  <details class="source-technical">
-                    <summary>存储位置</summary>
-                    <p>{{ selectedCard.markdown_path || firstSourceLabel || '尚未记录' }}</p>
-                  </details>
-            <ul v-if="showSourceTrace && selectedCard.source_urls?.length" class="source-link-list">
-              <li v-for="url in selectedCard.source_urls" :key="url">
-                <a :href="normalUrl(url)" target="_blank" rel="noreferrer">{{ readableUrl(url) }}</a>
-              </li>
-            </ul>
-            <ul v-else-if="showSourceTrace && sourceEvidence.length" class="source-link-list">
-              <li v-for="item in sourceEvidence" :key="item.id">
-                <strong>{{ item.source_card_title || item.section_id || '证据' }}</strong>
-                <p>{{ item.claim_text || item.evidence_text }}</p>
-              </li>
-            </ul>
-            <p v-else class="empty-note">暂无来源证据。</p>
-          </section>
-        </aside>
       </div>
     </div>
 
@@ -258,6 +242,9 @@ import { useRouter } from 'vue-router'
 import { NModal, NTag } from 'naive-ui'
 import { api, type WikiCard } from '../api'
 import { isReaderContentField, hasReaderContent } from '../lib/wikiContent'
+import { readerMarkdown, readerInline } from '../lib/readerMarkdown'
+import { repositoryReviewLabel } from '../lib/repositoryReview'
+import 'katex/dist/katex.min.css'
 
 type LibraryGroup = { key: string; label: string; items: WikiCard[] }
 type AliasItem = { card_id: string; title: string; alias: string; normalized_alias: string; page_type: string }
@@ -279,8 +266,7 @@ const cardLinks = ref<any | null>(null)
 const libraryGroups = computed<LibraryGroup[]>(() => {
   const groups: LibraryGroup[] = [
     { key: 'papers', label: '论文', items: [] },
-    { key: 'concepts', label: '概念', items: [] },
-    { key: 'methods', label: '方法', items: [] },
+    { key: 'topics', label: '主题', items: [] },
     { key: 'interviews', label: '面经', items: [] },
     { key: 'insights', label: '我的洞见', items: [] },
     { key: 'sources', label: '资料', items: [] }
@@ -291,11 +277,49 @@ const libraryGroups = computed<LibraryGroup[]>(() => {
   return groups
 })
 
+const readingGuide = computed(() => String(selectedCard.value?.content_json?.reading_guide || ''))
+const repositoryMetadata = computed<Record<string, unknown>>(() => {
+  const value = selectedCard.value?.content_json?.repository_research
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+})
+const isRepositoryCard = computed(() => Boolean(repositoryMetadata.value?.repository))
+const selectedTypeLabel = computed(() => typeLabel(selectedCard.value?.page_type || ''))
+const repositoryName = computed(() => String(repositoryMetadata.value?.repository || ''))
+const repositoryCommit = computed(() => String(repositoryMetadata.value?.commit || ''))
+const repositoryReadDate = computed(() => String(repositoryMetadata.value?.read_date || '未记录'))
+const repositoryUrl = computed(() => repositoryName.value && repositoryCommit.value
+  ? `https://github.com/${repositoryName.value}/tree/${repositoryCommit.value}`
+  : `https://github.com/${repositoryName.value}`)
+const repositoryConclusion = computed(() => {
+  const content = selectedCard.value?.content_json || {}
+  const current = String(content.conclusion || '')
+  if (current) return current
+  const legacy = String(content['研究内容'] || '')
+  return legacy.replace(/^研究版本：.*$/m, '').replace(/^依据：.*$/gm, '').trim()
+})
+const sourcePapers = computed(() => {
+  if (!selectedCard.value || selectedCard.value.page_type === 'PaperPage') return []
+  const sources = new Map<string, { id: string; title: string }>()
+  for (const paper of cardLinks.value?.source_papers || []) {
+    sources.set(paper.id, { id: paper.id, title: paper.title })
+  }
+  for (const source of cardLinks.value?.sources || []) {
+    if (source.source_card_id && allCards.value.some(card => card.id === source.source_card_id && card.page_type === 'PaperPage')) {
+      sources.set(source.source_card_id, { id: source.source_card_id, title: source.source_card_title || '来源论文' })
+    }
+  }
+  // Relation rows are a fallback for older imports lacking source mappings.
+  for (const link of cardLinks.value?.incoming || []) {
+    const paper = allCards.value.find(card => card.id === link.from_card_id && card.page_type === 'PaperPage')
+    if (paper) sources.set(paper.id, { id: paper.id, title: paper.title })
+  }
+  return [...sources.values()]
+})
 const selectedSummary = computed(() => selectedCard.value ? cleanText(selectedCard.value.summary) : '')
 const hasProblemSection = computed(() => hasContent(selectedCard.value?.content_json?.problem))
 const selectedSourceType = computed(() => String(selectedCard.value?.content_json?.source_type || '').toLowerCase())
 const showSummarySection = computed(() =>
-  Boolean(selectedSummary.value && !hasProblemSection.value)
+  Boolean(!isRepositoryCard.value && selectedSummary.value && !hasProblemSection.value && !readingGuide.value)
 )
 const importImpact = computed(() => {
   const value = selectedCard.value?.content_json?.import_impact
@@ -322,17 +346,33 @@ const impactRows = computed(() => [
 const compiledSections = computed(() => {
   if (!selectedCard.value) return []
   const content = selectedCard.value.content_json || {}
-  const order = ['problem', 'definition', 'question_context', 'knowledge_kind', 'main_points', 'conversation_insights', 'open_questions', 'content', 'core_points', 'interview_questions', 'answer_frame', 'learning_value', 'key_idea', 'method', 'mechanism', 'results', 'findings', 'key_points', 'limitations', 'key_takeaways', 'interview_notes', 'notes']
+  const order = [
+    'reading_guide', 'paper_type', 'research_problem', 'problem', 'motivation', 'contributions',
+    'method_overview', 'method_components', 'execution_flow', 'experiment_setup',
+    'key_results', 'key_tables', 'figure_notes', 'ablations',
+    'comparison_to_prior_work', 'definition', 'question_context', 'knowledge_kind',
+    'main_points', 'conversation_insights', 'open_questions', 'content', 'core_points',
+    'interview_questions', 'answer_frame', 'learning_value', 'key_idea', 'method',
+    'mechanism', 'results', 'findings', 'key_points', 'limitations',
+    'key_takeaways', 'interview_notes', 'notes'
+  ]
   return Object.entries(content)
     .filter(([key, value]) => shouldRenderContentField(key, value))
     .sort(([a], [b]) => orderIndex(a, order) - orderIndex(b, order))
     .map(([key, value]) => ({
       key,
       title: sectionTitle(key),
-      html: key === 'knowledge_kind' ? valueToHtml(knowledgeKindLabel(String(value))) : valueToHtml(value)
+      html: contentValueToHtml(key, value)
     }))
     .filter((section) => section.html)
 })
+
+const overviewKeys = computed(() => selectedCard.value?.page_type === 'PaperPage'
+  ? ['research_problem', 'method_overview', 'limitations']
+  : ['mechanism', 'limitations'])
+const readingSections = computed(() => isRepositoryCard.value || readingGuide.value ? [] : compiledSections.value.filter(s => overviewKeys.value.includes(s.key)))
+const detailSections = computed(() => isRepositoryCard.value ? [] : compiledSections.value.filter(s => s.key !== 'reading_guide'
+  && (readingGuide.value || !overviewKeys.value.includes(s.key))))
 
 const linkedKnowledge = computed<LinkedKnowledgeRow[]>(() => {
   const content = selectedCard.value?.content_json || {}
@@ -408,6 +448,7 @@ function selectBestCard() {
 }
 
 async function selectCard(card: WikiCard) {
+  cardLinks.value = null
   selectedCard.value = card
   selectedGroupKey.value = cardGroup(card)
   await loadSelectedDetails(card.id)
@@ -430,6 +471,7 @@ async function loadSelectedDetails(cardId: string) {
       api.get(`/wiki/${cardId}`),
       api.get(`/wiki/${cardId}/links`)
     ])
+    if (selectedCard.value?.id !== cardId) return
     selectedCard.value = cardData
     cardLinks.value = linksData
   } catch {
@@ -463,139 +505,160 @@ async function deleteCard(card: WikiCard) {
 }
 
 function askAbout(card: WikiCard) {
-  router.push({ path: '/', query: { ask: `基于 Wiki 页面《${card.title}》，整理一版适合面试展示的解释。` } })
-}
-
-function handleDocumentClick(event: MouseEvent) {
-  const target = event.target as HTMLElement
-  const button = target.closest<HTMLButtonElement>('[data-keyword-card-id]')
-  if (button?.dataset.keywordCardId) {
-    selectCardById(button.dataset.keywordCardId)
-  }
+  router.push({ path: '/', query: { ask: `基于 Wiki 页面《${card.title}》，用通俗中文解释核心思路、关键证据与局限。` } })
 }
 
 function valueToHtml(value: unknown): string {
   if (Array.isArray(value)) {
     const items = value.map((item) => cleanText(renderInline(item))).filter(Boolean)
-    return items.length ? `<ul>${items.map((item) => `<li>${linkifiedText(item)}</li>`).join('')}</ul>` : ''
+    return items.length ? `<ul>${items.map((item) => `<li>${readerText(item)}</li>`).join('')}</ul>` : ''
   }
   if (typeof value === 'object' && value !== null) {
     const rows = Object.entries(value as Record<string, unknown>)
       .map(([key, nested]) => {
         const text = cleanText(renderInline(nested))
-        return text ? `<li><strong>${escapeHtml(sectionTitle(key))}</strong>: ${linkifiedText(text)}</li>` : ''
+        return text ? `<li><strong>${escapeHtml(sectionTitle(key))}</strong>: ${readerText(text)}</li>` : ''
       })
       .filter(Boolean)
     return rows.length ? `<ul>${rows.join('')}</ul>` : ''
   }
   const text = cleanText(String(value))
-  return text ? `<p>${linkifiedText(text)}</p>` : ''
+  return text ? readerText(text) : ''
 }
 
-function linkifiedText(text: string) {
-  const source = cleanText(text)
-  if (!source) return ''
-  const aliases = aliasItems.value
-    .filter((item) => item.card_id !== selectedCard.value?.id && item.alias && item.alias.trim().length >= 3)
-  const candidates: Array<{ start: number; end: number; alias: AliasItem; score: number }> = []
-  const lower = source.toLowerCase()
-  for (const alias of aliases) {
-    const needle = alias.alias.toLowerCase()
-    let index = lower.indexOf(needle)
-    while (index !== -1) {
-      const end = index + needle.length
-      if (isAliasBoundary(source, index, end)) {
-        candidates.push({
-          start: index,
-          end,
-          alias,
-          score: aliasLinkScore(alias, source.slice(index, end))
-        })
-      }
-      index = lower.indexOf(needle, index + needle.length)
+function contentValueToHtml(key: string, value: unknown): string {
+  if (key === 'key_tables') return keyTablesToHtml(value)
+  if (key === 'figure_notes') return figureNotesToHtml(value)
+  if (key === 'knowledge_kind') return valueToHtml(knowledgeKindLabel(String(value)))
+  if (key === 'paper_type') return valueToHtml(paperTypeLabel(String(value)))
+  return valueToHtml(value)
+}
+
+function keyTablesToHtml(value: unknown): string {
+  const tables = Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+    : parseStoredTableSections(String(value || ''))
+  return tables.map((table, index) => {
+    const caption = compactTableCaption(String(table.caption || ''), index)
+    const location = cleanText(String(table.location || table.section || ''))
+    const page = String(table.page || '').trim()
+    const locationText = [location, page ? `第 ${page} 页` : ''].filter(Boolean).join(' · ')
+    const tableHtml = markdownTableToHtml(String(table.markdown || ''))
+    if (!tableHtml) return ''
+    return [
+      `<section class="knowledge-table">`,
+      caption ? `<h3>${escapeHtml(caption)}</h3>` : '',
+      locationText ? `<p class="table-source">来源：${escapeHtml(locationText)}</p>` : '',
+      `<div class="table-scroll">${tableHtml}</div>`,
+      `</section>`
+    ].join('')
+  }).filter(Boolean).join('')
+}
+
+function parseStoredTableSections(markdown: string): Array<Record<string, unknown>> {
+  const blocks = markdown.replace(/\r\n/g, '\n').split(/(?=^###\s+)/m).map((item) => item.trim()).filter(Boolean)
+  return blocks.map((block, index) => {
+    const lines = block.split('\n')
+    const heading = lines[0]?.match(/^###\s+(.+)$/)?.[1] || `表格 ${index + 1}`
+    const locationLine = lines.find((line) => /来源位置/.test(line)) || ''
+    const location = locationLine.replace(/^\*|\*$/g, '').replace(/^来源位置[:：]\s*/, '')
+    const tableLines = lines.filter((line) => line.trim().startsWith('|')).join('\n')
+    return { caption: heading, location, markdown: tableLines }
+  })
+}
+
+function compactTableCaption(caption: string, index: number): string {
+  const text = cleanText(caption)
+  const numbered = text.match(/^(?:Table|表)\s*([\w.-]+)/i)
+  return numbered ? `表 ${numbered[1].replace(/[.:：]$/, '')}` : (text || `表 ${index + 1}`)
+}
+
+function markdownTableToHtml(markdown: string): string {
+  const rows = markdown.replace(/\r\n/g, '\n').split('\n')
+    .map(parseMarkdownTableRow)
+    .filter((cells): cells is string[] => Boolean(cells?.some((cell) => cell.trim())))
+    .filter((cells) => !cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim())))
+  if (!rows.length) return ''
+
+  const width = Math.max(...rows.map((row) => row.length))
+  if (width < 2) return ''
+  const normalized = rows.map((row) => {
+    if (row.length >= width) return row.slice(0, width)
+    // PDF tables commonly omit repeated row-group labels in the leading columns.
+    // Left-padding preserves the numeric columns instead of shifting every value.
+    return [...Array(width - row.length).fill(''), ...row]
+  })
+  const [header, ...body] = normalized
+  const headHtml = `<thead><tr>${header.map((cell) => `<th>${readerInline(cell)}</th>`).join('')}</tr></thead>`
+  const bodyHtml = body.length
+    ? `<tbody>${body.map((row) => `<tr>${row.map((cell) => `<td>${readerInline(cell)}</td>`).join('')}</tr>`).join('')}</tbody>`
+    : ''
+  return `<table>${headHtml}${bodyHtml}</table>`
+}
+
+function parseMarkdownTableRow(line: string): string[] | null {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('|')) return null
+  const inner = trimmed.replace(/^\|/, '').replace(/\|$/, '')
+  const cells = inner.split('|').map((cell) => cell.trim())
+  return cells.some(Boolean) ? cells : null
+}
+
+function figureNotesToHtml(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+      .map((figure, index) => {
+        const caption = compactFigureCaption(String(figure.caption || ''), index)
+        const description = cleanText(String(figure.description || ''))
+        const details = [
+          ['趋势', figure.trend],
+          ['适用条件', figure.conditions],
+          ['关键数值', Array.isArray(figure.key_values) ? figure.key_values.join('；') : figure.key_values]
+        ].filter(([, item]) => cleanText(String(item || '')))
+        return `<section class="figure-note"><h3>${escapeHtml(caption)}</h3>${description ? `<p>${readerText(description)}</p>` : ''}${details.length ? `<ul>${details.map(([label, item]) => `<li><strong>${label}</strong>：${readerText(cleanText(String(item)))}</li>`).join('')}</ul>` : ''}</section>`
+      }).join('')
+  }
+
+  const safeLines = String(value || '').replace(/\r\n/g, '\n').split('\n')
+  const output: string[] = []
+  for (const line of safeLines) {
+    if (/论文正文说明/.test(line)) continue
+    const heading = line.match(/^###\s+(.+)$/)
+    if (heading) {
+      output.push(`<h3>${escapeHtml(compactFigureCaption(heading[1], output.length))}</h3>`)
+      continue
     }
-  }
-  const matches: Array<{ start: number; end: number; alias: AliasItem }> = []
-  for (const candidate of candidates.sort(compareAliasCandidates)) {
-    if (!matches.some((match) => rangesOverlap(candidate.start, candidate.end, match.start, match.end))) {
-      matches.push({ start: candidate.start, end: candidate.end, alias: candidate.alias })
+    const bullet = line.match(/^[-*]\s+(.*)$/)
+    if (bullet) {
+      output.push(`<p class="figure-detail">${readerText(cleanText(bullet[1]))}</p>`)
+      continue
     }
+    const text = cleanText(line)
+    if (text) output.push(`<p>${readerText(text)}</p>`)
   }
-  if (!matches.length) return paragraphsToHtml(source)
-  matches.sort((a, b) => a.start - b.start)
-  let cursor = 0
-  let html = ''
-  for (const match of matches) {
-    html += escapeHtml(source.slice(cursor, match.start))
-    html += `<button type="button" class="keyword-link" data-keyword-card-id="${escapeHtml(match.alias.card_id)}">${escapeHtml(source.slice(match.start, match.end))}</button>`
-    cursor = match.end
-  }
-  html += escapeHtml(source.slice(cursor))
-  return paragraphsToHtmlFromEscaped(html)
+  return output.join('')
 }
 
-function paragraphsToHtml(text: string) {
-  return paragraphsToHtmlFromEscaped(escapeHtml(text))
+function compactFigureCaption(caption: string, index: number): string {
+  const text = cleanText(caption)
+  const numbered = text.match(/^(?:Figure|Fig\.?|图)\s*([\w.-]+)/i)
+  return numbered ? `图 ${numbered[1].replace(/[.:：]$/, '')}` : (text || `图 ${index + 1}`)
 }
 
-function paragraphsToHtmlFromEscaped(escaped: string) {
-  const parts = escaped.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean)
-  return parts.map((part) => `<p>${part.replace(/\n/g, '<br>')}</p>`).join('')
-}
-
-function rangesOverlap(aStart: number, aEnd: number, bStart: number, bEnd: number) {
-  return aStart < bEnd && bStart < aEnd
-}
-
-function compareAliasCandidates(
-  a: { start: number; end: number; alias: AliasItem; score: number },
-  b: { start: number; end: number; alias: AliasItem; score: number }
-) {
-  if (b.score !== a.score) return b.score - a.score
-  const lengthDiff = (b.end - b.start) - (a.end - a.start)
-  if (lengthDiff !== 0) return lengthDiff
-  return a.start - b.start
-}
-
-function aliasLinkScore(alias: AliasItem, matchedText: string) {
-  const aliasText = normalizeLinkText(alias.alias)
-  const titleText = normalizeLinkText(alias.title)
-  const matched = normalizeLinkText(matchedText)
-  const exactTitleScore = titleText && titleText === matched ? 2000 : 0
-  const exactAliasScore = aliasText && aliasText === matched ? 1000 : 0
-  return exactTitleScore + exactAliasScore + pageTypeLinkRank(alias.page_type) + matchedText.length * 10
-}
-
-function pageTypeLinkRank(pageType: string) {
-  if (pageType === 'ConceptPage') return 90
-  if (pageType === 'MethodPage') return 80
-  if (pageType === 'InterviewQA') return 50
-  if (pageType === 'PaperPage') return 20
-  return 40
-}
-
-function normalizeLinkText(value: string) {
-  return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim()
-}
-
-function isAliasBoundary(source: string, start: number, end: number) {
-  const before = start > 0 ? source[start - 1] : ''
-  const after = end < source.length ? source[end] : ''
-  return !isAsciiWord(before) && !isAsciiWord(after)
-}
-
-function isAsciiWord(char: string) {
-  return /^[a-zA-Z0-9_]$/.test(char)
+function readerText(text: string) {
+  return readerMarkdown(cleanText(text))
 }
 
 function cardGroup(card: WikiCard) {
   const sourceType = String(card.content_json?.source_type || '').toLowerCase()
   const urls = (card.source_urls || []).join(' ').toLowerCase()
+  if (card.content_json?.repository_research) return 'topics'
   if (sourceType.startsWith('conversation_insight')) return 'insights'
-  if (card.page_type === 'PaperPage' || sourceType.includes('paper') || /arxiv|\.pdf|doi\.org/.test(urls)) return 'papers'
-  if (card.page_type === 'ConceptPage') return 'concepts'
-  if (card.page_type === 'MethodPage') return 'methods'
+  if (card.page_type === 'PaperPage') return 'papers'
+  if (['TopicPage', 'ConceptPage', 'MethodPage'].includes(card.page_type)) return 'topics'
   if (card.page_type === 'InterviewQA') return 'interviews'
+  if (sourceType.includes('paper') || /arxiv|\.pdf|doi\.org/.test(urls)) return 'papers'
   return 'sources'
 }
 
@@ -605,6 +668,10 @@ function groupLabelForCard(card: WikiCard) {
 
 function cardSubtitle(card: WikiCard) {
   if (card.summary) return cleanText(card.summary).slice(0, 64)
+  if (card.content_json?.repository_research) {
+    const snapshot = card.content_json?.repository_research as Record<string, unknown> | undefined
+    return String(snapshot?.repository || '代码仓库')
+  }
   if (card.source_urls?.[0]) return readableUrl(card.source_urls[0])
   return typeLabel(card.page_type)
 }
@@ -612,8 +679,9 @@ function cardSubtitle(card: WikiCard) {
 function typeLabel(value: string) {
   return ({
     PaperPage: '论文',
-    ConceptPage: '概念',
-    MethodPage: '方法',
+    TopicPage: '主题',
+    ConceptPage: '主题',
+    MethodPage: '主题',
     ComparePage: '对比',
     InterviewQA: '面经',
     MistakeNote: '错题',
@@ -634,6 +702,16 @@ function knowledgeKindLabel(value: string) {
   } as Record<string, string>)[value] || value
 }
 
+function paperTypeLabel(value: string) {
+  return ({
+    empirical: '实证研究',
+    system: '系统研究',
+    theory: '理论研究',
+    survey: '综述',
+    other: '其他'
+  } as Record<string, string>)[value.toLowerCase()] || value
+}
+
 function relationLabel(value: string) {
   return ({
     topic_related: '主题相关',
@@ -645,7 +723,21 @@ function relationLabel(value: string) {
 
 function sectionTitle(key: string) {
   const labels: Record<string, string> = {
+    reading_guide: '核心解读',
     problem: '问题',
+    paper_type: '论文类型',
+    research_problem: '研究问题',
+    motivation: '研究动机',
+    contributions: '主要贡献',
+    method_overview: '方法概览',
+    method_components: '方法组成',
+    execution_flow: '执行流程',
+    experiment_setup: '实验设置',
+    key_results: '关键结果',
+    key_tables: '关键表格',
+    figure_notes: '图表解读',
+    ablations: '消融实验',
+    comparison_to_prior_work: '与既有工作的比较',
     key_idea: '核心观点',
     method: '方法',
     methods: '方法',
@@ -700,10 +792,16 @@ function cleanText(value: string) {
     .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)/gi, '')
     .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
     .replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/g, '')
-    .replace(/^#{1,6}\s*/gm, '')
-    .replace(/\s*---+\s*/g, '\n')
+    .replace(/^\s*---+\s*$/gm, '\n')
+    .replace(/^\s*-\s*\*\*Table Id\*\*[:：].*$/gim, '')
+    .replace(/\*\*Purpose\*\*/gi, '用途')
+    .replace(/\*\*Mechanism\*\*/gi, '机制')
+    .replace(/\*\*Details\*\*/gi, '说明')
+    .replace(/\*\*Evidence\*\*/gi, '证据')
+    .replace(/\*\*Conditions\*\*/gi, '条件')
+    .replace(/\*\*Implication\*\*/gi, '含义')
     .replace(/（已过）/g, '')
-    .replace(/\s+\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
@@ -1050,6 +1148,16 @@ onMounted(() => {
   color: rgba(195, 214, 202, 0.26);
 }
 
+.repository-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 12px 0 0;
+  color: var(--ink-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .wiki-document h1 {
   max-width: 780px;
   margin: 0;
@@ -1216,6 +1324,69 @@ onMounted(() => {
 .wiki-section :deep(strong) {
   color: var(--ink-text);
   font-weight: 600;
+}
+
+.wiki-section :deep(.knowledge-table + .knowledge-table),
+.wiki-section :deep(.figure-note + .figure-note) {
+  margin-top: 24px;
+}
+
+.wiki-section :deep(.table-source) {
+  margin-top: -4px;
+  color: var(--ink-text-muted);
+  font-size: 12px;
+}
+
+.wiki-section :deep(.table-scroll) {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line-quiet);
+  border-radius: 10px;
+}
+
+.wiki-section :deep(table) {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  background: #0f0d0b;
+  font-size: 13px;
+}
+
+.wiki-section :deep(th),
+.wiki-section :deep(td) {
+  max-width: 240px;
+  padding: 9px 11px;
+  border-right: 1px solid var(--line-quiet);
+  border-bottom: 1px solid var(--line-quiet);
+  color: var(--ink-text-soft);
+  line-height: 1.45;
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+}
+
+.wiki-section :deep(th) {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #1d1913;
+  color: var(--ink-text);
+  font-weight: 650;
+}
+
+.wiki-section :deep(tr:last-child td) {
+  border-bottom: 0;
+}
+
+.wiki-section :deep(th:last-child),
+.wiki-section :deep(td:last-child) {
+  border-right: 0;
+}
+
+.wiki-section :deep(.figure-detail) {
+  padding-left: 12px;
+  border-left: 2px solid rgba(155, 184, 173, 0.22);
+  color: var(--ink-text-muted);
 }
 
 .wiki-section :deep(.keyword-link) {
@@ -1481,3 +1652,47 @@ onMounted(() => {
 </style>
 
 
+
+<style scoped>
+/* Reading is the primary task; use the existing palette with quieter hierarchy. */
+.vault-layout { grid-template-columns: 240px minmax(0, 1fr); }
+.vault-reader { background: var(--surface, #12110e); }
+.wiki-document { max-width: 880px; margin: 0 auto; padding: clamp(24px, 4vw, 54px); }
+.reader-head { padding-bottom: 24px; }
+.wiki-document h1 { font-size: clamp(23px, 2.3vw, 32px); line-height: 1.35; }
+.reader-control-row { margin-top: 12px; }
+.source-level-chip { min-height: auto; padding: 0; border: 0; background: transparent; font-size: 12px; }
+.reader-origin { margin-top: 20px; padding-left: 14px; border-left: 2px solid #86a79a; }
+.origin-label { color: var(--ink-muted); font-size: 12px; }
+.origin-paper { margin-top: 6px; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.origin-paper > span { flex: 1; min-width: 180px; font-size: 13px; line-height: 1.65; color: var(--ink-muted); }
+.origin-paper button { flex-shrink: 0; border: 0; border-bottom: 1px solid #759488; background: transparent; color: #a7c5b8; padding: 2px 0; font-size: 12px; cursor: pointer; }
+.reader-actions { gap: 14px; margin-top: 20px; }
+.reader-actions button { min-height: 32px; padding: 5px 12px; font-size: 12px; }
+.wiki-section { margin-top: 28px; }
+.wiki-section h2 { font-size: 19px; border: 0; padding-bottom: 0; }
+.wiki-section :deep(h3) { font-size: 17px; line-height: 1.5; margin: 24px 0 10px; font-weight: 600; }
+.wiki-section :deep(p), .wiki-section :deep(li) { font-size: 15px; line-height: 1.95; color: #d3d1c9; overflow-wrap: anywhere; }
+.wiki-section :deep(p) { margin: 0 0 14px; }
+.wiki-section :deep(strong) { color: #eeece5; font-weight: 600; }
+.wiki-section :deep(.katex) { font-size: 1.1em; }
+.wiki-section :deep(.katex-display) { overflow-x: auto; overflow-y: hidden; padding: 10px 0; }
+.reading-guide-label { font-size: 12px; letter-spacing: .08em; color: #a7c5b8; margin-bottom: 18px; }
+.repository-conclusion { max-width: 760px; }
+.repository-snapshot { margin-top: 44px; padding-top: 15px; border-top: 1px solid var(--line-quiet); color: var(--ink-muted); font-size: 11px; line-height: 1.8; }
+.repository-snapshot a { color: #a7c5b8; text-decoration: none; }
+.repository-snapshot a:hover { text-decoration: underline; }
+.repository-snapshot code { color: inherit; font-size: inherit; }
+.reading-details { margin-top: 36px; border-top: 1px solid var(--line-quiet); padding-top: 24px; }
+.reading-details > h2 { font-size: 17px; margin: 0; }
+.detail-hint { color: var(--ink-muted); font-size: 12px; margin: 8px 0 16px; }
+.reader-fold { margin: 0; border-top: 1px solid var(--line-quiet); padding: 14px 0; }
+.reader-fold > summary { font-size: 14px; cursor: pointer; color: #c9d5ce; }
+.reader-fold[open] > summary { margin-bottom: 20px; }
+.reader-detail-section { margin-top: 16px; }
+@media(max-width: 760px) {
+  .vault-layout { grid-template-columns: minmax(0, 1fr); }
+  .wiki-document { padding: 22px 18px; }
+  .wiki-document h1 { font-size: 23px; }
+}
+</style>

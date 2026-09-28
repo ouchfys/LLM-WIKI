@@ -8,6 +8,8 @@ from typing import Any
 
 from system.conversation.context_budget import default_counter
 from system.core.llm_call import invoke_structured
+from system.agent_runtime.tracing import get_current_trace
+from system.agent_runtime.control import RunCancelled, RunInterrupted
 from system.storage import get_object_storage
 
 from system.wiki.paper_pipeline.models import CandidateClaim, DistilledCandidate, SourcePacket
@@ -25,15 +27,58 @@ Output language:
 - Keep paper titles, model names, method names, metrics, datasets, and equations
   in their original language.
 
+Editorial structure:
+- Include reading_guide: a self-contained, plain-Chinese explanation for a reader who
+  has not read the paper. Aim for 350-650 Chinese characters, using ### headings:
+  为什么需要它 / 核心办法 / 证据说明了什么 / 不能据此推出什么. Explain an intuitive
+  example before implementation detail. Define paper-specific jargon, abbreviations,
+  benchmark names and symbols in everyday Chinese at first mention (for example,
+  explain what a "weak seed" actually contains before writing H_seed). Do not assume
+  the reader knows the paper's terminology. Mark invented teaching examples as examples,
+  never as experiments. Include at most two headline results with comparison scope.
+  Cover the main idea and essential limitations; put full tables and implementation
+  detail in the existing structured fields. Do not repeat the guide in the summary.
+- For dataset papers, include a short ### 一条数据长什么样 inside reading_guide:
+  show one source-provided record (or a short faithful excerpt), explain its input,
+  output/label and important fields, and locate it by source section/table/example.
+  Distinguish an actual record from a schema and from an illustrative example.
+  If no record is supplied, explicitly say 原文未提供完整样本; describe only supported
+  fields. Never invent raw records, labels, field names or pretend to have opened data.
+- For benchmark papers, include ### 一个具体任务 inside reading_guide. Walk through
+  one named task actually described in the source: starting materials/input, goal,
+  allowed actions and fixed constraints, submitted artifact, evaluator/metric and
+  success criterion. Explain a benchmark task rather than inventing a question-answer
+  row. Cite its section/appendix. Say which details the paper does not report.
+  Prefer this grounded walkthrough over a generic analogy; keep it concise and move
+  exhaustive task lists and metric tables into details. Do not claim a hypothetical
+  modification was actually executed or improved the score.
+- Summary is a short plain-Chinese introduction, not an academic abstract or a list
+  of model names and numbers. Explain the main idea before using specialist terms.
+  It remains complete; no unfinished sentences.
+- Use valid LaTeX delimited by $...$ or $$...$$ for math, escaping backslashes in
+  JSON. Define symbols in Chinese. Include equations only when they aid understanding.
+- Identify paper_type first. For surveys/perspective papers explain the taxonomy,
+  conceptual framework, cited evidence, open questions and limitations. Leave
+  experiment_setup and ablations empty when there are no original experiments.
+- Clearly distinguish the authors' proposals from results cited from other papers.
+- Organize the main narrative around
+  a few research questions; avoid repeating the same facts in multiple sections.
+- key_results.finding must be a concise Chinese conclusion; its explanation and
+  conditions must be Chinese. Keep verbatim evidence quotes in claims, not in the
+  reader-facing narrative. Explain selected tables in Chinese without rewriting cells.
+
 Hard rules:
 - Return valid JSON only. No markdown fences and no prose outside JSON.
 - Do not invent authors, datasets, metrics, numbers, figure contents, or conclusions.
 - Cover every substantive part of the paper. Do not summarize only the abstract or introduction.
 - Explain causal links: what problem each design choice solves and how components interact.
 - For empirical papers, state datasets/models/baselines/metrics/settings before reporting results.
-- selected_table_ids may contain only IDs shown in the source. Select 2-5 tables that best
-  explain the main results, comparisons or ablations. Python will insert their exact Markdown;
-  never copy or rewrite table cells into another field.
+- selected_table_ids may contain only IDs shown in the source. Default to an empty list.
+  Select at most one table only when comparing its rows or columns is necessary to
+  understand a headline result, and link it from that key_results item's table_id.
+  Explain the comparison in Chinese. Python will insert exact Markdown; never copy or
+  rewrite table cells into another field. A source having tables is not a reason to
+  select one for the reader page.
 - figure_notes may contain only figure_ids shown in the source. Describe each useful figure
   from its caption and nearby author-written discussion. State trends, axes, conditions and
   key values only when the supplied text explicitly supports them. Never infer unseen pixels.
@@ -58,7 +103,8 @@ Return this exact JSON shape:
     "content_json": {
       "schema_version": "paper-wiki-v2",
       "compile_status": "llm_refined",
-      "paper_type": "empirical/system/theory/survey/other",
+      "reading_guide": "",
+      "paper_type": "empirical/system/theory/survey/dataset/benchmark/other",
       "research_problem": "",
       "motivation": "",
       "contributions": [""],
@@ -67,7 +113,7 @@ Return this exact JSON shape:
       "execution_flow": [""],
       "experiment_setup": [{"name":"Datasets / Models / Baselines / Metrics / Hardware", "details":""}],
       "key_results": [{"finding":"", "evidence":"", "conditions":"", "table_id":""}],
-      "selected_table_ids": ["tbl-..."],
+      "selected_table_ids": [],
       "figure_notes": [{"figure_id":"fig-...", "description":"", "trend":"", "conditions":"", "key_values":[]}],
       "ablations": [{"factor":"", "finding":"", "implication":"", "table_id":""}],
       "limitations": "",
@@ -104,7 +150,23 @@ __SOURCE_CONTEXT__
 TOPIC_PROMPT = """\
 You create reusable TopicPage candidates from a compiled paper page. Return JSON only.
 Write explanations in Simplified Chinese while preserving technical names in their original language.
-Create 0-4 cards. Create a card only for a durable concept or method that future papers can extend;
+Prefer 0-2 cards; create up to 4 only when each adds independent explanatory value.
+Use a clear Chinese display title with the original technical name in parentheses.
+Do not promote every component name or section heading into a standalone topic.
+Do not make a second TopicPage for the paper itself, its title, acronym or alias.
+The summary states what it is in 1-2 plain-Chinese sentences. reading_guide should
+explain, in 250-450 Chinese characters, its purpose, mechanism, a clearly labeled
+illustrative example and limitations. Define specialist terms at first mention, with
+  the meaning they have in this source. Use ### headings. Avoid repeating the paper
+  summary or copying its scores into the definition.
+Use $...$ / $$...$$ for math, defining symbols in Chinese. Source-specific terms
+must retain their paper context; do not generalize a single-paper result.
+For dataset or benchmark topics, use the compiled paper's grounded record/task
+walkthrough in reading_guide instead of an abstract generic example. Explain input,
+expected output/submission and evaluation in plain Chinese. Preserve its source
+locator and missing-information qualifications; never upgrade an illustrative
+example to real data. Do not invent a sample absent from the compiled paper.
+Create a card only for a durable concept or method that future papers can extend;
 do not split incidental paper details into separate cards. Every claim must reuse source-grounded
 evidence and section IDs from the compiled paper. Do not invent facts.
 
@@ -118,6 +180,7 @@ Return:
       "aliases": ["..."],
       "summary": "...",
       "content_json": {
+        "reading_guide": "",
         "schema_version": "topic-wiki-v1",
         "compile_status": "llm_refined",
         "definition": "",
@@ -153,7 +216,7 @@ __PAPER_PAGE__
 
 REVISION_PROMPT = """\
 You are revising a PaperWiki page that failed deterministic coverage checks.
-Return the complete paper_page JSON object in the same paper-wiki-v2 schema.
+Return {"paper_page": {...}} containing the complete page in the same paper-wiki-v2 schema.
 Fix every listed issue using only the supplied source. Preserve correct detail and evidence.
 Do not invent missing facts, numbers, tables, figures or limitations.
 
@@ -166,6 +229,10 @@ __CANDIDATE__
 Source:
 __SOURCE_CONTEXT__
 """
+
+
+class PaperDistillationError(RuntimeError):
+    """A model response could not produce a usable, source-grounded paper page."""
 
 
 class PaperDistiller:
@@ -194,23 +261,7 @@ class PaperDistiller:
     def _llm_distill(self, packet: SourcePacket) -> list[DistilledCandidate]:
         source_context = self._source_context_for_prompt(packet)
         prompt = PAPER_PAGE_PROMPT.replace("__TITLE__", packet.title).replace("__SOURCE_CONTEXT__", source_context)
-        try:
-            raw = invoke_structured(
-                self.llm,
-                prompt,
-                temperature=0.0,
-                max_tokens=int(os.getenv("PAPERWIKI_PAPER_OUTPUT_TOKENS", "12000")),
-            )
-        except Exception as exc:
-            print(f"[paper_pipeline.distiller] LLM distill failed: {exc}")
-            return []
-        payload = parse_json_object(raw)
-        if not payload:
-            return []
-        paper = payload.get("paper_page")
-        candidate = self._candidate_from_payload(paper) if isinstance(paper, dict) else None
-        if not candidate:
-            return []
+        candidate = self._generate_paper(prompt, stage="distillation", source_id=packet.source_id)
         self._attach_source_artifacts(candidate, packet)
 
         issues = paper_coverage_issues(candidate, packet)
@@ -222,6 +273,60 @@ class PaperDistiller:
                     candidate = revised
 
         return [candidate] + self._llm_topic_candidates(candidate)
+
+    def _generate_paper(self, prompt: str, *, stage: str, source_id: str) -> DistilledCandidate:
+        # Limits are deployment settings, not an implicit 12K truncation policy.
+        # One repair attempt can use a larger budget; provider capabilities are
+        # enforced by the configured model rather than a second hidden cap here.
+        initial_budget = int(os.getenv("PAPERWIKI_PAPER_OUTPUT_TOKENS", "65536"))
+        repair_budget = int(os.getenv("PAPERWIKI_PAPER_RETRY_OUTPUT_TOKENS", "131072"))
+        if min(initial_budget, repair_budget) <= 0:
+            raise ValueError("paper output token budgets must be positive")
+        failure = ""
+        for attempt, budget in enumerate((initial_budget, max(initial_budget, repair_budget)), start=1):
+            request = prompt
+            if failure:
+                request += (
+                    "\n\nThe previous response could not be used: " + failure +
+                    "\nReturn a COMPLETE valid JSON object with the required paper_page wrapper and paper-wiki-v2 fields. "
+                    "Do not continue a partial JSON fragment, omit required fields, or copy tables into prose. "
+                    "Preserve substantive source coverage while avoiding repetitive wording."
+                )
+            try:
+                raw = invoke_structured(self.llm, request, temperature=0.0, max_tokens=budget)
+                payload = parse_json_object(raw)
+                if not payload:
+                    raise PaperDistillationError(_json_failure_reason(raw))
+                paper = payload.get("paper_page")
+                if not isinstance(paper, dict):
+                    raise PaperDistillationError("response has no paper_page JSON object")
+                candidate = self._candidate_from_payload(paper)
+                if not candidate or candidate.candidate_type != "paper_page":
+                    raise PaperDistillationError("paper_page has invalid candidate_type, page_type or title")
+                if candidate.content_json.get("schema_version") != "paper-wiki-v2":
+                    raise PaperDistillationError("paper_page must use schema_version=paper-wiki-v2")
+                if not candidate.claims:
+                    raise PaperDistillationError("paper_page has no nonempty source-grounded claims")
+                candidate.content_json["compile_status"] = "llm_refined"
+                return candidate
+            except (RunCancelled, RunInterrupted):
+                raise
+            except Exception as exc:
+                failure = f"{exc.__class__.__name__}: {exc}"[:800]
+                trace = get_current_trace()
+                if trace:
+                    trace.event(
+                        "paper.distillation.retry" if attempt == 1 else "paper.distillation.failed",
+                        name=stage, status="retrying" if attempt == 1 else "failed",
+                        data={"source_packet_id": source_id, "attempt": attempt, "max_attempts": 2,
+                              "max_tokens": budget, "next_max_tokens": max(initial_budget, repair_budget) if attempt == 1 else None},
+                        error=failure,
+                    )
+                print(f"[paper_pipeline.distiller] {stage} attempt {attempt}/2 failed: {failure}")
+        raise PaperDistillationError(
+            f"{stage} failed after 2 attempts for source {source_id}: {failure}. "
+            "Source material is retained; no abstract-only PaperPage was accepted."
+        )
 
     def _revise_paper(
         self,
@@ -236,42 +341,72 @@ class PaperDistiller:
             .replace("__CANDIDATE__", _candidate_prompt_json(candidate))
             .replace("__SOURCE_CONTEXT__", source_context)
         )
-        try:
-            raw = invoke_structured(
-                self.llm,
-                prompt,
-                temperature=0.0,
-                max_tokens=int(os.getenv("PAPERWIKI_PAPER_OUTPUT_TOKENS", "12000")),
-            )
-        except Exception as exc:
-            print(f"[paper_pipeline.distiller] Paper coverage revision failed: {exc}")
-            return None
-        payload = parse_json_object(raw) or {}
-        item = payload.get("paper_page") if isinstance(payload.get("paper_page"), dict) else payload
-        revised = self._candidate_from_payload(item) if isinstance(item, dict) else None
-        return revised if revised and revised.candidate_type == "paper_page" else None
+        return self._generate_paper(prompt, stage="coverage_revision", source_id=packet.source_id)
 
     def _llm_topic_candidates(self, paper: DistilledCandidate) -> list[DistilledCandidate]:
         prompt = TOPIC_PROMPT.replace("__PAPER_PAGE__", _candidate_prompt_json(paper, include_artifacts=False))
-        try:
-            raw = invoke_structured(
-                self.llm,
-                prompt,
-                temperature=0.0,
-                max_tokens=int(os.getenv("PAPERWIKI_TOPIC_OUTPUT_TOKENS", "4500")),
-            )
-        except Exception as exc:
-            print(f"[paper_pipeline.distiller] Topic distill failed: {exc}")
-            return []
-        payload = parse_json_object(raw) or {}
-        candidates = []
-        for item in payload.get("knowledge_cards") or []:
-            if not isinstance(item, dict):
-                continue
-            candidate = self._candidate_from_payload(item)
-            if candidate:
-                candidates.append(candidate)
-        return candidates
+        initial_budget = int(os.getenv("PAPERWIKI_TOPIC_OUTPUT_TOKENS", "16384"))
+        repair_budget = int(os.getenv("PAPERWIKI_TOPIC_RETRY_OUTPUT_TOKENS", "32768"))
+        if min(initial_budget, repair_budget) <= 0:
+            raise ValueError("topic output token budgets must be positive")
+        failure = ""
+        for attempt, budget in enumerate((initial_budget, max(initial_budget, repair_budget)), start=1):
+            request = prompt
+            if failure:
+                request += (
+                    "\n\nThe previous topic response could not be used: " + failure +
+                    "\nReturn a COMPLETE valid JSON object with a knowledge_cards array. "
+                    "Regenerate the full object, not a continuation of truncated JSON. "
+                    "Return an empty array only when no reusable concept or method is supported."
+                )
+            try:
+                raw = invoke_structured(self.llm, request, temperature=0.0, max_tokens=budget)
+                payload = parse_json_object(raw)
+                if payload is None:
+                    raise PaperDistillationError(_json_failure_reason(raw))
+                cards = payload.get("knowledge_cards")
+                if not isinstance(cards, list):
+                    raise PaperDistillationError("response has no knowledge_cards JSON array")
+                candidates = []
+                paper_names = {
+                    normalize_alias(name) for name in [paper.title, *paper.aliases] if normalize_alias(name)
+                }
+                for item in cards:
+                    candidate = self._candidate_from_payload(item) if isinstance(item, dict) else None
+                    if not candidate or candidate.candidate_type not in {"concept_card", "method_card"}:
+                        raise PaperDistillationError("knowledge_cards contains an invalid topic candidate")
+                    topic_names = {
+                        normalize_alias(name)
+                        for name in [candidate.title, *candidate.aliases]
+                        if normalize_alias(name)
+                    }
+                    if topic_names & paper_names:
+                        continue
+                    guide_issues = reader_guide_issues(candidate.content_json, minimum_units=200)
+                    if guide_issues:
+                        raise PaperDistillationError(
+                            f"topic {candidate.title} has no usable reader guide: {'; '.join(guide_issues)}"
+                        )
+                    candidates.append(candidate)
+                return candidates
+            except (RunCancelled, RunInterrupted):
+                raise
+            except Exception as exc:
+                failure = f"{exc.__class__.__name__}: {exc}"[:800]
+                trace = get_current_trace()
+                if trace:
+                    trace.event(
+                        "paper.topic.retry" if attempt == 1 else "paper.topic.failed",
+                        name="topic_distillation", status="retrying" if attempt == 1 else "failed",
+                        data={"source_packet_id": paper.source_packet_id, "paper_title": paper.title,
+                              "attempt": attempt, "max_attempts": 2, "max_tokens": budget,
+                              "next_max_tokens": max(initial_budget, repair_budget) if attempt == 1 else None},
+                        error=failure,
+                    )
+                print(f"[paper_pipeline.distiller] Topic attempt {attempt}/2 failed: {failure}")
+        note = f"可选主题卡生成未完成：两次尝试均失败，未生成可用主题候选卡（{failure[:250]}）。论文页仍按既有流程核验。"
+        paper.content_json["notes"] = "\n\n".join(filter(None, [str(paper.content_json.get("notes") or "").strip(), note]))
+        return []
 
     def _candidate_from_payload(self, item: dict[str, Any]) -> DistilledCandidate | None:
         candidate_type = item.get("candidate_type")
@@ -495,9 +630,12 @@ class PaperDistiller:
             requested = re.findall(r"tbl-[0-9a-z-]+", requested, flags=re.IGNORECASE)
         table_map = {table.table_id: table for table in packet.tables}
         selected = [str(value) for value in requested if str(value) in table_map]
-        if not selected and packet.tables:
-            selected = [table.table_id for table in _rank_key_tables(packet.tables)]
-        selected = list(dict.fromkeys(selected))[: int(os.getenv("PAPERWIKI_MAX_CARD_TABLES", "5"))]
+        result_table_ids = {
+            str(result.get("table_id") or "")
+            for result in content.get("key_results") or []
+            if isinstance(result, dict)
+        }
+        selected = [table_id for table_id in dict.fromkeys(selected) if table_id in result_table_ids][:1]
         content["selected_table_ids"] = selected
         content["key_tables"] = [
             {
@@ -640,26 +778,6 @@ def _strip_source_frontmatter(markdown: str) -> str:
     return text
 
 
-def _rank_key_tables(tables: list[Any]) -> list[Any]:
-    keywords = (
-        "main result", "comparison", "performance", "accuracy", "throughput", "latency",
-        "quality", "benchmark", "ablation", "perplexity", "memory", "speedup",
-        "主要结果", "对比", "性能", "准确率", "吞吐", "延迟", "消融",
-    )
-
-    def score(table: Any) -> tuple[int, int]:
-        text = f"{table.caption} {' '.join(table.section_path)} {table.markdown[:1200]}".lower()
-        keyword_score = sum(5 for keyword in keywords if keyword in text)
-        markdown_lines = [line for line in table.markdown.splitlines() if line.strip().startswith("|")]
-        row_score = min(8, max(0, len(markdown_lines) - 2))
-        column_score = min(5, max(0, markdown_lines[0].count("|") - 1)) if markdown_lines else 0
-        size_score = row_score + column_score
-        return keyword_score + size_score, len(table.markdown)
-
-    limit = int(os.getenv("PAPERWIKI_DEFAULT_CARD_TABLES", "3"))
-    return sorted(tables, key=score, reverse=True)[: max(1, limit)]
-
-
 def _resolved_figure_note(source: dict[str, Any], proposed: dict[str, Any]) -> dict[str, Any]:
     caption = sanitize_wiki_text(str(source.get("caption") or ""))
     source_text = sanitize_wiki_text(str(source.get("source_text") or ""))
@@ -685,9 +803,14 @@ def _resolved_figure_note(source: dict[str, Any], proposed: dict[str, Any]) -> d
 def paper_coverage_issues(candidate: DistilledCandidate, packet: SourcePacket | None = None) -> list[str]:
     """Deterministic completeness gate for the richer PaperPage schema."""
     content = candidate.content_json or {}
-    if candidate.candidate_type != "paper_page" or content.get("schema_version") != "paper-wiki-v2":
+    if candidate.candidate_type != "paper_page":
         return []
+    if content.get("schema_version") != "paper-wiki-v2":
+        return ["paper candidate is not a fully compiled paper-wiki-v2 page; legacy or extraction-only candidates require recompilation"]
+    if content.get("compile_status") in {"distilled_local", "extraction_only", "failed"}:
+        return ["paper distillation is incomplete; extraction-only fallback cannot be approved"]
     issues = []
+    issues.extend(reader_guide_issues(content, minimum_units=300))
     paper_type = str(content.get("paper_type") or "").lower()
     required_text = {
         # These are content-unit thresholds rather than raw character counts.
@@ -721,10 +844,20 @@ def paper_coverage_issues(candidate: DistilledCandidate, packet: SourcePacket | 
             issues.append("empirical/system paper needs experiment_setup")
         if not isinstance(content.get("key_results"), list) or len(content.get("key_results") or []) < 2:
             issues.append("empirical/system paper needs at least two key_results")
-    if packet and packet.tables and not content.get("key_tables"):
-        issues.append("source contains tables but no exact key_tables were attached")
+    if len(content.get("key_tables") or []) > 1:
+        issues.append("reader page may contain at most one directly relevant table")
     if packet and packet.figures and not content.get("figure_notes"):
         issues.append("source contains figures but no figure_notes were attached")
+    return issues
+
+
+def reader_guide_issues(content: dict[str, Any], *, minimum_units: int) -> list[str]:
+    guide = str(content.get("reading_guide") or "")
+    issues = []
+    if _text_content_units(guide) < minimum_units or len(re.findall(r"(?m)^###\s+\S", guide)) < 2:
+        issues.append("reading_guide needs a substantive plain-language explanation with at least two sections")
+    if re.search(r"(?m)^\s*\|.*\|\s*$", guide):
+        issues.append("reading_guide must explain results in prose, not embed a table")
     return issues
 
 
@@ -826,6 +959,21 @@ def _unique_strings(items: list[str]) -> list[str]:
         seen.add(key)
         result.append(text)
     return result
+
+
+def _json_failure_reason(text: Any) -> str:
+    """Describe a structured-output failure without logging model prose."""
+    value = str(text or "").strip()
+    if not value:
+        return "model returned empty content"
+    start = value.find("{")
+    if start < 0:
+        return "model response has no JSON object opening brace"
+    try:
+        json.loads(value[start:])
+    except json.JSONDecodeError as exc:
+        return f"invalid JSON: {exc.msg} at line {exc.lineno}, column {exc.colno} (position {exc.pos}, response_chars={len(value)})"
+    return "response is not a usable JSON object"
 
 
 def parse_json_object(text: Any) -> dict[str, Any] | None:

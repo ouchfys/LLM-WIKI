@@ -87,12 +87,13 @@ def test_lookup_terms_create_cjk_bigrams_without_extra_dependency():
     assert "优化" in terms
 
 
-def test_wiki_search_returns_bounded_resolutions_not_full_catalog(tmp_path):
+def test_internal_wiki_search_returns_bounded_resolutions_not_full_catalog(tmp_path):
     store, grpo_id, _, _ = _build_store(tmp_path)
     service = WikiChatService(store, wiki_resolver=WikiResolver(store))
     cards = []
 
-    observation = service._execute_agent_tool_call(
+    # Retired as a model tool; the underlying resolver still serves internal callers.
+    observation = service._execute_agent_tool_call_impl(
         AgentToolCall(name="wiki_search", arguments={"query": "GRPO", "limit": 1}),
         cards=cards,
         web_results=[],
@@ -185,8 +186,9 @@ def test_agent_exposes_clean_page_and_on_demand_evidence_tools():
     }
     fallback_names = {item["name"] for item in WikiChatService._tool_specs()}
 
-    assert {"wiki_search", "wiki_open", "evidence_lookup", "arxiv_search", "arxiv_import_paper", "arxiv_ingestion_status"} <= native_names
-    assert {"wiki_search", "wiki_open", "evidence_lookup", "arxiv_search", "arxiv_import_paper", "arxiv_ingestion_status"} <= fallback_names
+    assert {"wiki_open", "evidence_lookup", "arxiv_lookup", "arxiv_import_paper", "arxiv_ingestion_status"} <= native_names
+    assert native_names == fallback_names == WikiChatService.DEFAULT_AGENT_TOOLS
+    assert {"wiki_search", "arxiv_search"}.isdisjoint(native_names)
     assert "table_query" not in native_names
     assert "table_query" not in fallback_names
     assert "wiki_card" not in native_names

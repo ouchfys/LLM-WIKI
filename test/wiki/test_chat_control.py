@@ -225,8 +225,8 @@ def test_independent_read_tools_run_concurrently_but_return_in_call_order():
 
     service = ParallelChat()
     calls = [
-        AgentToolCall("wiki_search", {"query": "first"}),
-        AgentToolCall("web_search", {"query": "second"}),
+        AgentToolCall("evidence_lookup", {"query": "first"}),
+        AgentToolCall("arxiv", {"action": "lookup", "arxiv_ids": ["1706.03762"], "query": "second"}),
     ]
     observations = service._execute_tool_batch(calls, [], [], [], 4)
 
@@ -238,7 +238,7 @@ def test_tool_batches_keep_dependencies_and_writes_serial():
     calls = [
         AgentToolCall("wiki_search", {"query": "paper"}),
         AgentToolCall("wiki_open", {"query": "paper"}),
-        AgentToolCall("web_search", {"query": "paper"}),
+        AgentToolCall("repository", {"operation": "open", "repository": "fixtures/agent"}),
         AgentToolCall("project_memory_update", {"content": "# Project Memory"}),
         AgentToolCall("search_project_history", {"query": "paper"}),
     ]
@@ -247,7 +247,7 @@ def test_tool_batches_keep_dependencies_and_writes_serial():
 
     assert [[call.name for call in batch] for batch in batches] == [
         ["wiki_search"],
-        ["wiki_open", "web_search"],
+        ["wiki_open", "repository"],
         ["project_memory_update"],
         ["search_project_history"],
     ]
@@ -320,11 +320,12 @@ def test_cancelled_transcript_is_not_reused_as_model_context(tmp_path):
     assert len(sessions.get_display_history(session)) == 2
 
 
-def test_disconnecting_before_worker_starts_closes_run_and_blocks_queue(tmp_path):
+def test_disconnecting_after_acknowledgement_keeps_worker_and_lease(tmp_path):
     from backend.api.wiki import WikiChatPayload, chat_with_wiki
 
     runtime = AgentRunStore(str(tmp_path / "disconnect.db"))
-    service = ControlChat(runtime, BlockingLLM())
+    llm = BlockingLLM(block_plan=True)
+    service = ControlChat(runtime, llm)
     response = chat_with_wiki(
         WikiChatPayload(message="测试断开", session_id="disconnect", stream=True),
         chat_service=service,
@@ -333,14 +334,103 @@ def test_disconnecting_before_worker_starts_closes_run_and_blocks_queue(tmp_path
     async def disconnect():
         first = await anext(response.body_iterator)
         assert "run_started" in first
+        assert llm.entered.wait(2)
         run_id = runtime.list_runs()[0]["id"]
         runtime.enqueue_input(run_id, kind="command", content="/compact", input_id="pending")
         await response.body_iterator.aclose()
-        assert runtime.get_run(run_id)["current_state"] == "CANCELLED"
-        assert runtime.list_inputs(run_id)[0]["status"] == "blocked"
+        assert runtime.get_run(run_id)["current_state"] == "CHAT_RUNNING"
+        assert runtime.get_run(run_id)["lease_owner"]
+        assert runtime.list_inputs(run_id)[0]["status"] == "pending"
 
-    asyncio.run(disconnect())
-    assert service.saved == []
+    try:
+        asyncio.run(disconnect())
+        assert service.saved == []
+    finally:
+        llm.release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and runtime.list_runs()[0]["current_state"] != "COMPLETED":
+        time.sleep(0.02)
+    assert runtime.list_runs()[0]["current_state"] == "COMPLETED"
+    assert len(service.saved) == 1
+
+
+def test_detached_stream_cannot_block_worker_when_output_exceeds_queue(tmp_path):
+    class ManyTokens(BlockingLLM):
+        def stream_invoke(self, prompt, **kwargs):
+            yield from ["x"] * 600
+
+    runtime = AgentRunStore(str(tmp_path / "many-tokens.db"))
+    llm = ManyTokens(block_plan=True)
+    service = ControlChat(runtime, llm)
+    stream = service.chat_stream("test")
+    run_id = next(stream)["run_id"]
+    try:
+        assert llm.entered.wait(2)
+        stream.close()
+    finally:
+        llm.release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and runtime.get_run(run_id)["current_state"] != "COMPLETED":
+        time.sleep(0.02)
+    assert runtime.get_run(run_id)["current_state"] == "COMPLETED"
+    assert service.saved[0][1] == "x" * 600
+
+
+@pytest.mark.parametrize("action", ["pause", "delete"])
+def test_detached_worker_still_obeys_pause_and_deletion(tmp_path, action):
+    path = str(tmp_path / "detached-control.db")
+    sessions = SessionStore(path)
+    sessions.ensure_session("session-control")
+    runtime = AgentRunStore(path)
+    llm = BlockingLLM(block_plan=True)
+    service = ControlChat(runtime, llm, session_store=sessions)
+    stream = service.chat_stream("test", session_id="session-control")
+    run_id = next(stream)["run_id"]
+    try:
+        assert llm.entered.wait(2)
+        stream.close()
+        if action == "pause":
+            runtime.request_pause(run_id)
+        else:
+            sessions.delete_session("session-control")
+    finally:
+        llm.release.set()
+    assert llm.finished.wait(2)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and (runtime.get_run(run_id) or {}).get("lease_owner"):
+        time.sleep(0.02)
+    assert service.saved == service.profile_updates == []
+    if action == "pause":
+        assert runtime.get_run(run_id)["current_state"] == "CHAT_INTERRUPTED"
+    else:
+        assert runtime.get_run(run_id) is None
+        assert sessions.get_session("session-control") is None
+
+
+def test_activity_is_session_scoped_paginated_and_does_not_start_tasks(tmp_path):
+    from backend.api.wiki import get_chat_activity
+    path = str(tmp_path / "activity.db")
+    sessions = SessionStore(path)
+    sid = sessions.create_session("background")
+    other = sessions.create_session("other")
+    runtime = AgentRunStore(path)
+    run = runtime.create_run(run_type="wiki_chat", source_uri=f"session:{sid}",
+                             context={"require_session": True, "session_id": sid, "request_message": "read papers"})
+    runtime.transition(run["id"], "CHAT_RUNNING")
+    runtime.append_event(run["id"], event_type="chat.public_event", output_data={"type": "progress", "text": "reading"})
+    runtime.append_event(run["id"], event_type="model.internal", output_data={"private": "not public"})
+    result = get_chat_activity(sid, store=sessions)
+    assert result["run"]["message"] == "read papers"
+    assert result["events"] == [{"type": "progress", "text": "reading"}]
+    assert get_chat_activity(sid, run_id=run["id"], after=result["after"], store=sessions)["events"] == []
+    assert get_chat_activity(sid, run_id="stale-run", after=99999, store=sessions)["events"] == result["events"]
+    assert get_chat_activity(other, store=sessions)["run"] is None
+    with pytest.raises(ValueError, match="already has a running task"):
+        runtime.create_run(run_type="wiki_chat", source_uri=f"session:{sid}",
+                           context={"require_session": True, "session_id": sid})
+    assert len(runtime.list_runs()) == 1
+    runtime.request_pause(run["id"])
+    assert get_chat_activity(sid, store=sessions)["run"] is None
 
 
 def test_queue_capacity_and_blocking_remaining_ready_commands(tmp_path):

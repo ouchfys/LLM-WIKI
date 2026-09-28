@@ -12,10 +12,13 @@ import re
 from system.memory.user_memory import UserMemoryStore
 from system.memory.project_files import ProjectMemoryFiles
 from system.memory.project_memory import DEFAULT_PROJECT_ID, ProjectMemoryStore
+from system.agent_runtime.lifecycle import serialized_write
+from system.storage.layout import get_storage_layout, resolve_database_path
 
 
 class SessionStore(UserMemoryStore, ProjectMemoryStore):
     _CHAT_RUNTIME_CHILD_TABLES = (
+        "chat_tool_calls",
         "agent_run_inputs",
         "agent_events",
         "agent_checkpoints",
@@ -23,16 +26,25 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
     )
 
     def __init__(self, db_path: str = None, memory_root: str = None):
-        base_dir = Path(__file__).resolve().parents[2]
-        configured_db = os.getenv("PAPERWIKI_DB_PATH", "").strip()
-        path = Path(db_path) if db_path else Path(configured_db) if configured_db else base_dir / "sessions.db"
+        path = resolve_database_path(db_path)
         self.db_path = str(path)
-        configured_memory_root = memory_root or os.getenv("PAPERWIKI_MEMORY_ROOT", "").strip()
-        self.project_memory_files = ProjectMemoryFiles(
-            configured_memory_root or path.parent / ".paperwiki" / "memory"
-        )
+        uses_application_database = path == resolve_database_path(create_parent=False)
+        if memory_root:
+            memory_path = Path(memory_root)
+        elif uses_application_database:
+            memory_path = Path(os.getenv("PAPERWIKI_MEMORY_ROOT", "").strip() or get_storage_layout().memory_dir)
+        else:
+            # Explicit databases (tests, imports, evaluations) own their memory.
+            # Do not let a global .env send those writes into the live home.
+            memory_path = path.parent / "memory"
+            legacy_memory = path.parent / ".paperwiki" / "memory"
+            if not memory_path.exists() and legacy_memory.is_dir():
+                memory_path = legacy_memory
+        self.project_memory_files = ProjectMemoryFiles(memory_path.expanduser())
         self._preference_fts_enabled = False
         self._init_db()
+        from system.agent_runtime.task_plans import TaskPlanStore
+        self.task_plans = TaskPlanStore(db_path=self.db_path)
         self._sync_all_project_memory_files()
         self._sync_user_memory_file()
 
@@ -254,14 +266,16 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT id, title, created_at, settings_json, project_id FROM sessions WHERE id = ?",
+                """SELECT id,title,created_at,settings_json,project_id,
+                    (SELECT content FROM messages m WHERE m.session_id=sessions.id AND m.role='user' ORDER BY m.id LIMIT 1) AS first_prompt
+                    FROM sessions WHERE id=?""",
                 (session_id,),
             ).fetchone()
         if not row:
             return None
         return {
             "id": row["id"],
-            "title": row["title"],
+            "title": (self._title_fallback(row["first_prompt"]) if row["title"] in {None, "", "新会话", "新对话"} and row["first_prompt"] else row["title"]),
             "created_at": row["created_at"],
             "settings": self._load_json(row["settings_json"]),
             "project_id": row["project_id"] or DEFAULT_PROJECT_ID,
@@ -293,6 +307,29 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             conn.commit()
             # A late model response must not recreate messages after deletion.
             return int(cursor.lastrowid) if cursor.rowcount else 0
+
+    def save_chat_answer(self, session_id, run_id, message, answer, metadata, title):
+        """One answer per run attempt; explicit continuation retains earlier answers."""
+        from system.agent_runtime.chat_recovery import ChatRecovery
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = ChatRecovery._check(conn, run_id)
+            attempt = int(run["attempt"] or 0)
+            if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+                from system.agent_runtime.control import RunCancelled
+                raise RunCancelled("Conversation deleted")
+            old = conn.execute("SELECT id FROM messages WHERE session_id=? AND json_extract(metadata_json,'$.completed_run_id')=? AND COALESCE(json_extract(metadata_json,'$.completed_run_attempt'),0)=? ORDER BY id", (session_id, run_id, attempt)).fetchall()
+            if old:
+                return [row[0] for row in old]
+            ids = []
+            for role, content, details in (("user", message, {"mode": "wiki_chat"}), ("assistant", answer, metadata)):
+                cursor = conn.execute("INSERT INTO messages(session_id,role,content,metadata_json,created_at) VALUES(?,?,?,?,?)",
+                    (session_id, role, content, self._dump_json({**details, "completed_run_id": run_id,
+                         "completed_run_attempt": attempt}), self._now_iso()))
+                ids.append(cursor.lastrowid)
+            conn.execute("UPDATE sessions SET title=? WHERE id=? AND title IN ('新会话','新对话')", (title, session_id))
+            conn.commit()
+        return ids
 
     def update_message_metadata(self, session_id: str, message_id: int, patch: Dict[str, Any]) -> bool:
         """Merge metadata after post-answer memory maintenance finishes."""
@@ -428,20 +465,48 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             conn.commit()
             return cursor.lastrowid if cursor.rowcount else None
 
-    def read_tool_result(self, session_id, result_id, offset=0, query=""):
+    def read_tool_result(self, session_id, result_id, offset=0, query="", *, card_id="", section="", max_chars=4000):
+        requested_id = int(result_id)
+        seen = set()
         with closing(self._connect()) as conn:
-            row = conn.execute("SELECT tool, result_json FROM session_tool_results WHERE session_id = ? AND id = ?",
-                               (session_id, int(result_id))).fetchone()
-        if not row:
-            return []
+            for _ in range(32):
+                if int(result_id) in seen:
+                    return []
+                seen.add(int(result_id))
+                row = conn.execute("SELECT tool, arguments_json, result_json FROM session_tool_results WHERE session_id = ? AND id = ?",
+                                   (session_id, int(result_id))).fetchone()
+                if not row:
+                    return []
+                if row["tool"] != "read_tool_result":
+                    break
+                args = json.loads(row["arguments_json"])
+                if not args.get("result_id"):
+                    return []
+                card_id = card_id or args.get("card_id", "")
+                section = section or args.get("section", "")
+                result_id = int(args["result_id"])
+            else:
+                return []
         offset = max(0, int(offset))
         content = row["result_json"]
         query = str(query or "").strip()
+        max_chars = max(256, min(int(max_chars), 24000))
+        if row["tool"] in {"wiki_open", "wiki_card"}:
+            from system.conversation.tool_reading import read_wiki_result
+            return read_wiki_result(json.loads(content), int(result_id), row["tool"],
+                                    card_id=str(card_id or ""), section=str(section or ""),
+                                    query=query, offset=offset, max_chars=max_chars)
         matched_offset = content.lower().find(query.lower()) if query else -1
         if matched_offset >= 0:
             offset = max(0, matched_offset - 500)
-        return [{"result_id": int(result_id), "tool": row["tool"], "content": content[offset:offset + 4000],
-                 "offset": offset, "next_offset": offset + 4000 if len(content) > offset + 4000 else None,
+        original = json.loads(content)
+        original_status = original.get("status") if isinstance(original, dict) else None
+        diagnostics = [item for item in original.get("items", []) if item.get("kind") == "operational_error"] if isinstance(original, dict) else []
+        return [{"result_id": int(result_id), "requested_result_id": requested_id,
+                 "tool": row["tool"], "content": content[offset:offset + max_chars],
+                 "original_status": original_status,
+                 **({"kind": "operational_error", "diagnostics": diagnostics} if original_status == "error" or diagnostics else {}),
+                 "offset": offset, "next_offset": offset + max_chars if len(content) > offset + max_chars else None,
                  "total_chars": len(content), "query": query, "match_found": matched_offset >= 0 if query else None}]
 
     def get_history(self, session_id: str, last_n: Optional[int] = 5) -> list:
@@ -530,23 +595,67 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
 
     def list_sessions(self) -> list:
         with closing(self._connect()) as conn:
+            has_runs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_runs'").fetchone()
+            run_activity = "EXISTS(SELECT 1 FROM agent_runs r WHERE r.source_uri='session:'||s.id)" if has_runs else "0"
             rows = conn.execute(
-                """
-                SELECT id, title, created_at, project_id
-                FROM sessions
-                ORDER BY created_at DESC, id DESC
-                """
+                f"""SELECT s.id,s.title,s.created_at,s.project_id,
+                    (SELECT content FROM messages m WHERE m.session_id=s.id AND m.role='user' ORDER BY m.id LIMIT 1) AS first_prompt,
+                    (EXISTS(SELECT 1 FROM messages m WHERE m.session_id=s.id) OR {run_activity}) AS has_activity
+                FROM sessions s ORDER BY s.created_at DESC,s.id DESC"""
             ).fetchall()
 
         return [
             {
                 "id": row["id"],
-                "title": row["title"],
+                "title": (self._title_fallback(row["first_prompt"]) if row["title"] in {None, "", "新会话", "新对话"} and row["first_prompt"] else row["title"]),
+                "has_activity": bool(row["has_activity"]),
                 "created_at": row["created_at"],
                 "project_id": row["project_id"] or DEFAULT_PROJECT_ID,
             }
             for row in rows
         ]
+
+    @staticmethod
+    def _title_fallback(message):
+        return " ".join(str(message or "").split()).strip()[:24] or "新对话"
+
+    def begin_session_title(self, session_id, message):
+        """Reserve the first prompt once, including turns stopped before an answer."""
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT title,settings_json FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if not row:
+                return None
+            settings = self._load_json(row["settings_json"])
+            existing = settings.get("auto_title")
+            if existing:
+                return existing if existing.get("pending") and row["title"] == existing.get("fallback") else None
+            if row["title"] not in {None, "", "新会话", "新对话"}:
+                return None
+            first = conn.execute("SELECT content FROM messages WHERE session_id=? AND role='user' ORDER BY id LIMIT 1", (session_id,)).fetchone()
+            source = str(first[0] if first else message)
+            fallback = self._title_fallback(source)
+            request = {"source": source if len(source) <= 8000 else source[:6000] + "\n…\n" + source[-2000:],
+                       "fallback": fallback, "pending": True}
+            settings["auto_title"] = request
+            conn.execute("UPDATE sessions SET title=?,settings_json=? WHERE id=?", (fallback, self._dump_json(settings), session_id))
+            conn.commit()
+            return request
+
+    def finish_session_title(self, session_id, request, title):
+        """A late model response cannot recreate a deleted session or undo a rename."""
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT title,settings_json FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if not row:
+                return False
+            settings = self._load_json(row["settings_json"])
+            if settings.get("auto_title") != request or row["title"] != request["fallback"]:
+                return False
+            settings["auto_title"] = {"pending": False}
+            conn.execute("UPDATE sessions SET title=?,settings_json=? WHERE id=?", (title, self._dump_json(settings), session_id))
+            conn.commit()
+            return True
 
     def update_session_title(self, session_id: str, title: str) -> None:
         with closing(self._connect()) as conn:
@@ -625,9 +734,11 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
         conn.execute(f"DELETE FROM agent_runs WHERE id IN ({placeholders})", run_ids)
         return len(run_ids)
 
+    @serialized_write(lambda self: self.db_path)
     def clear_session(self, session_id: str) -> None:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._detach_session_work(conn, {session_id})
             conn.execute("DELETE FROM context_checkpoints WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_tool_results WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_state WHERE session_id = ?", (session_id,))
@@ -643,6 +754,7 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             self._delete_chat_runtime(conn, session_ids={session_id})
             conn.commit()
 
+    @serialized_write(lambda self: self.db_path)
     def delete_session(self, session_id: str) -> bool:
         """Delete one chat and its runtime trace. Long-term memory is untouched."""
         with closing(self._connect()) as conn:
@@ -654,6 +766,7 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             if not row:
                 conn.rollback()
                 return False
+            self._detach_session_work(conn, {session_id})
             conn.execute("DELETE FROM session_state WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM context_checkpoints WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_tool_results WHERE session_id = ?", (session_id,))
@@ -663,10 +776,13 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             conn.commit()
         return True
 
+    @serialized_write(lambda self: self.db_path)
     def delete_all_sessions(self) -> int:
         """Delete every chat and Wiki-chat trace. Long-term memory is untouched."""
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            ids = {str(row[0]) for row in conn.execute("SELECT id FROM sessions")}
+            self._detach_session_work(conn, ids, all_sessions=True)
             row = conn.execute("SELECT COUNT(*) AS count FROM sessions").fetchone()
             count = int(row["count"] if row else 0)
             conn.execute("DELETE FROM context_checkpoints")
@@ -677,3 +793,22 @@ class SessionStore(UserMemoryStore, ProjectMemoryStore):
             self._delete_chat_runtime(conn, delete_all=True)
             conn.commit()
         return count
+
+    def _detach_session_work(self, conn, session_ids, *, all_sessions=False):
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "ingestion_jobs" in tables:
+            for row in conn.execute("SELECT id,metadata_json,status FROM ingestion_jobs").fetchall():
+                metadata = self._load_json(row["metadata_json"])
+                owners = set(metadata.get("owner_session_ids") or [])
+                if not owners or (not all_sessions and not owners.intersection(session_ids)):
+                    continue
+                remaining = set() if all_sessions else owners - session_ids
+                metadata["owner_session_ids"] = sorted(remaining)
+                conn.execute("UPDATE ingestion_jobs SET metadata_json=? WHERE id=?", (self._dump_json(metadata), row["id"]))
+                if remaining or metadata.get("independent") or row["status"] in {"done", "rejected", "cancelled"}:
+                    continue
+                conn.execute("UPDATE ingestion_jobs SET status='cancelled',stage='cancelled',error='Owning conversation deleted' WHERE id=?", (row["id"],))
+                if "agent_runs" in tables:
+                    conn.execute("""UPDATE agent_runs SET current_state='CANCELLED',status='cancelled',cancel_requested=1,input_closed=1
+                        WHERE ingestion_job_id=? AND current_state NOT IN ('COMPLETED','REJECTED','CANCELLED')""", (row["id"],))
+        self.task_plans.detach_sessions(session_ids, all_sessions=all_sessions, conn=conn)

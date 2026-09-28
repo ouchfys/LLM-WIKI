@@ -1,0 +1,79 @@
+{
+  "date": "2026-09-28",
+  "kind": "archived_case_comparison_not_controlled_benchmark",
+  "latest_paperwiki_run": "526092a8-a25b-43d1-9f6d-2a949bcb3abf",
+  "latest_run_predates_seven_tool_consolidation": true,
+  "price_cny_per_million_tokens": {
+    "cache_hit_input": 0.04,
+    "cache_miss_input": 2,
+    "output_including_reasoning": 8
+  },
+  "runs": {
+    "paperwiki_previous": {
+      "seconds": 1140.845,
+      "model_calls": 55,
+      "tool_calls": 161,
+      "input": 7257375,
+      "cache_hit_input": 6786688,
+      "cache_miss_input": 470687,
+      "output": 210505,
+      "reasoning_in_output": 164762,
+      "cards": 4,
+      "total_tokens": 7467880,
+      "estimated_cny": 2.89688152
+    },
+    "paperwiki_latest": {
+      "seconds": 559.006,
+      "model_calls": 24,
+      "tool_calls": 138,
+      "input": 2648736,
+      "cache_hit_input": 2453888,
+      "cache_miss_input": 194848,
+      "output": 77070,
+      "reasoning_in_output": 48250,
+      "cards": 4,
+      "total_tokens": 2725806,
+      "estimated_cny": 1.10441152
+    },
+    "workbuddy": {
+      "seconds": 1656.455,
+      "model_calls": 110,
+      "tool_calls": 132,
+      "input": 18187080,
+      "cache_hit_input": 17994624,
+      "cache_miss_input": 192456,
+      "output": 82857,
+      "reasoning_in_output": 28470,
+      "cards": 4,
+      "total_tokens": 18269937,
+      "estimated_cny": 1.76755296
+    }
+  },
+  "manual_spotcheck_scores": {
+    "rubric": {
+      "facts": 40,
+      "coverage": 30,
+      "readability": 20,
+      "traceability": 10
+    },
+    "paperwiki": {
+      "pi": 87,
+      "dsh": 82,
+      "codex": 77,
+      "hermes": 74
+    },
+    "workbuddy": {
+      "pi": 90,
+      "dsh": 86,
+      "codex": 82,
+      "hermes": 82
+    }
+  },
+  "limitations": [
+    "WorkBuddy was not rerun.",
+    "System prompts, tools and actual service configurations differ.",
+    "Pi and Hermes repository commits differ.",
+    "Scores are subjective key-fact spot checks, not measured factual accuracy.",
+    "Prices are a historical common accounting basis, not current prices or actual platform bills."
+  ]
+}

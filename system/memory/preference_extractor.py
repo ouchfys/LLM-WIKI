@@ -92,7 +92,7 @@ class PreferenceExtractor:
     def __init__(self, llm):
         """
         Args:
-            llm: SiliconFlowChat 实例，需要有 invoke(prompt) 方法
+            llm: DeepSeekChat 实例，需要有 invoke(prompt) 方法
         """
         self.llm = llm
 

@@ -3,16 +3,16 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any
 
 
 class IngestionJobStore:
     def __init__(self, db_path: str = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        path = Path(db_path) if db_path else repo_root / "sessions.db"
+        path = resolve_database_path(db_path)
         self.db_path = str(path)
         self._init_db()
 
@@ -70,10 +70,12 @@ class IngestionJobStore:
         source_uri: str,
         stage: str = "queued",
         metadata: dict[str, Any] | None = None,
+        job_id: str = "",
+        connection=None,
     ) -> dict[str, Any]:
-        job_id = str(uuid.uuid4())
+        job_id = job_id or str(uuid.uuid4())
         now = self.now_iso()
-        with closing(self._connect()) as conn:
+        with (nullcontext(connection) if connection is not None else closing(self._connect())) as conn:
             conn.execute(
                 """
                 INSERT INTO ingestion_jobs
@@ -82,8 +84,38 @@ class IngestionJobStore:
                 """,
                 (job_id, source_type, source_uri, stage, self.dump_json(metadata or {}), now, now),
             )
-            conn.commit()
+            if connection is None:
+                conn.commit()
+        if connection is not None:
+            return self._row(conn.execute("SELECT * FROM ingestion_jobs WHERE id=?", (job_id,)).fetchone())
         return self.get_job(job_id) or {}
+
+    @staticmethod
+    def validate_owner(conn, session_id, run_id, call_id):
+        if not session_id:
+            return
+        row = conn.execute("""SELECT 1 FROM sessions s JOIN agent_runs r ON r.id=?
+            JOIN chat_tool_calls c ON c.id=? AND c.run_id=r.id
+            WHERE s.id=? AND r.source_uri=? AND r.current_state='CHAT_RUNNING'
+            AND r.cancel_requested=0 AND c.status='started' AND c.tool='arxiv_import_paper'""",
+            (run_id, call_id, session_id, f"session:{session_id}")).fetchone()
+        if not row:
+            raise ValueError("Owning chat is no longer active")
+
+    @classmethod
+    def attach_owner(cls, conn, job_id, session_id, run_id, call_id):
+        if not session_id:
+            return
+        cls.validate_owner(conn, session_id, run_id, call_id)
+        row = conn.execute("SELECT metadata_json FROM ingestion_jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            return
+        metadata = cls.load_json(row[0])
+        if "owner_session_ids" not in metadata:
+            metadata["independent"] = True  # Legacy/UI-created work is not chat-owned.
+        metadata["owner_session_ids"] = list(dict.fromkeys([*(metadata.get("owner_session_ids") or []), session_id]))
+        conn.execute("UPDATE ingestion_jobs SET metadata_json=? WHERE id=?", (cls.dump_json(metadata), job_id))
+        conn.execute("UPDATE chat_tool_calls SET job_id=? WHERE id=? AND run_id=?", (job_id, call_id, run_id))
 
     def update_job(
         self,
@@ -130,7 +162,8 @@ class IngestionJobStore:
         params.append(self.now_iso())
         params.append(job_id)
         with closing(self._connect()) as conn:
-            conn.execute(f"UPDATE ingestion_jobs SET {', '.join(fields)} WHERE id = ?", params)
+            # Late pipeline callbacks cannot resurrect a cancelled job.
+            conn.execute(f"UPDATE ingestion_jobs SET {', '.join(fields)} WHERE id = ? AND status<>'cancelled'", params)
             conn.commit()
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
@@ -139,10 +172,14 @@ class IngestionJobStore:
         return self._row(row) if row else None
 
     def merge_metadata(self, job_id: str, values: dict[str, Any]) -> None:
-        current = self.get_job(job_id) or {}
-        metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
-        metadata.update(values or {})
-        self.update_job(job_id, metadata=metadata)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT metadata_json FROM ingestion_jobs WHERE id=? AND status<>'cancelled'", (job_id,)).fetchone()
+            if row:
+                metadata = self.load_json(row[0])
+                metadata.update(values or {})
+                conn.execute("UPDATE ingestion_jobs SET metadata_json=? WHERE id=?", (self.dump_json(metadata), job_id))
+            conn.commit()
 
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         with closing(self._connect()) as conn:

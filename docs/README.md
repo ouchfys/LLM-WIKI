@@ -1,10 +1,17 @@
 # 文档索引
 
-- [知识库、记忆与上下文管理](CONTEXT_MANAGEMENT.md)
-- [论文解析路由](PARSER_ROUTING.md)
-- [arXiv MCP](design/ARXIV_MCP.md)
-- [多来源知识维护与长探索任务 Spec](design/RESEARCH_KNOWLEDGE_LIFECYCLE_SPEC.md)
-- [Verifier 140 条评测口径](audits/EVIDENCE_WIKI_SILVER_BENCHMARK_2026-08-13.md)
-- [Wiki Chat 30 题结果](../test/evaluation/runs/current30_full_answer_check/summary.md)
+- [面试讲解与当前能力总览](../README.md)
+- [四仓库实验与 WorkBuddy 公开对照摘要](audits/COMPARISON_PUBLIC_2026-09-28.md)
 
-根目录 [README](../README.md) 是唯一的项目定位与能力清单。这里仅保留仍与当前代码一致的专项说明。
+- [论文解析路由](PARSER_ROUTING.md)
+- [arXiv 论文服务](design/ARXIV_SERVICE.md)
+- [Tool 与 MCP 的边界：arXiv 入口精简案例](design/TOOL_MCP_BOUNDARY_CASE.md)
+- [独立测试项目目录](design/LOCAL_TEST_WORKSPACE.md)
+- [多来源知识维护与长探索任务 Spec](design/RESEARCH_KNOWLEDGE_LIFECYCLE_SPEC.md)
+- [当前测试与评测说明](../test/evaluation/README.md)
+- [四仓库记忆研究失败 Trace 复盘（2026-09-26）](audits/TRACE_FAILURE_REPOSITORY_MEMORY_2026-09-26.md)
+
+根目录 [README](../README.md) 是当前项目定位与能力清单。设计文档可能描述目标方案，历史复盘描述当时实现；二者不应当作当前默认能力。
+
+- [2026-09-27 研究提前结束与 thinking 修复](audits/TRACE_FAILURE_REPOSITORY_MEMORY_2026-09-27.md)
+- [2026-09-27 提交评审截断与四仓库只交付两篇](audits/TRACE_FAILURE_REPOSITORY_MEMORY_2026-09-27_REVIEW_BUDGET.md)

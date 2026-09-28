@@ -23,6 +23,7 @@ def run_paper_pipeline(
     llm=None,
     review_llm=None,
     merge_llm=None,
+    claim_embedder=None,
     approval_mode: str = "auto",
     stage_callback=None,
 ) -> PaperPipelineResult:
@@ -63,7 +64,7 @@ def run_paper_pipeline(
         stage_callback("COMPILING_PROPOSAL", {"approved_candidates": sum(report.status == "approved" for report in reports.values())})
     merger = PaperMergeAgent(
         pipeline_store=pipeline_store, wiki_store=wiki_store, llm=merge_llm,
-        approval_mode=approval_mode,
+        approval_mode=approval_mode, claim_embedder=claim_embedder,
     )
     merge_result = merger.merge(
         packet=packet,

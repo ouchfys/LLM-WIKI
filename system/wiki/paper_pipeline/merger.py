@@ -15,6 +15,7 @@ from system.wiki.wiki_builder import sanitize_wiki_text
 from system.wiki.wiki_store import WikiStore
 from system.wiki.hierarchical_compiler import HierarchicalWikiCompiler
 from system.wiki.claim_relation_resolver import ClaimRelationResolver
+from system.wiki.claim_candidate_retriever import ClaimCandidateRetriever
 from system.wiki.revision import WikiRevisionManager
 
 ALLOWED_ACTIONS = {"create_new", "update_existing", "link_only", "skip_duplicate", "needs_human_review"}
@@ -57,6 +58,17 @@ Return this exact shape:
   "reason": "",
   "confidence": 0.0
 }}
+
+Input:
+{payload}
+"""
+
+READING_GUIDE_MERGE_PROMPT = """\
+Write one clear, 250-450 Chinese character reading guide for this reusable Wiki topic.
+Use only the supplied existing and incoming grounded material. Define specialist terms
+at first mention, give one clearly marked intuitive example, and state limitations.
+Synthesize the sources without presenting one paper's result as a universal fact.
+Use 2-4 ### headings. Return JSON only: {{"reading_guide": "..."}}.
 
 Input:
 {payload}
@@ -165,7 +177,14 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 
 class PaperMergeAgent:
-    def __init__(self, pipeline_store: PaperWikiPipelineStore, wiki_store: WikiStore, llm=None, approval_mode: str = "auto"):
+    def __init__(
+        self,
+        pipeline_store: PaperWikiPipelineStore,
+        wiki_store: WikiStore,
+        llm=None,
+        approval_mode: str = "auto",
+        claim_embedder=None,
+    ):
         self.pipeline_store = pipeline_store
         self.wiki_store = wiki_store
         self.markdown_vault = MarkdownVault()
@@ -173,7 +192,12 @@ class PaperMergeAgent:
         self.llm = llm
         self.llm_calls = 0
         self.compiler = HierarchicalWikiCompiler()
-        self.relation_resolver = ClaimRelationResolver(llm=llm)
+        self.relation_resolver = ClaimRelationResolver(
+            llm=llm,
+            retriever=ClaimCandidateRetriever(
+                wiki_store, embedder=claim_embedder
+            ),
+        )
         self.approval_mode = approval_mode if approval_mode in {"auto", "manual", "risk"} else "risk"
         self.proposals: list[dict[str, Any]] = []
 
@@ -364,7 +388,7 @@ class PaperMergeAgent:
             title=candidate.title,
             page_type="PaperPage",
             content_json=content,
-            summary=summary[:360],
+            summary=summary,
             source_level="primary",
             source_urls=source_urls,
             related_topics=related_topics,
@@ -403,7 +427,7 @@ class PaperMergeAgent:
             title=candidate.title,
             page_type=candidate.page_type,
             content_json=content,
-            summary=candidate.summary[:280],
+            summary=candidate.summary,
             source_level=candidate.source_level or "primary",
             source_urls=packet.source_urls[:1],
             related_topics=candidate.related_topics,
@@ -430,7 +454,7 @@ class PaperMergeAgent:
             card_id=card_id,
             title=existing.get("title") or candidate.title,
             page_type=existing.get("page_type") or candidate.page_type,
-            summary=summary[:360],
+            summary=summary,
             content_json=content,
             source_level=existing.get("source_level") or candidate.source_level or "primary",
             source_urls=source_urls,
@@ -456,6 +480,14 @@ class PaperMergeAgent:
         existing_card: dict[str, Any] | None = None,
     ) -> str:
         """Verify a page proposal, commit its revision, then rebuild caches."""
+        if self.approval_mode == "auto" and any(
+            bool(change.get("requires_review"))
+            for change in content_json.get("affected_claims") or []
+            if isinstance(change, dict)
+        ):
+            # Auto mode must not bypass a conflict or an unavailable relation
+            # check. Keep this proposal and its side effects behind approval.
+            self.approval_mode = "risk"
         manager = WikiRevisionManager(
             store=self.pipeline_store,
             vault=self.markdown_vault,
@@ -502,6 +534,9 @@ class PaperMergeAgent:
             content["key_takeaways"] = _unique_list(_as_list(content.get("key_takeaways")) + _as_list(incoming.get("key_takeaways")))
         if plan and plan.field_updates:
             content = _apply_field_updates(content, plan.field_updates)
+        content["reading_guide"] = self._merged_reading_guide(
+            existing=existing, incoming=incoming, merged=content, packet=packet,
+        )
         content["aliases"] = _unique_list(_as_list(content.get("aliases")) + [candidate.title] + candidate.aliases)
         if plan:
             content["aliases"] = _unique_list(_as_list(content.get("aliases")) + plan.aliases_to_add)
@@ -542,6 +577,51 @@ class PaperMergeAgent:
             packet=packet,
             relation_decisions=relation_decisions,
         ).content_json
+
+    def _merged_reading_guide(
+        self,
+        *,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+        merged: dict[str, Any],
+        packet: SourcePacket,
+    ) -> str:
+        old_guide = sanitize_wiki_text(str(existing.get("reading_guide") or ""))
+        new_guide = sanitize_wiki_text(str(incoming.get("reading_guide") or ""))
+        if not old_guide:
+            return new_guide
+        if not new_guide:
+            return old_guide
+        source_ids = _as_list(existing.get("source_packet_ids"))
+        if packet.source_id in source_ids or packet.source_id == existing.get("source_packet_id"):
+            return new_guide
+        if not self.llm:
+            return old_guide
+        payload = {
+            "existing_guide": old_guide,
+            "incoming_guide": new_guide,
+            "merged_definition": merged.get("definition", ""),
+            "merged_mechanism": merged.get("mechanism", ""),
+            "merged_findings": merged.get("findings", ""),
+            "merged_limitations": merged.get("limitations", ""),
+            "incoming_source_title": packet.title,
+        }
+        try:
+            self.llm_calls += 1
+            raw = invoke_structured(
+                self.llm,
+                READING_GUIDE_MERGE_PROMPT.format(payload=json.dumps(payload, ensure_ascii=False)),
+                temperature=0.0,
+                max_tokens=1600,
+            )
+        except Exception as exc:
+            print(f"[paper_pipeline.merger] reading guide merge failed: {exc}")
+            return old_guide
+        parsed = parse_json_object(raw)
+        guide = sanitize_wiki_text(str((parsed or {}).get("reading_guide") or ""))
+        if len(guide) < 120 or len(guide) > 2400 or "###" not in guide:
+            return old_guide
+        return guide
 
     def _plan_merge(self, packet: SourcePacket, candidate: DistilledCandidate, report: ReviewReport) -> MergePlan:
         fallback = _fallback_merge_plan(report)

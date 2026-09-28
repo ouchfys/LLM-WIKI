@@ -13,6 +13,21 @@
 
       <ChatPrompts :expanded="!messages.some(message => message.role === 'user')" @select="choosePrompt" />
 
+      <aside v-if="!sending && recoverableTasks.length" class="recovery-notice" aria-label="未完成任务">
+        <div v-for="task in recoverableTasks" :key="task.run_id">
+          <strong>{{ task.task_outcome?.status === 'partial' ? '任务部分完成' : '任务已中断' }} · 已保存 {{ task.completed_tools }} 次工具结果</strong>
+          <p>{{ task.message.slice(0, 160) }}</p>
+          <p>可在输入框补充要求后发送，继续已有进度；新要求优先。要开始无关任务，请新建对话。</p>
+          <n-button size="small" :disabled="!task.can_resume || task.unknown_writes.length > 0" @click="send(undefined, false, task.run_id)">继续任务</n-button>
+          <div v-for="call in task.unknown_writes" :key="call.id" class="recovery-write">
+            <p>这次 {{ call.tool }} 操作的结果尚未确认。请先核对实际文件或任务状态，再选择；系统不会直接重复执行。</p>
+            <details><summary>查看调用参数</summary><pre>{{ JSON.stringify(call.arguments, null, 2) }}</pre></details>
+            <n-button size="small" @click="resolveRecoveryWrite(task.run_id, call.id, 'confirmed_done')">已核实完成，跳过重做</n-button>
+            <n-button size="small" @click="resolveRecoveryWrite(task.run_id, call.id, 'retry_allowed')">已核实可安全重试</n-button>
+          </div>
+        </div>
+      </aside>
+
       <div ref="threadRef" class="chat-thread">
         <article
           v-for="message in messages"
@@ -27,64 +42,14 @@
                 <small>{{ message.role === 'assistant' ? 'Wiki Agent' : '问题记录' }}</small>
               </header>
 
-              <section
-                v-if="showProcess(message)"
-                class="agent-process"
-                :class="{ live: isMessageProcessing(message) }"
-                aria-label="检索过程"
-              >
-                <header class="process-head">
-                  <div>
-                    <span class="process-live-dot"></span>
-                    <strong>{{ isMessageProcessing(message) ? runPhaseLabel : '检索过程' }}</strong>
-                  </div>
-                  <span>{{ processSummary(message) }}</span>
-                </header>
-
-                <ol class="process-timeline">
-                  <li
-                    v-for="(step, index) in processSteps(message)"
-                    :key="step.eventId || `${message.id}-${step.tool}-${index}`"
-                    class="process-step"
-                    :class="step.status"
-                  >
-                    <div class="process-marker">
-                      <span>{{ step.status === 'done' ? '✓' : index + 1 }}</span>
-                    </div>
-                    <div class="process-body">
-                      <header>
-                        <strong>{{ processStepTitle(step.tool) }}</strong>
-                        <span>{{ processStatusLabel(step.status) }}</span>
-                      </header>
-                      <p>{{ processStepDetail(step) }}</p>
-
-                      <div v-if="step.items?.length" class="process-results">
-                        <template v-for="(item, itemIndex) in step.items" :key="item.card_id || item.url || `${step.eventId}-${itemIndex}`">
-                          <button
-                            v-if="item.card_id"
-                            type="button"
-                            class="process-card-result"
-                            @click="openProcessCard(item)"
-                          >
-                            <span>{{ item.page_type || 'WikiPage' }}</span>
-                            <strong>{{ item.title }}</strong>
-                            <small v-if="item.score !== undefined">匹配分 {{ formatScore(item.score) }} · {{ formatMatchReason(item.match_reason) }}</small>
-                            <small v-else>{{ item.summary || '已读取页面正文与关联关系' }}</small>
-                            <small v-if="item.matched_sections?.length">
-                              命中小节：{{ item.matched_sections.map(section => section.section).filter(Boolean).join(' / ') }}
-                            </small>
-                          </button>
-
-                          <div v-else class="process-generic-result">
-                            <strong>{{ item.title || item.url || '工具结果' }}</strong>
-                            <small>{{ item.snippet || item.summary || item.text || item.section || '' }}</small>
-                          </div>
-                        </template>
-                      </div>
-                    </div>
-                  </li>
-                </ol>
-              </section>
+              <AgentActivity
+                v-if="message.role === 'assistant'"
+                :message="message"
+                :loading="isMessageProcessing(message)"
+                :elapsed-seconds="elapsedSeconds"
+                :phase-label="runPhaseLabel"
+                @open-card="openProcessCard"
+              />
 
               <details v-if="message.trace?.context_budget?.input_tokens_estimate" class="context-usage">
                 <summary>会话上下文 · 约 {{ Math.round((message.trace.context_budget.input_tokens_estimate || 0) / 1000) }}K / {{ Math.round((message.trace.context_budget.window || 0) / 1000) }}K Token</summary>
@@ -95,21 +60,9 @@
               <div class="message-text" v-html="renderMarkdown(message.content)"></div>
 
               <div
-                v-if="message.citations?.length || message.resources?.length || message.profileUpdates?.length"
+                v-if="message.resources?.length || message.profileUpdates?.length"
                 class="evidence-rail"
               >
-                <section v-if="message.citations?.length" class="citation-list" aria-label="引用卡片">
-                  <header>引用卡片</header>
-                  <button
-                    v-for="citation in message.citations"
-                    :key="citation.card_id"
-                    type="button"
-                    @click="openCitation(citation)"
-                  >
-                    {{ citation.title }}
-                  </button>
-                </section>
-
                 <section v-if="message.resources?.length" class="resource-list" aria-label="延伸资源">
                   <header>延伸资源</header>
                   <a
@@ -165,6 +118,15 @@
           @keydown="handleComposeKeydown"
         />
         <div class="composer-actions">
+          <label class="composer-ghost">
+            思考强度
+            <select v-model="thinkingEffort" :disabled="sending" aria-label="思考强度" @change="saveThinkingEffort">
+              <option value="none">关闭</option>
+              <option value="low">低</option>
+              <option value="high">高</option>
+              <option value="max">最高</option>
+            </select>
+          </label>
           <button type="button" class="composer-ghost" @click="draft = ''">清空输入</button>
           <n-button v-if="sending" type="primary" attr-type="button"
             :disabled="!activeRunId || stopRequested || runPhase === 'saving'" @click="stopCurrentRun">
@@ -197,10 +159,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import axios from 'axios'
 import { NButton, NInput, NModal, NTag, type InputInst } from 'naive-ui'
 import { api, apiErrorMessage } from '../api'
 import ChatPrompts from '../components/ChatPrompts.vue'
+import AgentActivity from '../components/AgentActivity.vue'
+import { mergeTimelineEvent } from '../lib/traceTimeline'
 import { consumeEventStream } from '../lib/chatStream'
+import { selectContinuation, type RecoverableTask } from '../lib/chatContinuation'
+import { createRequestGuard } from '../lib/requestGuard'
 import type { Citation, ToolEventItem, ToolEvent, TraceCard, ChatMessage, SlashCommand, RunInput, SseChunk, ChatSession, ChatHistory, StoredChatMessage, RunInputList, AgentTrace } from '../types/chat'
 
 const route = useRoute()
@@ -211,29 +178,57 @@ const historyIndex = ref(-1)
 const SESSION_STORAGE_KEY = 'wiki_chat_session_id'
 
 const draft = ref('')
+const THINKING_STORAGE_KEY = 'wiki_thinking_effort'
+const savedThinkingEffort = localStorage.getItem(THINKING_STORAGE_KEY)
+const thinkingEffort = ref(['none', 'low', 'high', 'max'].includes(savedThinkingEffort || '') ? savedThinkingEffort! : 'high')
+function saveThinkingEffort() {
+  localStorage.setItem(THINKING_STORAGE_KEY, thinkingEffort.value)
+}
 const sending = ref(false)
 const activeRunId = ref('')
 const activeAssistantId = ref<number | null>(null)
 const stopRequested = ref(false)
 const runPhase = ref('')
 const controlNotice = ref('')
+const recoverableTasks = ref<RecoverableTask[]>([])
+
+async function refreshRecovery(sessionId = currentSessionId.value) {
+  if (!sessionId) return
+  try {
+    const { data } = await api.get<{ items: RecoverableTask[] }>(`/wiki/sessions/${sessionId}/recovery`)
+    if (sessionId === currentSessionId.value) recoverableTasks.value = data.items || []
+  } catch { /* The next history load retries after a disconnected backend. */ }
+}
+
+async function resolveRecoveryWrite(runId: string, callId: string, decision: string) {
+  try {
+    await api.post(`/wiki/sessions/${currentSessionId.value}/recovery/${runId}/${callId}`, { decision })
+    await refreshRecovery()
+  } catch (error) { controlNotice.value = apiErrorMessage(error, '状态核对未保存，请重试。') }
+}
 const inboxItems = ref<RunInput[]>([])
 const queuePosting = ref(false)
 const elapsedSeconds = ref(0)
 let startedAt = 0
 let timer: ReturnType<typeof setInterval> | undefined
+let recoveryTimer: ReturnType<typeof setInterval> | undefined
+let activityTimer: ReturnType<typeof setInterval> | undefined
+let observingBackground = false
+let activityLoading = false
+let activityCursor = 0
 let streamController: AbortController | null = null
 let turnEpoch = 0
 let draining = false
 const consumedInputIds = new Set<string>()
 const automaticQueueIds = new Set<string>()
-let turnOutcome: 'completed' | 'cancelled' | 'failed' = 'completed'
+let turnOutcome: 'completed' | 'cancelled' | 'paused' | 'failed' = 'completed'
 const visibleQueue = computed(() => inboxItems.value.filter(item => ['pending', 'ready', 'blocked', 'running', 'failed'].includes(item.status)))
 const runPhaseLabel = computed(() => stopRequested.value ? '正在请求停止' : ({
-  starting: '正在连接', searching: '正在检索资料', answering: '正在生成回答',
+  starting: '正在连接', thinking: '正在等待模型', searching: '正在执行工具', answering: '正在生成回答',
   saving: '正在保存结果（此步骤不可中断）', command: '正在执行知识/上下文命令（此步骤不可中断）'
 } as Record<string, string>)[runPhase.value] || '正在处理')
 const currentSessionId = ref('')
+const historyRequests = createRequestGuard()
 const currentSessionTitle = ref('新对话')
 const activeCitation = ref<Citation | null>(null)
 const rawModalVisible = ref(false)
@@ -268,33 +263,51 @@ function scrollThreadToBottom() {
 }
 
 async function createSession(syncRoute = true) {
+  const ticket = historyRequests.begin()
   await abandonActiveStream()
-  const { data } = await api.post<ChatSession>('/wiki/sessions', { title: '新对话' })
-  currentSessionId.value = data.id
-  currentSessionTitle.value = data.title || '新对话'
-  localStorage.setItem(SESSION_STORAGE_KEY, data.id)
+  if (!historyRequests.isCurrent(ticket)) return
+  // An empty composer is a local draft, not a persisted conversation.
+  currentSessionId.value = ''
+  currentSessionTitle.value = '新对话'
+  localStorage.removeItem(SESSION_STORAGE_KEY)
   messages.value = [...initialMessages]
+  draft.value = typeof route.query.ask === 'string' ? route.query.ask : ''
+  recoverableTasks.value = []
   activeCitation.value = null
   inboxItems.value = []
   scrollThreadToBottom()
   if (syncRoute) {
     await router.replace({
       path: '/',
-      query: { session: data.id }
+      query: route.query.ask ? { ask: route.query.ask } : {}
     })
   }
 }
 
 async function loadSessionHistory(sessionId: string) {
+  const ticket = historyRequests.begin()
   await abandonActiveStream()
-  const { data } = await api.get<ChatHistory>(`/wiki/sessions/${sessionId}/messages`)
+  const response = await api.get<ChatHistory>(`/wiki/sessions/${sessionId}/messages`).catch(error => {
+    if (!historyRequests.isCurrent(ticket)) return null
+    throw error
+  })
+  if (!response || !historyRequests.isCurrent(ticket)) return false
+  const { data } = response
   currentSessionId.value = sessionId
   currentSessionTitle.value = data.session?.title || '对话'
   messages.value = data.items?.length ? normalizeMessages(data.items) : [...initialMessages]
   localStorage.setItem(SESSION_STORAGE_KEY, sessionId)
-  const queued = await api.get<RunInputList>('/agent-runs/inbox', { params: { session_id: sessionId } })
+  const queued = await api.get<RunInputList>('/agent-runs/inbox', { params: { session_id: sessionId } }).catch(error => {
+    if (!historyRequests.isCurrent(ticket)) return null
+    throw error
+  })
+  if (!queued || !historyRequests.isCurrent(ticket)) return false
   inboxItems.value = queued.data.items || []
+  await refreshRecovery(sessionId)
+  if (!historyRequests.isCurrent(ticket)) return false
+  await refreshActivity()
   scrollThreadToBottom()
+  return historyRequests.isCurrent(ticket)
 }
 
 function normalizeMessages(items: StoredChatMessage[]): ChatMessage[] {
@@ -307,8 +320,66 @@ function normalizeMessages(items: StoredChatMessage[]): ChatMessage[] {
     toolEvents: [],
     toolPlan: item.tool_plan || undefined,
     trace: item.trace || undefined,
+    timeline: item.trace?.timeline || item.timeline || [],
     profileUpdates: item.profile_updates || []
   }))
+}
+
+async function refreshActivity() {
+  const sessionId = currentSessionId.value
+  if (!sessionId || activityLoading || (sending.value && !observingBackground)) return
+  const epoch = turnEpoch
+  activityLoading = true
+  try {
+    const { data } = await api.get<{
+      run: { id: string; message: string; created_at: string; input_closed: boolean } | null
+      events: SseChunk[]; after: number
+    }>(`/wiki/sessions/${sessionId}/activity`, {
+      params: { run_id: observingBackground ? activeRunId.value : '', after: activityCursor }
+    })
+    if (epoch !== turnEpoch || sessionId !== currentSessionId.value || (sending.value && !observingBackground)) return
+    if (!data.run) {
+      if (observingBackground) {
+        observingBackground = false
+        // The terminal answer and trace are committed to history by the worker.
+        await loadSessionHistory(sessionId)
+        window.dispatchEvent(new Event('paperwiki:sessions-changed'))
+      }
+      return
+    }
+    if (observingBackground && activeRunId.value !== data.run.id) {
+      await loadSessionHistory(sessionId)
+      return
+    }
+    if (!observingBackground) {
+      observingBackground = true
+      sending.value = true
+      stopRequested.value = false
+      startedAt = Date.parse(data.run.created_at) || Date.now()
+      elapsedSeconds.value = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+      const assistantId = Date.now()
+      messages.value.push({ id: assistantId - 1, role: 'user', content: data.run.message })
+      messages.value.push({ id: assistantId, role: 'assistant', content: '', timeline: [], toolEvents: [] })
+      activeAssistantId.value = assistantId
+      runPhase.value = 'searching'
+      controlNotice.value = '任务仍在后台执行，已重新连接进度。'
+    }
+    activeRunId.value = data.run.id
+    if (data.run.input_closed) runPhase.value = 'saving'
+    activityCursor = data.after
+    const assistant = messages.value.find(item => item.id === activeAssistantId.value)
+    if (assistant) for (const event of data.events) handleStreamChunk(event, assistant)
+  } catch (error) {
+    if (epoch !== turnEpoch) return
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      await createSession(true)
+      window.dispatchEvent(new Event('paperwiki:sessions-changed'))
+    } else {
+      controlNotice.value = '暂时无法同步后台进度，正在重试；连接异常不代表任务已停止。'
+    }
+  } finally {
+    activityLoading = false
+  }
 }
 
 async function ensureSession() {
@@ -321,17 +392,18 @@ async function ensureSession() {
   }
 
   try {
-    await loadSessionHistory(saved)
+    if (!await loadSessionHistory(saved)) return
     if (routeSession !== saved) {
       await router.replace({ path: '/', query: { session: saved } })
     }
-  } catch {
-    await createSession(true)
+  } catch (error) {
+    if (route.query.new || (route.query.session && route.query.session !== saved)) return
+    if (typeof error === 'object' && error && 'response' in error && (error as { response?: { status?: number } }).response?.status === 404) {
+      await createSession(true)
+    } else {
+      controlNotice.value = '会话加载失败，请刷新重试。'
+    }
   }
-}
-
-function openCitation(citation: Citation) {
-  activeCitation.value = citation
 }
 
 function openTraceCard(card: TraceCard) {
@@ -350,157 +422,6 @@ function isMessageProcessing(message: ChatMessage) {
     && message.role === 'assistant'
     && activeAssistantId.value === message.id
   )
-}
-
-function processSteps(message: ChatMessage): ToolEvent[] {
-  if (message.toolEvents?.length) return message.toolEvents
-
-  const observations = message.trace?.tool_observations || []
-  if (observations.length) {
-    return observations.map((item, index) => ({
-      eventId: `${item.tool}:${item.query || index}`,
-      tool: item.tool,
-      label: item.tool,
-      status: item.status || 'done',
-      detail: item.summary,
-      query: item.query,
-      items: (item.items || []).slice(0, 4)
-    }))
-  }
-
-  if (isMessageProcessing(message)) {
-    return [{
-      eventId: `planning:${message.id}`,
-      tool: 'planning',
-      label: 'Planning',
-      status: 'running',
-      detail: '正在分析问题并选择可审计的检索工具。',
-      items: []
-    }]
-  }
-
-  return (message.toolPlan?.tools || []).map((tool, index) => ({
-    eventId: `${tool.name}:${tool.query || index}`,
-    tool: tool.name,
-    label: tool.name,
-    status: 'done',
-    detail: tool.reason,
-    query: tool.query,
-    items: []
-  }))
-}
-
-function showProcess(message: ChatMessage) {
-  return message.role === 'assistant' && (isMessageProcessing(message) || processSteps(message).length > 0)
-}
-
-function processSummary(message: ChatMessage) {
-  const steps = processSteps(message)
-  if (isMessageProcessing(message)) {
-    const active = steps.find((step) => step.status === 'running')
-    if (active) return processStepTitle(active.tool)
-    return message.content.trim() ? '正在生成回答' : '正在规划下一步'
-  }
-  const cardCount = message.trace?.diagnostics?.wiki_page_count ?? message.trace?.diagnostics?.wiki_card_count ?? message.trace?.retrieved_cards?.length ?? 0
-  const runtime = message.trace?.runtime
-  const parts = [`${steps.length} 步`]
-  if (cardCount) parts.push(`${cardCount} 个 Wiki 页面`)
-  if (runtime?.wall_time_ms) parts.push(formatDuration(runtime.wall_time_ms))
-  if (runtime?.token_usage?.total_tokens) {
-    const prefix = runtime.token_usage.contains_estimates ? '约 ' : ''
-    parts.push(`${prefix}${formatTokenCount(runtime.token_usage.total_tokens)} tokens`)
-  }
-  if (runtime?.retry_count) parts.push(`${runtime.retry_count} 次重试`)
-  if ((runtime?.model_failures || 0) + (runtime?.tool_failures || 0) > 0) {
-    parts.push(`${(runtime?.model_failures || 0) + (runtime?.tool_failures || 0)} 次失败`)
-  }
-  return parts.join(' · ')
-}
-
-function formatDuration(value: number) {
-  if (value < 1000) return `${Math.round(value)}ms`
-  return `${(value / 1000).toFixed(1)}s`
-}
-
-function formatTokenCount(value: number) {
-  if (value < 1000) return String(value)
-  return `${(value / 1000).toFixed(1)}k`
-}
-
-function processStepTitle(tool: string) {
-  const labels: Record<string, string> = {
-    planning: '规划检索路径',
-    context: '解析对话上下文',
-    wiki_search: '搜索 Wiki',
-    wiki_open: '阅读 Wiki 页面',
-    wiki_card: '阅读 Wiki 页面',
-    evidence_lookup: '核验原文依据',
-    web_search: '搜索外部资料',
-    web_fetch: '读取网页原文',
-    resource_recommend: '查找延伸资源',
-    conversation_context: '选择相关对话',
-    wiki_write: '沉淀 Wiki 知识',
-    wiki_validate: '校验 Wiki 结构',
-    context_compact: '整理较早对话',
-    project_purpose: '维护项目目标',
-    search_session_history: '搜索会话原文',
-    read_session_messages: '读取会话原文',
-    search_project_history: '搜索项目历史',
-    read_project_messages: '读取项目历史原文',
-    read_tool_result: '读取工具记录'
-  }
-  return labels[tool] || tool
-}
-
-function processStatusLabel(status: ToolEvent['status']) {
-  return ({ running: '进行中', done: '已完成', error: '失败' } as Record<string, string>)[status] || status
-}
-
-function extractCount(detail: string | undefined) {
-  const match = String(detail || '').match(/\d+/)
-  return match ? Number(match[0]) : 0
-}
-
-function processStepDetail(step: ToolEvent) {
-  if (step.status === 'running') {
-    const query = step.query ? `“${step.query}”` : '当前问题'
-    const runningCopy: Record<string, string> = {
-      planning: '正在分析问题并选择可审计的检索工具。',
-      context: '正在结合最近对话补全当前问题。',
-      wiki_search: `正在用 ${query} 匹配标题、别名与 Wiki 索引。`,
-      wiki_open: '正在打开高相关页面，只读取面向用户的 Markdown 正文。',
-      wiki_card: '正在打开高相关页面，读取 Markdown 正文与页面关系。',
-      evidence_lookup: '正在按需回查来源段落，核验当前关键结论。',
-      web_search: `正在搜索 ${query} 的外部信息。`,
-      web_fetch: '正在读取候选网页的正文段落。',
-      resource_recommend: '正在筛选相关学习资料。'
-    }
-    return runningCopy[step.tool] || step.detail || '正在执行工具。'
-  }
-
-  const count = extractCount(step.detail)
-  if (step.tool === 'wiki_search') return `找到 ${count || step.items?.length || 0} 个候选页面，并保留匹配分与命中原因。`
-  if (step.tool === 'wiki_open') return `已读取 ${count || step.items?.length || 0} 个高相关 Wiki 页面。`
-  if (step.tool === 'wiki_card') return `已读取 ${count || step.items?.length || 0} 张高相关 Wiki 页面。`
-  if (step.tool === 'evidence_lookup') return step.detail || '已按需回查原文段落。'
-  if (step.tool === 'context') return '已结合最近对话解析追问指代。'
-  if (step.tool === 'conversation_context') return step.detail || '已按用户要求选择相关对话。'
-  if (step.tool === 'wiki_write') return step.detail || '已生成对话洞见并写入 Wiki。'
-  if (step.tool === 'wiki_validate') return step.detail || '已校验 Wiki 结构并更新索引。'
-  if (step.tool === 'context_compact') return step.detail || '已保存上下文摘要，原始对话仍然保留。'
-  return step.detail || (step.status === 'error' ? '工具执行失败。' : '工具执行完成。')
-}
-
-function formatScore(score: number | undefined) {
-  if (score === undefined || Number.isNaN(Number(score))) return '—'
-  return Number(score).toFixed(1)
-}
-
-function formatMatchReason(reason: string | undefined) {
-  if (!reason) return '语义匹配'
-  return reason
-    .replace('page_fts', '页面全文命中')
-    .replace(/term_overlap:(\d+)\/(\d+)/, '关键词重合 $1/$2')
 }
 
 function openProcessCard(item: ToolEventItem) {
@@ -543,6 +464,11 @@ function handleComposeKeydown(event: KeyboardEvent) {
 }
 
 function handleStreamChunk(chunk: SseChunk, assistantMessage: ChatMessage) {
+  if (chunk.type === 'session_updated') {
+    if (chunk.session_id === currentSessionId.value) currentSessionTitle.value = chunk.title
+    window.dispatchEvent(new Event('paperwiki:sessions-changed'))
+    return
+  }
   if (chunk.type === 'run_started') {
     activeRunId.value = chunk.run_id
     return
@@ -572,14 +498,16 @@ function handleStreamChunk(chunk: SseChunk, assistantMessage: ChatMessage) {
     controlNotice.value = chunk.detail || '正在重新生成回答。'
     return
   }
-  if (chunk.type === 'cancelled') {
-    turnOutcome = 'cancelled'
+  if (chunk.type === 'cancelled' || chunk.type === 'paused') {
+    turnOutcome = chunk.type
     assistantMessage.content = chunk.message
     assistantMessage.citations = []
     assistantMessage.resources = []
     assistantMessage.toolEvents = (assistantMessage.toolEvents || []).filter(item => item.status !== 'running')
     activeCitation.value = null
-    controlNotice.value = '已停止；待执行命令不会自动保存未完成的回答。'
+    controlNotice.value = chunk.type === 'paused'
+      ? '进度已保存，输入补充要求并发送即可继续。'
+      : '已停止；待执行命令不会自动保存未完成的回答。'
     return
   }
   if (chunk.type === 'tool_plan') {
@@ -597,8 +525,15 @@ function handleStreamChunk(chunk: SseChunk, assistantMessage: ChatMessage) {
     return
   }
 
+  if (chunk.type === 'progress') {
+    assistantMessage.timeline = mergeTimelineEvent(assistantMessage.timeline || [], chunk)
+    scrollThreadToBottom()
+    return
+  }
+
   if (chunk.type === 'agent_trace') {
     assistantMessage.trace = chunk.trace
+    if (chunk.trace?.timeline?.length) assistantMessage.timeline = chunk.trace.timeline
     if (!assistantMessage.toolPlan && chunk.trace?.tool_plan) {
       assistantMessage.toolPlan = chunk.trace.tool_plan
     }
@@ -606,6 +541,7 @@ function handleStreamChunk(chunk: SseChunk, assistantMessage: ChatMessage) {
   }
 
   if (chunk.type === 'tool_status') {
+    assistantMessage.timeline = mergeTimelineEvent(assistantMessage.timeline || [], chunk)
     const events = assistantMessage.toolEvents || []
     const eventId = chunk.event_id || `${chunk.tool}:${chunk.query || ''}`
     const index = events.findIndex((item) => item.eventId === eventId)
@@ -617,7 +553,11 @@ function handleStreamChunk(chunk: SseChunk, assistantMessage: ChatMessage) {
       detail: chunk.detail,
       query: chunk.query,
       reason: chunk.reason,
-      items: chunk.items || []
+      items: chunk.items || [],
+      arguments: chunk.arguments,
+      output_preview: chunk.output_preview,
+      duration_ms: chunk.duration_ms,
+      result_id: chunk.result_id
     }
     if (index >= 0) {
       events[index] = nextEvent
@@ -744,8 +684,8 @@ async function stopCurrentRun() {
   if (!runId || stopRequested.value) return
   stopRequested.value = true
   try {
-    await api.post(`/agent-runs/${runId}/cancel`)
-    // Keep reading SSE until the server acknowledges cancellation; a browser
+    await api.post(`/agent-runs/${runId}/pause`)
+    // Keep reading SSE until the server acknowledges the interruption; a browser
     // abort alone cannot stop backend tools or prevent late writes.
   } catch (error) {
     if (epoch !== turnEpoch) return
@@ -755,18 +695,16 @@ async function stopCurrentRun() {
 }
 
 async function abandonActiveStream() {
-  const runId = activeRunId.value
   const controller = streamController
   ++turnEpoch
   automaticQueueIds.clear()
   activeRunId.value = ''
   activeAssistantId.value = null
   sending.value = false
+  observingBackground = false
+  activityCursor = 0
   controlNotice.value = ''
-  if (runId) {
-    // keepalive also covers page navigation. The original session owns this run.
-    void fetch(`/api/agent-runs/${runId}/cancel`, { method: 'POST', keepalive: true }).catch(() => {})
-  }
+  // Detach the view only. Explicit Stop uses the pause endpoint.
   controller?.abort()
   streamController = null
 }
@@ -890,10 +828,10 @@ async function runSlashCommand(command: SlashCommand, assistantMessage: ChatMess
   assistantMessage.toolEvents = []
 }
 
-async function send(queuedText?: string, followup = false): Promise<boolean> {
+async function send(queuedText?: string, followup = false, resumeRunId = ''): Promise<boolean> {
   historyIndex.value = -1
   const text = (queuedText ?? draft.value).trim()
-  if (!text) return false
+  if (!text && !resumeRunId) return false
   if (text.toLowerCase() === '/stop') {
     if (sending.value) await stopCurrentRun()
     else controlNotice.value = '当前没有运行中的任务。'
@@ -905,7 +843,13 @@ async function send(queuedText?: string, followup = false): Promise<boolean> {
     return false
   }
   const command = parseSlashCommand(text)
-  const sessionId = currentSessionId.value
+  const continuation = selectContinuation(recoverableTasks.value, resumeRunId, !command && queuedText === undefined)
+  if (continuation.error) {
+    controlNotice.value = continuation.error
+    return false
+  }
+  resumeRunId = continuation.runId
+  let sessionId = currentSessionId.value
   const epoch = ++turnEpoch
   turnOutcome = 'completed'
   stopRequested.value = false
@@ -915,7 +859,7 @@ async function send(queuedText?: string, followup = false): Promise<boolean> {
   startedAt = Date.now()
   elapsedSeconds.value = 0
 
-  messages.value.push({ id: Date.now(), role: 'user', content: text })
+  if (text) messages.value.push({ id: Date.now(), role: 'user', content: text })
   if (queuedText === undefined) draft.value = ''
   sending.value = true
   activeCitation.value = null
@@ -939,6 +883,19 @@ async function send(queuedText?: string, followup = false): Promise<boolean> {
   scrollThreadToBottom()
 
   try {
+    if (!sessionId) {
+      const { data } = await api.post<ChatSession>('/wiki/sessions', { title: '新对话' })
+      if (epoch !== turnEpoch) {
+        await api.delete(`/wiki/sessions/${data.id}`)
+        return false
+      }
+      sessionId = data.id
+      currentSessionId.value = data.id
+      currentSessionTitle.value = data.title
+      localStorage.setItem(SESSION_STORAGE_KEY, data.id)
+      await router.replace({ path: '/', query: { session: data.id } })
+      if (epoch !== turnEpoch) return false
+    }
     if (command) {
       await runSlashCommand(command, assistantMessage, sessionId)
     } else {
@@ -953,6 +910,8 @@ async function send(queuedText?: string, followup = false): Promise<boolean> {
       body: JSON.stringify({
         message: text,
         session_id: sessionId,
+        resume_run_id: resumeRunId,
+        thinking_effort: thinkingEffort.value,
         stream: true
       })
     })
@@ -975,15 +934,19 @@ async function send(queuedText?: string, followup = false): Promise<boolean> {
     assistantMessage.content = command
       ? `/${command.name} 执行未确认，请检查结果后再重试。`
       : '请求失败，请稍后重试。'
-    if (activeRunId.value) {
-      void api.post(`/agent-runs/${activeRunId.value}/cancel`).catch(() => {})
-    }
   } finally {
     if (epoch === turnEpoch) {
+    // Keep Send disabled until the continuation target has been refreshed.
+    // Otherwise a fast follow-up could create a fresh run after Stop.
+    await refreshRecovery(sessionId)
+    if (epoch !== turnEpoch) return false
     sending.value = false
     activeRunId.value = ''
     activeAssistantId.value = null
     streamController = null
+    if (turnOutcome === 'failed') await loadSessionHistory(sessionId)
+    else await refreshActivity()
+    window.dispatchEvent(new Event('paperwiki:sessions-changed'))
     scrollThreadToBottom()
     }
   }
@@ -1186,7 +1149,13 @@ watch(
   async (value) => {
     const sessionId = typeof value === 'string' ? value : ''
     if (!sessionId || sessionId === currentSessionId.value) return
-    await loadSessionHistory(sessionId)
+    try {
+      await loadSessionHistory(sessionId)
+    } catch {
+      if (route.query.session === sessionId) {
+        controlNotice.value = '会话已删除或暂时无法加载，请新建对话或刷新重试。'
+      }
+    }
   }
 )
 
@@ -1196,18 +1165,31 @@ onMounted(async () => {
   timer = setInterval(() => {
     if (sending.value) elapsedSeconds.value = Math.floor((Date.now() - startedAt) / 1000)
   }, 1000)
-  await ensureSession()
+  recoveryTimer = setInterval(() => {
+    if (!sending.value && document.visibilityState === 'visible') void refreshRecovery()
+  }, 15000)
+  activityTimer = setInterval(() => { void refreshActivity() }, 2000)
+  if (route.query.new) await createSession(true)
+  else await ensureSession()
   applyRoutePrompt()
   scrollThreadToBottom()
 })
 
 onBeforeUnmount(() => {
+  historyRequests.invalidate()
   if (timer) clearInterval(timer)
+  if (recoveryTimer) clearInterval(recoveryTimer)
+  if (activityTimer) clearInterval(activityTimer)
   void abandonActiveStream()
 })
 </script>
 
 <style scoped>
+.recovery-notice { margin: 0 24px 16px; padding: 16px; border: 1px solid var(--border-color, #333); border-radius: 10px; }
+.recovery-notice p { margin: 8px 0; overflow-wrap: anywhere; }
+.recovery-write { margin-top: 12px; }
+.recovery-write pre { max-height: 180px; overflow: auto; white-space: pre-wrap; }
+.recovery-write .n-button { margin: 8px 8px 0 0; }
 .context-usage { margin: 0.5rem 0; color: var(--text-muted, #aaa); font-size: 0.78rem; }
 .context-usage summary { cursor: pointer; }
 .context-usage p { max-width: 64ch; margin: 0.5rem 0; line-height: 1.65; }
@@ -1488,228 +1470,12 @@ onBeforeUnmount(() => {
   text-underline-offset: 3px;
 }
 
-.agent-process {
-  display: grid;
-  gap: 13px;
-  padding: 14px 15px 15px;
-  border: 1px solid rgba(195, 214, 202, 0.16);
-  border-radius: 13px;
-  background:
-    radial-gradient(circle at 0 0, rgba(155, 184, 173, 0.1), transparent 32%),
-    rgba(17, 16, 13, 0.74);
-}
-
-.process-head,
-.process-head > div,
-.process-body > header {
-  display: flex;
-  align-items: center;
-}
-
-.process-head {
-  justify-content: space-between;
-  gap: 14px;
-}
-
-.process-head > div {
-  gap: 9px;
-}
-
-.process-head strong {
-  color: var(--desk-accent-bright);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.process-head > span {
-  color: var(--desk-signal);
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 10px;
-}
-
-.process-live-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #8fa99e;
-  box-shadow: 0 0 0 4px rgba(155, 184, 173, 0.11);
-}
-
-.agent-process.live .process-live-dot {
-  animation: process-pulse 1.35s ease-out infinite;
-}
-
-@keyframes process-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(155, 184, 173, 0.34); }
-  72%, 100% { box-shadow: 0 0 0 8px rgba(155, 184, 173, 0); }
-}
-
-.process-timeline {
-  display: grid;
-  gap: 0;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.process-step {
-  position: relative;
-  display: grid;
-  grid-template-columns: 26px minmax(0, 1fr);
-  gap: 11px;
-  padding: 0 0 15px;
-}
-
-.process-step:last-child {
-  padding-bottom: 0;
-}
-
-.process-step:not(:last-child)::before {
-  content: "";
-  position: absolute;
-  left: 12px;
-  top: 25px;
-  bottom: 2px;
-  width: 1px;
-  background: rgba(195, 214, 202, 0.14);
-}
-
-.process-marker {
-  position: relative;
-  z-index: 1;
-  width: 25px;
-  height: 25px;
-  display: grid;
-  place-items: center;
-  border: 1px solid rgba(195, 214, 202, 0.18);
-  border-radius: 7px;
-  background: #15130f;
-  color: var(--ink-text-muted);
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 9px;
-  font-weight: 750;
-}
-
-.process-step.running .process-marker {
-  border-color: rgba(155, 184, 173, 0.38);
-  color: #d4e3d8;
-}
-
-.process-step.done .process-marker {
-  border-color: rgba(74, 222, 128, 0.2);
-  background: rgba(34, 197, 94, 0.08);
-  color: #acd4b7;
-}
-
-.process-step.error .process-marker {
-  border-color: rgba(244, 63, 94, 0.22);
-  background: rgba(244, 63, 94, 0.08);
-  color: #fda4af;
-}
-
-.process-body {
-  min-width: 0;
-  padding-top: 2px;
-}
-
-.process-body > header {
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.process-body > header strong {
-  color: var(--ink-text);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.process-body > header span {
-  color: var(--ink-text-muted);
-  font-size: 10px;
-}
-
-.process-step.running .process-body > header span {
-  color: #c2d6ca;
-}
-
-.process-body > p {
-  margin: 4px 0 0;
-  color: var(--ink-text-muted);
-  font-size: 11px;
-  line-height: 1.55;
-  text-wrap: pretty;
-}
-
-.process-results {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 7px;
-  margin-top: 9px;
-}
-
-.process-card-result,
-.process-generic-result {
-  min-width: 0;
-  display: grid;
-  gap: 4px;
-  padding: 9px 10px;
-  border: 1px solid rgba(195, 214, 202, 0.11);
-  border-radius: 8px;
-  background: rgba(29, 25, 19, 0.58);
-  color: var(--ink-text);
-  text-align: left;
-}
-
-.process-card-result {
-  cursor: pointer;
-  transition: border-color 180ms ease, background 180ms ease, transform 180ms ease;
-}
-
-.process-card-result:hover {
-  border-color: rgba(195, 214, 202, 0.32);
-  background: rgba(155, 184, 173, 0.1);
-  transform: translateY(-1px);
-}
-
-.process-card-result:focus-visible {
-  outline: 2px solid #c2d6ca;
-  outline-offset: 2px;
-}
-
-.process-card-result > span {
-  color: #a8bdb3;
-  font-size: 9px;
-  font-weight: 750;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.process-card-result > strong,
-.process-generic-result > strong {
-  overflow: hidden;
-  font-size: 11px;
-  line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.process-card-result > small,
-.process-generic-result > small {
-  overflow: hidden;
-  color: var(--ink-text-muted);
-  font-size: 9px;
-  line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .evidence-rail {
   display: grid;
   gap: 10px;
   padding-top: 2px;
 }
 
-.citation-list,
 .resource-list,
 .profile-update-list {
   display: grid;
@@ -1717,32 +1483,11 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
-.citation-list header,
 .resource-list header,
 .profile-update-list header {
   color: var(--ink-text-muted);
   font-size: 11px;
   font-weight: 800;
-}
-
-.citation-list button {
-  min-height: 30px;
-  width: fit-content;
-  max-width: 100%;
-  padding: 0 10px;
-  border: 1px solid rgba(195, 214, 202, 0.18);
-  border-radius: 8px;
-  background: rgba(155, 184, 173, 0.08);
-  color: var(--desk-accent-bright);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.citation-list button:hover {
-  border-color: rgba(195, 214, 202, 0.38);
-  background: rgba(155, 184, 173, 0.14);
 }
 
 .resource-list {

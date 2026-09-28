@@ -6,6 +6,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from system.storage.layout import get_storage_layout, resolve_database_path
 from typing import Any
 
 from system.storage import get_object_storage
@@ -43,9 +44,9 @@ class WikiValidator:
     """Deterministic health checks for the wiki database and storage paths."""
 
     def __init__(self, db_path: str | Path | None = None):
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = get_storage_layout().repo_root
         self.repo_root = repo_root
-        self.db_path = str(Path(db_path) if db_path else repo_root / "sessions.db")
+        self.db_path = str(resolve_database_path(db_path))
         self.storage = get_object_storage()
 
     def validate_all(self, *, check_storage: bool = False) -> dict[str, Any]:

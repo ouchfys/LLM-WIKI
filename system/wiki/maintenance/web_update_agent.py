@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any
 
 from system.storage import get_object_storage, get_storage_layout
@@ -73,8 +74,7 @@ class WebUpdateAgent:
         web_search: WebSearchTool | None = None,
         web_fetch: WebFetchTool | None = None,
     ):
-        repo_root = Path(__file__).resolve().parents[3]
-        self.db_path = str(Path(db_path) if db_path else repo_root / "sessions.db")
+        self.db_path = str(resolve_database_path(db_path))
         self.llm = llm
         self.web_search = web_search or WebSearchTool()
         self.web_fetch = web_fetch or WebFetchTool()

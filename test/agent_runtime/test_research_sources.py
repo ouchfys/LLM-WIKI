@@ -40,6 +40,29 @@ def test_article_with_single_question_marker_is_not_high_confidence_ai_chat(tmp_
     assert store.auto_capture_if_ai_conversation(project_id="project-1", raw_text=text) is None
 
 
+def test_detects_flattened_tabular_ai_answer_without_inferring_provider(tmp_path):
+    store = ResearchSourceStore(str(tmp_path / "sources.db"))
+    text = """截至今天，可以把两种方案概括为不同的 KV cache 量化路线。以下结论仍需回到论文核验，不能直接进入知识库。
+
+维度\t方案 A\t方案 B
+定位\t端到端 serving 系统，包含权重与缓存量化。\t只处理 KV cache 的低比特插件。
+量化粒度\t按通道缩放并配合系统内核。\tKey 按通道，Value 按 token。
+收益口径\t报告端到端吞吐与服务成本。\t报告显存占用与可支持 batch。
+适用场景\t大批量云端推理。\t长上下文且显存受限的推理。
+
+关键限制是两者实验硬件、模型族和指标口径并不相同，因此不能直接横向比较。""" * 4
+
+    detection = store.detect_pasted_content(text)
+
+    assert detection["content_kind"] == "ai_answer"
+    assert detection["provider"] == "unknown"
+    assert detection["confidence"] >= 0.9
+    result = store.auto_capture_if_ai_material(project_id="project-1", raw_text=text)
+    assert result is not None
+    assert result["source"]["source_type"] == "ai_answer"
+    assert result["source"]["origin"] == "unknown"
+
+
 def test_candidate_claims_stay_out_of_accepted_and_preserve_uncertain_dispute(tmp_path):
     store = ResearchSourceStore(str(tmp_path / "sources.db"))
     first = store.capture(
@@ -58,3 +81,20 @@ def test_candidate_claims_stay_out_of_accepted_and_preserve_uncertain_dispute(tm
     assert "# Disputed Claims" in second["snapshot"]["markdown"]
     assert "KIVI uses 2-bit" in second["snapshot"]["markdown"]
     assert "KIVI uses 4-bit" in second["snapshot"]["markdown"]
+
+
+def test_recapture_preserves_user_confirmed_provider(tmp_path):
+    store = ResearchSourceStore(str(tmp_path / "sources.db"))
+    raw = "Assistant: This is a sufficiently long answer about KV cache quantization. " * 4
+    first = store.capture(
+        project_id="project-1", raw_text=raw, source_type="ai_answer", origin="Kimi",
+    )
+
+    repeated = store.capture(
+        project_id="project-1", raw_text=raw, source_type="unknown", origin="unknown",
+    )
+
+    assert first["source"]["origin"] == "Kimi"
+    assert repeated["source"]["origin"] == "Kimi"
+    assert repeated["source"]["source_type"] == "ai_answer"
+    assert repeated["source"]["metadata"]["provider_confirmed_by_user"] is True

@@ -17,6 +17,7 @@ from system.agent_runtime import (
     RunLeaseBusy,
     TraceRecorder,
 )
+from system.agent_runtime.control import RunCancelled
 from system.wiki.ingestion_jobs import IngestionJobStore
 from system.wiki.markdown_reindexer import MarkdownWikiReindexer
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
@@ -58,6 +59,14 @@ def _control_error(exc):
 def cancel_agent_run(run_id: str, wiki: WikiStore = Depends(get_wiki_store)):
     try:
         return AgentRunStore(db_path=wiki.db_path).request_cancel(run_id)
+    except (KeyError, ValueError) as exc:
+        raise _control_error(exc) from exc
+
+
+@router.post("/{run_id}/pause")
+def pause_agent_run(run_id: str, wiki: WikiStore = Depends(get_wiki_store)):
+    try:
+        return AgentRunStore(db_path=wiki.db_path).request_pause(run_id)
     except (KeyError, ValueError) as exc:
         raise _control_error(exc) from exc
 
@@ -146,6 +155,7 @@ def list_approvals(
         items = [
             item for item in items
             if str(item.get("status") or "") == "commit_failed" or item.get("conflict_pairs")
+            or (item.get("decision_context") or {}).get("risk_reasons")
         ]
     return {"items": items}
 
@@ -550,7 +560,9 @@ def _approval_decision_context(
     for claim in affected_claims:
         action = str(claim.get("action") or "verify_claim")
         actions[action] = actions.get(action, 0) + 1
-    reasons = []
+    from backend.api.papers import _proposal_risk_reasons
+
+    reasons = _proposal_risk_reasons(revision)
     if conflict_pairs:
         reasons.append("changes_claim_history")
     if any(
@@ -564,7 +576,7 @@ def _approval_decision_context(
     after_summary = _markdown_section(after_markdown, "Summary")
     return {
         "kind": "update_existing" if revision.get("parent_revision_id") else "create_new",
-        "risk_reasons": reasons,
+        "risk_reasons": list(dict.fromkeys(reasons)),
         "line_changes": {"added": len(added_lines), "removed": len(removed_lines)},
         "claim_actions": actions,
         "new_source_urls": new_source_urls,
@@ -615,6 +627,7 @@ def _finalize_run_if_decided(
         raise RunLeaseBusy(f"Agent run {run_id} is already being finalized.")
     manager = _manager(wiki, pipeline)
     trace = TraceRecorder(runtime, run_id)
+    trace.lease_owner = lease.owner
     active_approval: dict[str, Any] | None = None
     try:
         run = runtime.get_run(run_id) or run
@@ -632,6 +645,7 @@ def _finalize_run_if_decided(
             return committed
 
         for approval in accepted:
+            lease.check()
             active_approval = approval
             current_approval = runtime.get_approval(str(approval["id"])) or approval
             if current_approval["status"] == "approved":
@@ -662,6 +676,7 @@ def _finalize_run_if_decided(
                 tool_name="wiki.apply_post_commit_effects",
                 input_data={"revision_id": approval["revision_id"]},
             ) as span:
+                lease.check()
                 span["output"] = manager.apply_post_commit_effects(
                     str(approval["revision_id"])
                 )
@@ -674,6 +689,7 @@ def _finalize_run_if_decided(
                 )
             runtime.complete_approval(str(approval["id"]))
 
+        lease.check()
         current_state = str((runtime.get_run(run_id) or {}).get("current_state") or "")
         if current_state == "COMMITTING":
             runtime.transition(run_id, "REINDEXING", reason="approved revisions committed and indexed")
@@ -692,6 +708,8 @@ def _finalize_run_if_decided(
             progress=1.0, approval_complete=True,
         )
         return committed
+    except RunCancelled as exc:
+        raise RunLeaseBusy("Task was cancelled or its execution lease was lost") from exc
     except Exception as exc:
         error = str(exc)
         for approval in accepted:

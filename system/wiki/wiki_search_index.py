@@ -16,6 +16,7 @@ from array import array
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any, Iterable
 
 from system.wiki.markdown_vault import SYSTEM_CONTENT_KEYS
@@ -28,8 +29,7 @@ SEARCH_EXCLUDED_KEYS = SYSTEM_CONTENT_KEYS | {
 
 class WikiSearchIndex:
     def __init__(self, db_path: str | None = None, embedder: Any = None):
-        base_dir = Path(__file__).resolve().parents[2]
-        self.db_path = str(Path(db_path) if db_path else base_dir / "sessions.db")
+        self.db_path = str(resolve_database_path(db_path))
         self.embedder = embedder
         self._fts_enabled = False
         self._init_db()
@@ -56,11 +56,24 @@ class WikiSearchIndex:
                     embedding BLOB,
                     embedding_dim INTEGER DEFAULT 0,
                     embedding_model TEXT DEFAULT '',
+                    claim_id TEXT DEFAULT '',
                     updated_at TEXT NOT NULL
                 )"""
             )
+            columns = {
+                str(row[1]) for row in conn.execute(
+                    "PRAGMA table_info(wiki_search_units)"
+                ).fetchall()
+            }
+            if "claim_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE wiki_search_units ADD COLUMN claim_id TEXT DEFAULT ''"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_wiki_search_units_page ON wiki_search_units(page_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_wiki_search_units_claim ON wiki_search_units(claim_id)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_wiki_search_units_embedding ON wiki_search_units(embedding_model, embedding_dim)"
@@ -74,6 +87,7 @@ class WikiSearchIndex:
                 self._fts_enabled = True
             except sqlite3.OperationalError:
                 self._fts_enabled = False
+            self._sync_claim_units(conn)
             conn.commit()
 
     def replace_page(self, card: dict[str, Any]) -> int:
@@ -102,8 +116,8 @@ class WikiSearchIndex:
                     """INSERT INTO wiki_search_units
                        (id, page_id, page_type, unit_kind, section, title, text,
                         aliases_text, lexical_terms, content_hash, embedding,
-                        embedding_dim, embedding_model, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        embedding_dim, embedding_model, claim_id, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         unit["id"], page_id, unit["page_type"], unit["unit_kind"],
                         unit["section"], unit["title"], unit["text"], unit["aliases_text"],
@@ -111,6 +125,7 @@ class WikiSearchIndex:
                         old["embedding"] if unchanged else None,
                         int(old["embedding_dim"] or 0) if unchanged else 0,
                         str(old["embedding_model"] or "") if unchanged else "",
+                        unit.get("claim_id", ""),
                         now,
                     ),
                 )
@@ -139,20 +154,27 @@ class WikiSearchIndex:
         query: str,
         limit: int = 30,
         page_types: Iterable[str] | None = None,
+        unit_kinds: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         query = (query or "").strip()
         if not query:
             return []
         fts_query = _fts_query(query)
         if not self._fts_enabled or not fts_query:
-            return self._search_like(query, limit, page_types)
+            return self._search_like(query, limit, page_types, unit_kinds)
         allowed = [str(item) for item in (page_types or []) if str(item)]
+        allowed_kinds = [str(item) for item in (unit_kinds or []) if str(item)]
         where_type = ""
+        where_kind = ""
         params: list[Any] = [fts_query]
         if allowed:
             placeholders = ",".join("?" for _ in allowed)
             where_type = f" AND u.page_type IN ({placeholders})"
             params.extend(allowed)
+        if allowed_kinds:
+            placeholders = ",".join("?" for _ in allowed_kinds)
+            where_kind = f" AND u.unit_kind IN ({placeholders})"
+            params.extend(allowed_kinds)
         params.append(max(1, min(int(limit), 200)))
         try:
             with closing(self._connect()) as conn:
@@ -160,32 +182,40 @@ class WikiSearchIndex:
                     f"""SELECT u.*, bm25(wiki_search_units_fts, 0, 3, 1.4, 1, 2, 1.5) AS lexical_score
                         FROM wiki_search_units_fts f
                         JOIN wiki_search_units u ON u.id = f.unit_id
-                        WHERE wiki_search_units_fts MATCH ? {where_type}
+                        WHERE wiki_search_units_fts MATCH ? {where_type} {where_kind}
                         ORDER BY lexical_score ASC LIMIT ?""",
                     params,
                 ).fetchall()
             return [_unit_result(row, score=-float(row["lexical_score"] or 0)) for row in rows]
         except sqlite3.OperationalError:
-            return self._search_like(query, limit, page_types)
+            return self._search_like(query, limit, page_types, unit_kinds)
 
     def _search_like(
         self,
         query: str,
         limit: int,
         page_types: Iterable[str] | None,
+        unit_kinds: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         allowed = [str(item) for item in (page_types or []) if str(item)]
+        allowed_kinds = [str(item) for item in (unit_kinds or []) if str(item)]
         where_type = ""
+        where_kind = ""
         params: list[Any] = [f"%{query}%", f"%{query}%", f"%{query}%"]
         if allowed:
             placeholders = ",".join("?" for _ in allowed)
             where_type = f" AND page_type IN ({placeholders})"
             params.extend(allowed)
+        if allowed_kinds:
+            placeholders = ",".join("?" for _ in allowed_kinds)
+            where_kind = f" AND unit_kind IN ({placeholders})"
+            params.extend(allowed_kinds)
         params.append(max(1, min(int(limit), 200)))
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""SELECT * FROM wiki_search_units
-                    WHERE (title LIKE ? OR text LIKE ? OR aliases_text LIKE ?) {where_type}
+                    WHERE (title LIKE ? OR text LIKE ? OR aliases_text LIKE ?)
+                    {where_type} {where_kind}
                     ORDER BY updated_at DESC LIMIT ?""",
                 params,
             ).fetchall()
@@ -208,10 +238,10 @@ class WikiSearchIndex:
     def backfill_embeddings(self, limit: int = 64) -> int:
         if self.embedder is None:
             return 0
-        model = str(getattr(self.embedder, "model", "embedding"))
+        model = str(getattr(self.embedder, "index_model", getattr(self.embedder, "model", "embedding")))
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                """SELECT id, title, section, text, aliases_text FROM wiki_search_units
+                """SELECT id, title, section, text, aliases_text, content_hash FROM wiki_search_units
                    WHERE embedding IS NULL OR embedding_model <> ?
                    ORDER BY updated_at ASC LIMIT ?""",
                 (model, max(1, min(int(limit), 256))),
@@ -222,45 +252,57 @@ class WikiSearchIndex:
         vectors = self.embedder.embed_documents(texts)
         if len(vectors) != len(rows):
             raise RuntimeError("Embedding API returned an unexpected vector count.")
+        processed = 0
         with closing(self._connect()) as conn:
             for row, vector in zip(rows, vectors):
                 packed, dimension = _pack_vector(vector)
-                conn.execute(
+                # A page may be edited/deleted while the remote request runs.
+                cursor = conn.execute(
                     """UPDATE wiki_search_units
                        SET embedding = ?, embedding_dim = ?, embedding_model = ?
-                       WHERE id = ?""",
-                    (packed, dimension, model, row["id"]),
+                       WHERE id = ? AND content_hash = ?""",
+                    (packed, dimension, model, row["id"], row["content_hash"]),
                 )
+                processed += cursor.rowcount
             conn.commit()
-        return len(rows)
+        return processed
 
     def search_vector(
         self,
         query: str,
         limit: int = 30,
         page_types: Iterable[str] | None = None,
+        unit_kinds: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         if self.embedder is None or not (query or "").strip():
             return []
-        model = str(getattr(self.embedder, "model", "embedding"))
+        model = str(getattr(self.embedder, "index_model", getattr(self.embedder, "model", "embedding")))
         allowed = [str(item) for item in (page_types or []) if str(item)]
+        allowed_kinds = [str(item) for item in (unit_kinds or []) if str(item)]
         where_type = ""
+        where_kind = ""
         params: list[Any] = [model]
         if allowed:
             placeholders = ",".join("?" for _ in allowed)
             where_type = f" AND page_type IN ({placeholders})"
             params.extend(allowed)
+        if allowed_kinds:
+            placeholders = ",".join("?" for _ in allowed_kinds)
+            where_kind = f" AND unit_kind IN ({placeholders})"
+            params.extend(allowed_kinds)
         with closing(self._connect()) as conn:
             count = conn.execute(
                 f"""SELECT COUNT(*) FROM wiki_search_units
-                    WHERE embedding IS NOT NULL AND embedding_model = ? {where_type}""",
+                    WHERE embedding IS NOT NULL AND embedding_model = ?
+                    {where_type} {where_kind}""",
                 params,
             ).fetchone()[0]
             if not count:
                 return []
             rows = conn.execute(
                 f"""SELECT * FROM wiki_search_units
-                    WHERE embedding IS NOT NULL AND embedding_model = ? {where_type}""",
+                    WHERE embedding IS NOT NULL AND embedding_model = ?
+                    {where_type} {where_kind}""",
                 params,
             ).fetchall()
         query_vector = self.embedder.embed_query(query)
@@ -280,6 +322,97 @@ class WikiSearchIndex:
             _unit_result(row, score=score)
             for score, row in ranked[: max(1, min(int(limit), 200))]
         ]
+
+    def _sync_claim_units(self, conn: sqlite3.Connection) -> None:
+        """Backfill Claim units for Wikis created before Claim-level retrieval.
+
+        Claim vectors are derived state. Existing vectors survive when the
+        normalized Claim content has not changed; new units are picked up by
+        the regular asynchronous embedding backfill.
+        """
+        tables = {
+            str(row[0]) for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "wiki_pages" not in tables:
+            return
+        rows = conn.execute(
+            """SELECT id, title, page_type, summary, content_json,
+                      related_topics_json
+               FROM wiki_pages"""
+        ).fetchall()
+        desired: dict[str, dict[str, str]] = {}
+        for row in rows:
+            try:
+                content = json.loads(row["content_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                content = {}
+            try:
+                related = json.loads(row["related_topics_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                related = []
+            card = {
+                "id": row["id"],
+                "title": row["title"],
+                "page_type": row["page_type"],
+                "summary": row["summary"],
+                "content_json": content if isinstance(content, dict) else {},
+                "related_topics": related if isinstance(related, list) else [],
+            }
+            for unit in build_claim_search_units(card):
+                desired[unit["id"]] = unit
+
+        current = {
+            str(row["id"]): row
+            for row in conn.execute(
+                """SELECT id, content_hash, embedding, embedding_dim,
+                          embedding_model
+                   FROM wiki_search_units WHERE unit_kind = 'claim'"""
+            ).fetchall()
+        }
+        stale_ids = set(current) - set(desired)
+        for unit_id in stale_ids:
+            conn.execute("DELETE FROM wiki_search_units WHERE id = ?", (unit_id,))
+            if self._fts_enabled:
+                conn.execute(
+                    "DELETE FROM wiki_search_units_fts WHERE unit_id = ?", (unit_id,)
+                )
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for unit_id, unit in desired.items():
+            old = current.get(unit_id)
+            if old and str(old["content_hash"] or "") == unit["content_hash"]:
+                continue
+            if old:
+                conn.execute("DELETE FROM wiki_search_units WHERE id = ?", (unit_id,))
+                if self._fts_enabled:
+                    conn.execute(
+                        "DELETE FROM wiki_search_units_fts WHERE unit_id = ?", (unit_id,)
+                    )
+            conn.execute(
+                """INSERT INTO wiki_search_units
+                   (id, page_id, page_type, unit_kind, section, title, text,
+                    aliases_text, lexical_terms, content_hash, embedding,
+                    embedding_dim, embedding_model, claim_id, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    unit["id"], unit["page_id"], unit["page_type"], "claim",
+                    unit["section"], unit["title"], unit["text"],
+                    unit["aliases_text"], unit["lexical_terms"],
+                    unit["content_hash"], None, 0, "", unit["claim_id"], now,
+                ),
+            )
+            if self._fts_enabled:
+                conn.execute(
+                    """INSERT INTO wiki_search_units_fts
+                       (unit_id, title, section, text, aliases, terms)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        unit["id"], unit["title"], unit["section"], unit["text"],
+                        unit["aliases_text"], unit["lexical_terms"],
+                    ),
+                )
 
 
 def build_search_units(card: dict[str, Any]) -> list[dict[str, str]]:
@@ -317,6 +450,7 @@ def build_search_units(card: dict[str, Any]) -> list[dict[str, str]]:
         lexical_terms = " ".join(_lexical_terms(f"{title} {aliases_text} {section} {text}"))
         units.append({
             "id": unit_id,
+            "page_id": page_id,
             "page_type": page_type,
             "unit_kind": kind,
             "section": section,
@@ -325,8 +459,65 @@ def build_search_units(card: dict[str, Any]) -> list[dict[str, str]]:
             "aliases_text": aliases_text,
             "lexical_terms": lexical_terms,
             "content_hash": digest,
+            "claim_id": "",
         })
+    units.extend(build_claim_search_units(card))
     return units
+
+
+def build_claim_search_units(card: dict[str, Any]) -> list[dict[str, str]]:
+    """Build one retrieval unit per atomic Claim.
+
+    The Markdown page remains canonical. These units are a rebuildable
+    projection used only to find old Claims that deserve semantic comparison.
+    """
+    page_id = str(card.get("id") or "")
+    title = str(card.get("title") or "").strip()
+    page_type = str(card.get("page_type") or "")
+    content = card.get("content_json") if isinstance(card.get("content_json"), dict) else {}
+    aliases = _unique([
+        *_string_values(content.get("aliases")),
+        *_string_values(card.get("related_topics")),
+    ])
+    aliases_text = " ".join(aliases)
+    output: list[dict[str, str]] = []
+    for index, claim in enumerate(content.get("claims") or []):
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("id") or "").strip()
+        statement = str(claim.get("statement") or "").strip()
+        if not claim_id or not statement:
+            continue
+        scope = claim.get("scope") if isinstance(claim.get("scope"), dict) else {}
+        qualifiers = claim.get("qualifiers") if isinstance(claim.get("qualifiers"), list) else []
+        parts = [
+            statement,
+            f"Subject: {claim.get('subject', '')}" if claim.get("subject") else "",
+            f"Aspect: {claim.get('aspect', '')}" if claim.get("aspect") else "",
+            f"Predicate: {claim.get('predicate', '')}" if claim.get("predicate") else "",
+            f"Value: {claim.get('value', '')}" if claim.get("value") else "",
+            f"Scope: {json.dumps(scope, ensure_ascii=False, sort_keys=True)}" if scope else "",
+            f"Qualifiers: {'; '.join(str(item) for item in qualifiers)}" if qualifiers else "",
+        ]
+        text = "\n".join(part for part in parts if part)[:6000]
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        output.append({
+            "id": f"{page_id}:claim:{claim_id}",
+            "page_id": page_id,
+            "page_type": page_type,
+            "unit_kind": "claim",
+            "section": "Claim",
+            "title": title,
+            "text": text,
+            "aliases_text": aliases_text,
+            "lexical_terms": " ".join(_lexical_terms(
+                f"{title} {aliases_text} {text}"
+            )),
+            "content_hash": digest,
+            "claim_id": claim_id,
+            "claim_index": str(index),
+        })
+    return output
 
 
 def _unit_result(row: sqlite3.Row, score: float) -> dict[str, Any]:
@@ -334,6 +525,8 @@ def _unit_result(row: sqlite3.Row, score: float) -> dict[str, Any]:
         "unit_id": row["id"],
         "page_id": row["page_id"],
         "page_type": row["page_type"],
+        "unit_kind": row["unit_kind"],
+        "claim_id": row["claim_id"] or "",
         "section": row["section"],
         "title": row["title"],
         "snippet": str(row["text"] or "")[:500],

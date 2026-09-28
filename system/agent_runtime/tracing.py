@@ -208,6 +208,13 @@ def set_current_span_usage(usage: Any) -> None:
         state["usage"]["estimated"] = False
 
 
+def set_current_span_output(output: dict[str, Any]) -> None:
+    """Attach provider diagnostics without recording private reasoning text."""
+    state = _current_span_state.get()
+    if state is not None:
+        state.setdefault("output", {}).update(output)
+
+
 def record_current_retry(
     *,
     kind: str = "model",

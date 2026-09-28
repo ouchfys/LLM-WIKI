@@ -31,6 +31,8 @@ from system.wiki.wiki_store import WikiStore
 
 class FakeSemanticLLM:
     def invoke(self, prompt: str, **kwargs) -> str:
+        if "Model A reaches 99.9 on GSM8K." in prompt:
+            return '{"label":"contradicted","score":0.98,"reason":"the cited result is 91.2, not 99.9"}'
         if "not improve" in prompt:
             return '{"label":"contradicted","score":0.98,"reason":"source states an improvement"}'
         return '{"label":"entailed","score":0.96,"reason":"claim follows from the persisted source span"}'
@@ -108,13 +110,13 @@ def test_source_packet_keeps_table_as_markdown() -> None:
     assert "| Model | GSM8K |" in packet.tables[0].markdown
 
 
-def test_store_and_verifier_reread_persisted_source_and_reject_wrong_number() -> None:
+def test_store_and_model_review_persisted_source_and_reject_wrong_number() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         store = PaperWikiPipelineStore(db_path=str(Path(tmp) / "evidence.db"))
         packet = _packet()
         store.upsert_source_packet(packet)
         paragraph = next(item for item in packet.elements if "91.2" in item.text)
-        verifier = EvidenceVerifier(store)
+        verifier = EvidenceVerifier(store, llm=FakeSemanticLLM())
 
         supported = verifier.verify_claim(
             statement="Model A reaches 91.2 on GSM8K.",
@@ -252,10 +254,10 @@ def test_store_migration_removes_retired_table_projection_and_dangling_links() -
             assert '"headers"' not in raw and '"rows"' not in raw and '"cells"' not in raw
 
 
-def test_verifier_keeps_long_parser_tail_and_normalizes_number_words() -> None:
+def test_model_receives_long_parser_tail_and_number_words_without_rewriting() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         store = PaperWikiPipelineStore(db_path=str(Path(tmp) / "long-evidence.db"))
-        long_text = ("architecture context " * 50) + "The model trained for eight days. TAIL_EVIDENCE"
+        long_text = ("architecture context " * 160) + "The model trained for eight days. TAIL_EVIDENCE"
         packet = SourcePacket(
             source_id="long-packet",
             title="Long Evidence",
@@ -279,6 +281,7 @@ def test_verifier_keeps_long_parser_tail_and_normalizes_number_words() -> None:
         )
         assert result.result == "supported"
         assert "TAIL_EVIDENCE" in llm.prompt
+        assert "trained for eight days" in llm.prompt and "trained for 8 days" in llm.prompt
 
 
 def test_verifier_rebinds_hallucinated_or_wrong_evidence_ids() -> None:
@@ -591,6 +594,7 @@ def test_revision_rejects_unsupported_claim_without_overwriting_page() -> None:
             vault=MarkdownVault(vault_dir=str(root / "wiki")),
             reindexer=MarkdownWikiReindexer(db_path=db_path),
         )
+        manager.verifier = EvidenceVerifier(store, llm=FakeSemanticLLM())
         manager.commit_card(
             card_id="page-2", title="Reject", page_type="ConceptPage",
             content_json={"definition": "Safe."}, summary="Safe summary.",

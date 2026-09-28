@@ -10,6 +10,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any, Iterable
 
 
@@ -24,8 +25,7 @@ class ResearchSourceStore:
     """Preserve raw pasted sources; never promote their claims to Wiki knowledge."""
 
     def __init__(self, db_path: str | None = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        self.db_path = str(Path(db_path) if db_path else repo_root / "sessions.db")
+        self.db_path = str(resolve_database_path(db_path))
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -129,6 +129,7 @@ class ResearchSourceStore:
     @staticmethod
     def detect_pasted_content(text: str) -> dict[str, Any]:
         raw = str(text or "")
+        lines = [line for line in raw.splitlines() if line.strip()]
         matches = list(ROLE_PATTERN.finditer(raw))
         segments: list[dict[str, str]] = []
         normalized_roles: list[str] = []
@@ -160,7 +161,19 @@ class ResearchSourceStore:
         elif len(raw) >= 120 and len(segments) >= 2 and alternations >= 1:
             kind, confidence = "ai_conversation", 0.86
         else:
-            kind, confidence, segments = "unknown", 0.0, []
+            # Browser/chat copy often flattens an assistant's Markdown table
+            # into tab-separated text and drops the provider/role chrome.  A
+            # long answer with a real tabular block is strong enough to retain
+            # as *unverified* research material, but never strong enough to
+            # infer which provider produced it.
+            tabular_lines = [line for line in lines if line.count("\t") >= 2]
+            paragraph_count = len([part for part in re.split(r"\n\s*\n", raw) if part.strip()])
+            if len(raw) >= 800 and len(tabular_lines) >= 3 and paragraph_count >= 2:
+                signals.extend(["long_structured_answer", "tabular_copy_format"])
+                segments = [{"role": "assistant", "content": raw.strip()}]
+                kind, confidence = "ai_answer", 0.93
+            else:
+                kind, confidence, segments = "unknown", 0.0, []
         return {
             "content_kind": kind, "provider": provider, "confidence": confidence,
             "segments": segments, "signals": signals,
@@ -186,25 +199,42 @@ class ResearchSourceStore:
                 rf"(?i)(?<![\w-]){re.escape(candidate)}(?![\w-])", raw_text
             )), "unknown",
         )
-        origin = explicit_provider if explicit_provider != "unknown" else "unknown"
+        requested_origin = str(origin or "unknown").strip() or "unknown"
+        origin = (
+            explicit_provider if explicit_provider != "unknown"
+            else requested_origin if requested_origin in PROVIDERS
+            else "unknown"
+        )
         content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
         now = self._now()
         source_id = str(uuid.uuid4())
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT id FROM research_sources WHERE project_id=? AND content_hash=?",
+                "SELECT id,source_type,origin,metadata_json FROM research_sources WHERE project_id=? AND content_hash=?",
                 (str(project_id), content_hash),
             ).fetchone()
             if existing:
                 source_id = str(existing["id"])
+                # A repeated automatic capture may improve format detection,
+                # but must not erase a user's earlier provider/type correction.
+                persisted_type = str(existing["source_type"] or "unknown")
+                persisted_origin = str(existing["origin"] or "unknown")
+                if persisted_type != "unknown":
+                    source_type = persisted_type
+                if persisted_origin != "unknown":
+                    origin = persisted_origin
+                merged_metadata = self._load(existing["metadata_json"], {})
+                merged_metadata.update(metadata or {})
+                if persisted_origin != "unknown":
+                    merged_metadata["provider_confirmed_by_user"] = True
                 conn.execute(
                     """UPDATE research_sources SET source_type=?, origin=?, detected_type=?,
                        detection_confidence=?, segments_json=?, signals_json=?, title=?,
                        metadata_json=?, updated_at=? WHERE id=?""",
                     (source_type, origin, detected_type, float(detection.get("confidence") or 0),
                      self._dump(detection.get("segments") or []), self._dump(detection.get("signals") or []),
-                     str(title or ""), self._dump(metadata or {}), now, source_id),
+                     str(title or ""), self._dump(merged_metadata), now, source_id),
                 )
             else:
                 conn.execute(
@@ -228,11 +258,19 @@ class ResearchSourceStore:
     def auto_capture_if_ai_conversation(
         self, *, project_id: str, raw_text: str, metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
+        """Compatibility wrapper for automatic high-confidence AI material capture."""
+        return self.auto_capture_if_ai_material(
+            project_id=project_id, raw_text=raw_text, metadata=metadata,
+        )
+
+    def auto_capture_if_ai_material(
+        self, *, project_id: str, raw_text: str, metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         detection = self.detect_pasted_content(raw_text)
-        if detection["content_kind"] != "ai_conversation" or detection["confidence"] < 0.9:
+        if detection["content_kind"] not in {"ai_conversation", "ai_answer"} or detection["confidence"] < 0.9:
             return None
         return self.capture(
-            project_id=project_id, raw_text=raw_text, source_type="ai_conversation",
+            project_id=project_id, raw_text=raw_text, source_type=detection["content_kind"],
             detection=detection, metadata=metadata,
         )
 

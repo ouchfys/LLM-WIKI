@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any
 
 from system.wiki.maintenance.index_generator import WikiIndexGenerator
@@ -22,8 +23,7 @@ class DeterministicRepairProcessor:
     """Process repair tasks that do not require semantic judgment."""
 
     def __init__(self, db_path: str | Path | None = None):
-        repo_root = Path(__file__).resolve().parents[3]
-        self.db_path = str(Path(db_path) if db_path else repo_root / "sessions.db")
+        self.db_path = str(resolve_database_path(db_path))
         self.store = WikiMaintenanceStore(db_path=self.db_path)
 
     def process_pending(self, *, limit: int = 50, upload_indices: bool = True) -> dict[str, Any]:

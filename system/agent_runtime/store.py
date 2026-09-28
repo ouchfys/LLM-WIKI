@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any
 
 
@@ -17,15 +18,16 @@ EXECUTING_STATES = {
 }
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "QUEUED": {"EXTRACTING", "CHAT_RUNNING", "FAILED", "CANCELLED"},
-    "CHAT_RUNNING": {"COMPLETED", "FAILED", "CANCELLED"},
+    "CHAT_RUNNING": {"COMPLETED", "FAILED", "CANCELLED", "CHAT_INTERRUPTED"},
+    "CHAT_INTERRUPTED": {"CHAT_RUNNING", "CANCELLED"},
     "EXTRACTING": {"DISTILLING", "FAILED", "CANCELLED"},
     "DISTILLING": {"VERIFYING", "FAILED", "CANCELLED"},
     "VERIFYING": {"REVISING", "COMPILING_PROPOSAL", "REJECTED", "FAILED", "CANCELLED"},
     "REVISING": {"VERIFYING", "REJECTED", "FAILED", "CANCELLED"},
     "COMPILING_PROPOSAL": {"AWAITING_APPROVAL", "COMMITTING", "REJECTED", "FAILED", "CANCELLED"},
     "AWAITING_APPROVAL": {"COMMITTING", "REJECTED", "CANCELLED", "FAILED"},
-    "COMMITTING": {"REINDEXING", "COMMIT_FAILED", "FAILED"},
-    "REINDEXING": {"COMPLETED", "COMMIT_FAILED", "FAILED"},
+    "COMMITTING": {"REINDEXING", "COMMIT_FAILED", "FAILED", "CANCELLED"},
+    "REINDEXING": {"COMPLETED", "COMMIT_FAILED", "FAILED", "CANCELLED"},
     "COMMIT_FAILED": {"COMMITTING", "AWAITING_APPROVAL", "CANCELLED", "FAILED"},
     "COMPLETED": set(),
     "REJECTED": set(),
@@ -42,8 +44,7 @@ class AgentRunStore:
     """SQLite-backed state, checkpoint, trace, and approval store."""
 
     def __init__(self, db_path: str | None = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        self.db_path = str(Path(db_path) if db_path else repo_root / "sessions.db")
+        self.db_path = str(resolve_database_path(db_path))
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -177,6 +178,41 @@ class AgentRunStore:
             self._ensure_column(conn, "agent_approvals", "commit_error", "TEXT DEFAULT ''")
             conn.commit()
 
+    def expire_chat_runs(self):
+        """Abandoned chats become manually resumable; never restart tools on boot."""
+        with closing(self._connect()) as conn:
+            conn.execute("""UPDATE agent_runs SET current_state='CHAT_INTERRUPTED',status='interrupted',
+                input_closed=1,updated_at=? WHERE run_type='wiki_chat' AND current_state='CHAT_RUNNING'
+                AND ((lease_expires_at<>'' AND lease_expires_at<=?) OR
+                     (lease_expires_at='' AND updated_at<=?))""", (self.now_iso(), self.now_iso(),
+                     (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat(timespec="milliseconds")))
+            conn.commit()
+
+    def save_chat_cursor(self, run_id, message, steps, *, research_state=None, thinking_effort=None,
+                         stop_reason=None, task_outcome=None):
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            from system.agent_runtime.chat_recovery import ChatRecovery
+            ChatRecovery._check(conn, run_id)
+            row = conn.execute("SELECT context_json FROM agent_runs WHERE id=? AND current_state='CHAT_RUNNING' AND cancel_requested=0", (run_id,)).fetchone()
+            if not row:
+                from system.agent_runtime.control import RunCancelled
+                raise RunCancelled("Chat stopped or was deleted")
+            context = self.load_json(row[0])
+            # The original request stays immutable. Steering messages already
+            # live in agent_run_inputs, including interrupts consumed just before a crash.
+            context.update(planner_steps=steps)
+            if research_state is not None:
+                context["research_state"] = research_state
+            if thinking_effort is not None:
+                context["thinking_effort"] = thinking_effort
+            if stop_reason is not None:
+                context["stop_reason"] = stop_reason
+            if task_outcome is not None:
+                context["task_outcome"] = task_outcome
+            conn.execute("UPDATE agent_runs SET context_json=? WHERE id=?", (self.dump_json(context), run_id))
+            conn.commit()
+
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -191,11 +227,22 @@ class AgentRunStore:
         approval_mode: str = "risk",
         ingestion_job_id: str = "",
         context: dict[str, Any] | None = None,
+        connection=None,
     ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
         now = self.now_iso()
         mode = approval_mode if approval_mode in {"risk", "manual", "auto"} else "risk"
-        with closing(self._connect()) as conn:
+        with (nullcontext(connection) if connection is not None else closing(self._connect())) as conn:
+            if connection is None:
+                conn.execute("BEGIN IMMEDIATE")
+            if run_type == "wiki_chat" and context and context.get("require_session"):
+                if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (context.get("session_id"),)).fetchone():
+                    raise ValueError("Conversation was deleted before the request started")
+                if conn.execute(
+                    "SELECT 1 FROM agent_runs WHERE run_type='wiki_chat' AND source_uri=? "
+                    "AND current_state IN ('QUEUED', 'CHAT_RUNNING') LIMIT 1", (source_uri,),
+                ).fetchone():
+                    raise ValueError("This conversation already has a running task; reconnect or send additional instructions")
             conn.execute(
                 """INSERT INTO agent_runs
                    (id, run_type, status, current_state, state_version, approval_mode,
@@ -209,7 +256,10 @@ class AgentRunStore:
                    VALUES (?, ?, 0, 'QUEUED', ?, ?)""",
                 (str(uuid.uuid4()), run_id, self.dump_json(context or {}), now),
             )
-            conn.commit()
+            if connection is None:
+                conn.commit()
+        if connection is not None:
+            return self._run_row(conn.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone())
         self.append_event(run_id, event_type="run.started", node_name="QUEUED", status="queued")
         return self.get_run(run_id) or {}
 
@@ -225,6 +275,34 @@ class AgentRunStore:
                 (job_id,),
             ).fetchone()
         return self._run_row(row) if row else None
+
+    def request_pause(self, run_id: str) -> dict[str, Any]:
+        """Stop this chat using the same durable interruption state as disconnects."""
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+            if not row:
+                raise KeyError(run_id)
+            if row["run_type"] != "wiki_chat":
+                raise ValueError("Only Wiki chat runs can be paused here.")
+            if row["current_state"] in {"CHAT_INTERRUPTED", "FAILED"}:
+                return self._run_row(row)
+            if row["current_state"] != "CHAT_RUNNING" or row["cancel_requested"]:
+                raise ValueError("This task is no longer running.")
+            if row["input_closed"]:
+                raise ValueError("The answer is already being saved; wait for completion.")
+            now = self.now_iso()
+            version = int(row["state_version"]) + 1
+            conn.execute("""UPDATE agent_runs SET current_state='CHAT_INTERRUPTED',status='interrupted',
+                state_version=?,input_closed=1,updated_at=? WHERE id=?""", (version, now, run_id))
+            conn.execute("""INSERT INTO agent_checkpoints(id,run_id,state_version,state,context_json,created_at)
+                VALUES(?,?,?,'CHAT_INTERRUPTED',?,?)""", (str(uuid.uuid4()), run_id, version, row["context_json"], now))
+            # Explicitly queued follow-ups must not start automatically after a stop.
+            # Pending steering stays attached and is consumed on continuation.
+            conn.execute("UPDATE agent_run_inputs SET status='blocked',updated_at=? WHERE run_id=? AND kind<>'interrupt' AND status='pending'", (now, run_id))
+            conn.commit()
+        self.append_event(run_id, event_type="run.paused", node_name="CHAT_INTERRUPTED", status="interrupted")
+        return self.get_run(run_id) or {}
 
     def request_cancel(self, run_id: str) -> dict[str, Any]:
         """Stop accepting input immediately; the worker exits at a safe point."""
@@ -345,6 +423,16 @@ class AgentRunStore:
         self.append_event(run_id, event_type=f"input.{status}", status=status, input_data={"input_id": input_id})
         return {**dict(row), "status": status}
 
+    def get_active_chat(self, session_id: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT * FROM agent_runs WHERE run_type='wiki_chat'
+                   AND source_uri=? AND current_state IN ('QUEUED', 'CHAT_RUNNING')
+                   ORDER BY created_at DESC LIMIT 1""",
+                (f"session:{session_id}",),
+            ).fetchone()
+        return self._run_row(row) if row else None
+
     def list_runs(self, *, limit: int = 100, status: str = "") -> list[dict[str, Any]]:
         sql = "SELECT * FROM agent_runs"
         params: list[Any] = []
@@ -399,8 +487,9 @@ class AgentRunStore:
         with closing(self._connect()) as conn:
             cursor = conn.execute(
                 """UPDATE agent_runs SET heartbeat_at=?, lease_expires_at=?, updated_at=?
-                   WHERE id=? AND lease_owner=?""",
-                (now, expires, now, run_id, owner),
+                   WHERE id=? AND lease_owner=? AND lease_expires_at>? AND cancel_requested=0
+                   AND current_state NOT IN ('CANCELLED','COMPLETED','REJECTED','CHAT_INTERRUPTED')""",
+                (now, expires, now, run_id, owner, now),
             )
             conn.commit()
         return cursor.rowcount == 1
@@ -842,6 +931,8 @@ class AgentRunStore:
             return "queued"
         if state in WAITING_STATES:
             return "waiting"
+        if state == "CHAT_INTERRUPTED":
+            return "interrupted"
         if state == "COMPLETED":
             return "completed"
         if state in {"REJECTED", "FAILED", "CANCELLED"}:

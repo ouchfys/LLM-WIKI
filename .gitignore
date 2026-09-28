@@ -5,6 +5,7 @@
 
 # Runtime data
 /.paperwiki/
+/codex-src-analysis/
 logs/*
 !logs/.gitkeep
 data/*

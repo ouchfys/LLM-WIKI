@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.deps import get_review_llm
-from system.core.config import SILICONFLOW_REVIEW_MODEL
+from system.core.config import DEEPSEEK_CHAT_MODEL
 from system.wiki.evidence_verifier import EvidenceVerifier
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 
@@ -26,7 +26,7 @@ from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="sessions.db")
-    parser.add_argument("--dataset", default="test/evaluation/datasets/evidence_wiki_silver_v1")
+    parser.add_argument("--dataset", required=True, help="Dataset directory with evidence IDs present in --db")
     parser.add_argument("--output-root", default="test/evaluation/runs/evidence_wiki_silver_v1")
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--limit", type=int, default=0)
@@ -60,7 +60,7 @@ def main() -> None:
         "started_at": datetime.fromtimestamp(started, timezone.utc).isoformat(),
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(time.time() - started, 2),
-        "models": {"verifier": SILICONFLOW_REVIEW_MODEL},
+        "models": {"verifier": DEEPSEEK_CHAT_MODEL},
         "verifier": _verifier_metrics(results),
         "limitations": [
             "The semantic labels are model-adjudicated silver labels with no human annotation.",

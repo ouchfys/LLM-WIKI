@@ -40,6 +40,7 @@ SYSTEM_CONTENT_KEYS = {
     "evidence", "links",
     "conversation_instruction", "source_session_id", "source_message_ids",
     "related_sources", "selected_table_ids",
+    "repository_research", "repository_review",
 }
 
 INTERNAL_SECTION_HEADINGS = {
@@ -51,9 +52,94 @@ INTERNAL_SECTION_HEADINGS = {
 }
 
 
+def normalize_markdown_table(markdown: str) -> str:
+    """Repair common PDF table layout noise without rewriting cell values.
+
+    MinerU may emit blank pipe-only rows and omit repeated leading row-group
+    labels. The reader needs a rectangular Markdown table, while the source
+    packet remains the authoritative copy of the original extraction.
+    """
+    rows: list[list[str]] = []
+    for raw_line in str(markdown or "").replace("\r\n", "\n").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("|"):
+            continue
+        inner = line[1:-1] if line.endswith("|") else line[1:]
+        cells = [cell.strip() for cell in inner.split("|")]
+        if not any(cells):
+            continue
+        if all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells):
+            continue
+        rows.append(cells)
+
+    if not rows:
+        return ""
+    # Extractors sometimes synthesize headers above the actual header row.
+    if len(rows) > 1 and all(re.fullmatch(r"column_\d+", cell, re.I) for cell in rows[0]) and len(rows[1]) == len(rows[0]) and all(rows[1]):
+        rows.pop(0)
+    symbols = {r"$\bm{\checkmark}$": "✓", r"$\bm{\circ}$": "○", r"$\bm{\times}$": "×"}
+    rows = [[symbols.get(cell, cell) for cell in row] for row in rows]
+    width = max(len(row) for row in rows)
+    if width < 2:
+        return ""
+
+    normalized: list[list[str]] = []
+    for row in rows:
+        if len(row) < width:
+            # PDF rowspan extraction normally drops repeated grouping cells at
+            # the left. Padding there preserves the alignment of numeric data.
+            row = [""] * (width - len(row)) + row
+        normalized.append(row[:width])
+
+    def render(row: list[str]) -> str:
+        return "| " + " | ".join(row) + " |"
+
+    separator = ["---"] * width
+    return "\n".join([render(normalized[0]), render(separator), *(render(row) for row in normalized[1:])])
+
+
+def _compact_artifact_label(caption: str, kind: str, fallback_index: int) -> str:
+    text = re.sub(r"\s+", " ", str(caption or "")).strip()
+    prefix = r"(?:table|表)" if kind == "表" else r"(?:figure|fig\.?|图)"
+    match = re.match(rf"^{prefix}\s*([\w.-]+)", text, flags=re.IGNORECASE)
+    if match:
+        number = match.group(1).rstrip(".:：")
+        return f"{kind} {number}"
+    return text if text else f"{kind} {fallback_index}"
+
+
+def _clean_reader_markdown(text: str) -> str:
+    value = str(text or "")
+    value = re.sub(r"^\s*-\s*\*\*Table Id\*\*[:：].*$", "", value, flags=re.MULTILINE | re.IGNORECASE)
+    replacements = {
+        "Purpose": "用途",
+        "Mechanism": "机制",
+        "Details": "说明",
+        "Evidence": "证据",
+        "Conditions": "条件",
+        "Implication": "含义",
+    }
+    for source, target in replacements.items():
+        value = re.sub(rf"\*\*{source}\*\*", f"**{target}**", value, flags=re.IGNORECASE)
+    return re.sub(r"\n{3,}", "\n\n", value).strip()
+
+
+def _nested_reader_label(key: str) -> str:
+    return {
+        "purpose": "用途",
+        "mechanism": "机制",
+        "details": "说明",
+        "evidence": "证据",
+        "conditions": "条件",
+        "implication": "含义",
+        "trend": "趋势",
+        "key_values": "关键数值",
+    }.get(key, key.replace("_", " ").title())
+
+
 class MarkdownVault:
     def __init__(self, vault_dir: Optional[str] = None):
-        self.repo_root = Path(__file__).resolve().parents[2]
+        self.repo_root = get_storage_layout().repo_root
         self.vault_dir = Path(vault_dir) if vault_dir else get_storage_layout().wiki_dir
 
     @property
@@ -189,6 +275,12 @@ class MarkdownVault:
         now = datetime.now(timezone.utc).date().isoformat()
         created_date = self._normalize_date(created) or now
         content_json = content_json or {}
+        is_repository_card = bool(content_json.get("repository_research"))
+        if is_repository_card:
+            # A repository card records source identity/version without embedding
+            # code-file URLs or requiring a separate persistent evidence bundle.
+            repository = str(content_json["repository_research"].get("repository") or "")
+            source_urls = [f"https://github.com/{repository}"] if repository else []
         aliases = self._as_string_list(content_json.get("aliases"))
         source_packet_id = str(content_json.get("source_packet_id") or "")
         if not source_packet_id:
@@ -201,6 +293,9 @@ class MarkdownVault:
             source_packet_id = source_packet_ids[0] if source_packet_ids else ""
         review_status = str(content_json.get("review_status") or "")
         status = self._status_for(review_status, source_level)
+        if is_repository_card:
+            from system.wiki.repository_verification import repository_card_status
+            status = repository_card_status(content_json.get("repository_review") or {})
         tags = self._tags_for(page_type, related_topics)
 
         frontmatter = [
@@ -222,7 +317,7 @@ class MarkdownVault:
             for url in source_urls:
                 frontmatter.append(f"  - url: {self._yaml_scalar(url)}")
                 frontmatter.append(f"    level: {self._yaml_scalar(source_level)}")
-                if source_packet_id:
+                if source_packet_id and not is_repository_card:
                     frontmatter.append(f"    source_packet_id: {self._yaml_scalar(source_packet_id)}")
         else:
             frontmatter.append("  []")
@@ -231,16 +326,27 @@ class MarkdownVault:
         frontmatter.extend(["---", ""])
 
         body = [f"# {title}", ""]
-        if summary:
+        if summary and not is_repository_card:
             # Summaries are prose fields, not nested Markdown documents. A
             # Parser abstracts can begin with ``##`` and would otherwise close
             # the Summary section during deterministic reindexing.
             inline_summary = re.sub(r"\s+", " ", summary).strip()
             inline_summary = re.sub(r"^#{1,6}\s*", "", inline_summary)
-            body.extend(["## Summary", "", inline_summary, ""])
+            body.extend(["## 摘要", "", inline_summary, ""])
         body.extend(self._render_content_sections(page_type, content_json))
+        if is_repository_card:
+            snapshot = content_json.get("repository_research") or {}
+            repository = str(snapshot.get("repository") or "")
+            commit = str(snapshot.get("commit") or "")
+            read_date = str(snapshot.get("read_date") or "")
+            if repository:
+                body.extend([
+                    f'<small class="repository-snapshot">代码仓库：https://github.com/{repository} · '
+                    f'阅读日期（UTC）：{read_date or "未记录"} · 版本：{commit[:12] or "未记录"}</small>',
+                    "",
+                ])
         if related_topics:
-            body.extend(["## Links", ""])
+            body.extend(["## 相关主题", ""])
             for topic in related_topics:
                 body.append(f"- [[{topic}]]")
             body.append("")
@@ -346,69 +452,69 @@ class MarkdownVault:
 
         preferred = {
             "PaperPage": [
-                ("paper_type", "Paper Type"),
-                ("research_problem", "Research Problem"),
-                ("motivation", "Motivation"),
-                ("contributions", "Contributions"),
-                ("method_overview", "Method Overview"),
-                ("method_components", "Method Components"),
-                ("execution_flow", "Execution Flow"),
-                ("experiment_setup", "Experiment Setup"),
-                ("key_results", "Key Results"),
-                ("key_tables", "Key Tables"),
-                ("figure_notes", "Figure Notes"),
-                ("ablations", "Ablations"),
-                ("comparison_to_prior_work", "Comparison To Prior Work"),
-                ("problem", "Problem"),
-                ("key_idea", "Key Ideas"),
-                ("method", "Method"),
-                ("methods", "Method"),
-                ("results", "Results"),
-                ("findings", "Findings"),
-                ("limitations", "Limitations"),
-                ("key_takeaways", "Key Takeaways"),
-                ("interview_notes", "Interview Notes"),
-                ("notes", "Notes"),
+                ("paper_type", "论文类型"),
+                ("research_problem", "研究问题"),
+                ("motivation", "研究动机"),
+                ("contributions", "主要贡献"),
+                ("method_overview", "方法概览"),
+                ("method_components", "方法组成"),
+                ("execution_flow", "执行流程"),
+                ("experiment_setup", "实验设置"),
+                ("key_results", "关键结果"),
+                ("key_tables", "关键表格"),
+                ("figure_notes", "图表解读"),
+                ("ablations", "消融实验"),
+                ("comparison_to_prior_work", "与既有工作的比较"),
+                ("problem", "问题"),
+                ("key_idea", "核心观点"),
+                ("method", "方法"),
+                ("methods", "方法"),
+                ("results", "结果"),
+                ("findings", "发现"),
+                ("limitations", "局限"),
+                ("key_takeaways", "要点"),
+                ("interview_notes", "面试提示"),
+                ("notes", "补充说明"),
             ],
             "ConceptPage": [
-                ("definition", "Definition"),
-                ("mechanism", "Mechanism"),
-                ("method", "Method"),
-                ("findings", "Findings"),
-                ("limitations", "Limitations"),
-                ("key_takeaways", "Key Takeaways"),
-                ("explanation", "Explanation"),
-                ("examples", "Examples"),
-                ("related_concepts", "Related Concepts"),
-                ("conversation_insights", "Conversation Insights"),
-                ("open_questions", "Open Questions"),
+                ("definition", "定义"),
+                ("mechanism", "机制"),
+                ("method", "方法"),
+                ("findings", "发现"),
+                ("limitations", "局限"),
+                ("key_takeaways", "要点"),
+                ("explanation", "解释"),
+                ("examples", "示例"),
+                ("related_concepts", "相关主题"),
+                ("conversation_insights", "对话洞见"),
+                ("open_questions", "待验证问题"),
             ],
             "TopicPage": [
-                ("definition", "Definition"),
-                ("mechanism", "Mechanism"),
-                ("method", "Method"),
-                ("findings", "Findings"),
-                ("limitations", "Limitations"),
-                ("key_takeaways", "Key Takeaways"),
-                ("examples", "Examples"),
-                ("related_concepts", "Related Topics"),
-                ("conversation_insights", "Conversation Insights"),
-                ("open_questions", "Open Questions"),
+                ("definition", "定义"),
+                ("mechanism", "机制"),
+                ("method", "方法"),
+                ("findings", "发现"),
+                ("limitations", "局限"),
+                ("key_takeaways", "要点"),
+                ("examples", "示例"),
+                ("related_concepts", "相关主题"),
+                ("conversation_insights", "对话洞见"),
+                ("open_questions", "待验证问题"),
             ],
             "MethodPage": [
-                ("definition", "Definition"),
-                ("mechanism", "Mechanism"),
-                ("method", "Method"),
-                ("findings", "Findings"),
-                ("limitations", "Limitations"),
-                ("key_takeaways", "Key Takeaways"),
-                ("category", "Category"),
-                ("description", "Description"),
-                ("when_to_use", "When To Use"),
-                ("steps", "Steps"),
-                ("comparison_to_alternatives", "Comparison To Alternatives"),
-                ("conversation_insights", "Conversation Insights"),
-                ("open_questions", "Open Questions"),
+                ("definition", "定义"),
+                ("mechanism", "机制"),
+                ("method", "方法"),
+                ("findings", "发现"),
+                ("limitations", "局限"),
+                ("key_takeaways", "要点"),
+                ("category", "类别"),
+                ("description", "说明"),
+                ("when_to_use", "适用场景"),
+                ("steps", "步骤"),
+                ("comparison_to_alternatives", "替代方案比较"),
+                ("conversation_insights", "对话洞见"),
+                ("open_questions", "待验证问题"),
             ],
             "ComparePage": [
                 ("item_a", "Item A"),
@@ -435,7 +541,9 @@ class MarkdownVault:
             ],
         }
 
-        seen = set()
+        seen = {"reading_guide"}
+        if content.get("reading_guide"):
+            lines.extend(MarkdownVault._render_value("核心解读", content["reading_guide"]))
         for key, label in preferred.get(page_type, []):
             if key in content:
                 lines.extend(MarkdownVault._render_value(label, content.get(key)))
@@ -463,10 +571,16 @@ class MarkdownVault:
             return []
         if isinstance(value, str) and value.strip() in {"-", "- ", "[]"}:
             return []
-        if label == "Key Tables" and isinstance(value, list):
-            return MarkdownVault._render_key_tables(value)
-        if label == "Figure Notes" and isinstance(value, list):
-            return MarkdownVault._render_figure_notes(value)
+        if label in {"Key Tables", "关键表格"}:
+            if isinstance(value, list):
+                return MarkdownVault._render_key_tables(value)
+            if isinstance(value, str):
+                return MarkdownVault._render_legacy_key_tables(value)
+        if label in {"Figure Notes", "图表解读"}:
+            if isinstance(value, list):
+                return MarkdownVault._render_figure_notes(value)
+            if isinstance(value, str):
+                return MarkdownVault._render_legacy_figure_notes(value)
         lines = [f"## {label}", ""]
         if isinstance(value, list):
             for item in value:
@@ -475,9 +589,9 @@ class MarkdownVault:
                     if title:
                         lines.extend([f"### {title}", ""])
                     for key, nested in item.items():
-                        if key in {"name", "finding", "factor"} or nested in (None, "", [], {}):
+                        if key in {"name", "finding", "factor", "table_id", "figure_id"} or nested in (None, "", [], {}):
                             continue
-                        nested_label = key.replace("_", " ").title()
+                        nested_label = _nested_reader_label(key)
                         if isinstance(nested, list):
                             lines.append(f"- **{nested_label}**: " + "；".join(str(entry) for entry in nested))
                         else:
@@ -489,20 +603,22 @@ class MarkdownVault:
                     lines.append(f"- {item}")
         elif isinstance(value, dict):
             for key, nested in value.items():
+                if key in {"table_id", "figure_id"}:
+                    continue
                 lines.append(f"- **{key}**: {nested}")
         else:
-            lines.append(str(value).strip())
+            lines.append(_clean_reader_markdown(str(value)))
         lines.append("")
         return lines
 
     @staticmethod
     def _render_key_tables(tables: List[Dict[str, Any]]) -> List[str]:
-        lines = ["## Key Tables", ""]
+        lines = ["## 关键表格", ""]
         for index, table in enumerate(tables, start=1):
             if not isinstance(table, dict):
                 continue
             caption = str(table.get("caption") or f"Table {index}").strip()
-            lines.extend([f"### {caption}", ""])
+            lines.extend([f"### {_compact_artifact_label(caption, '表', index)}", ""])
             location = " / ".join(
                 value for value in (
                     str(table.get("section") or "").strip(),
@@ -513,17 +629,41 @@ class MarkdownVault:
                 lines.extend([f"*来源位置：{location}*", ""])
             markdown = str(table.get("markdown") or "").strip()
             if markdown:
-                lines.extend([markdown, ""])
+                normalized = normalize_markdown_table(markdown)
+                if normalized:
+                    lines.extend([normalized, ""])
+        return lines if len(lines) > 2 else []
+
+    @staticmethod
+    def _render_legacy_key_tables(markdown: str) -> List[str]:
+        lines = ["## 关键表格", ""]
+        blocks = [
+            block.strip()
+            for block in re.split(r"(?=^###\s+)", str(markdown or ""), flags=re.MULTILINE)
+            if block.strip()
+        ]
+        for index, block in enumerate(blocks, start=1):
+            block_lines = block.splitlines()
+            heading = re.match(r"^###\s+(.+)$", block_lines[0].strip()) if block_lines else None
+            caption = heading.group(1) if heading else f"Table {index}"
+            lines.extend([f"### {_compact_artifact_label(caption, '表', index)}", ""])
+            location = next((line.strip() for line in block_lines if "来源位置" in line), "")
+            if location:
+                lines.extend([location, ""])
+            table_text = "\n".join(line for line in block_lines if line.strip().startswith("|"))
+            normalized = normalize_markdown_table(table_text)
+            if normalized:
+                lines.extend([normalized, ""])
         return lines if len(lines) > 2 else []
 
     @staticmethod
     def _render_figure_notes(figures: List[Dict[str, Any]]) -> List[str]:
-        lines = ["## Figure Notes", ""]
+        lines = ["## 图表解读", ""]
         for index, figure in enumerate(figures, start=1):
             if not isinstance(figure, dict):
                 continue
             caption = str(figure.get("caption") or f"Figure {index}").strip()
-            lines.extend([f"### {caption}", ""])
+            lines.extend([f"### {_compact_artifact_label(caption, '图', index)}", ""])
             description = str(figure.get("description") or "").strip()
             if description:
                 lines.extend([description, ""])
@@ -534,10 +674,26 @@ class MarkdownVault:
             values = figure.get("key_values") or []
             if values:
                 lines.append(f"- **关键数值**：{'；'.join(str(value) for value in values)}")
-            source_text = str(figure.get("source_text") or "").strip()
-            if source_text and source_text != description:
-                lines.append(f"- **论文正文说明**：{source_text}")
             lines.append("")
+        return lines if len(lines) > 2 else []
+
+    @staticmethod
+    def _render_legacy_figure_notes(markdown: str) -> List[str]:
+        lines = ["## 图表解读", ""]
+        figure_index = 0
+        for raw_line in str(markdown or "").replace("\r\n", "\n").splitlines():
+            line = raw_line.strip()
+            if not line or "论文正文说明" in line:
+                continue
+            heading = re.match(r"^###\s+(.+)$", line)
+            if heading:
+                figure_index += 1
+                lines.extend([
+                    f"### {_compact_artifact_label(heading.group(1), '图', figure_index)}",
+                    "",
+                ])
+                continue
+            lines.extend([line, ""])
         return lines if len(lines) > 2 else []
 
     @staticmethod

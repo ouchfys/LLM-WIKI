@@ -24,6 +24,8 @@ class ClaimVerification:
     semantic_result: str = "not_run"
     semantic_reason: str = ""
     entailment_score: float = 0.0
+    error_code: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -36,6 +38,8 @@ class ClaimVerification:
             "semantic_result": self.semantic_result,
             "semantic_reason": self.semantic_reason,
             "entailment_score": self.entailment_score,
+            "error_code": self.error_code,
+            "details": self.details,
         }
 
 
@@ -43,7 +47,11 @@ SEMANTIC_VERIFICATION_PROMPT = """\
 You are an evidence entailment verifier. Judge only whether the SOURCE EVIDENCE
 entails the CLAIM. Do not use outside knowledge. Pay special attention to
 negation, comparison direction, conditions, scope, causality, and whether a
-number belongs to the stated model/dataset/metric.
+number belongs to the stated model/dataset/metric. Interpret quantities with their
+units, denominators and conditions. Accept justified unit conversions, counts and
+faithful paraphrases even when their numeric strings differ from the source.
+Distinguish list numbers and source/version metadata from factual quantities.
+Evaluate support from context, never from numeric-string presence alone.
 
 Return strict JSON only:
 {{"label":"entailed|contradicted|insufficient","score":0.0,"reason":"short reason"}}
@@ -60,6 +68,9 @@ class EvidenceVerifier:
     def __init__(self, store: PaperWikiPipelineStore, llm=None):
         self.store = store
         self.llm = llm
+
+    def verify_claim_payloads(self, claims):
+        return [self.verify_claim_payload(claim) for claim in claims]
 
     def bind_and_verify_candidate(self, candidate: DistilledCandidate) -> list[ClaimVerification]:
         packet = self.store.get_source_packet(candidate.source_packet_id)
@@ -104,6 +115,9 @@ class EvidenceVerifier:
         return results
 
     def verify_claim_payload(self, claim: dict[str, Any]) -> ClaimVerification:
+        if claim.get("verification_profile") == "repository":
+            from system.wiki.repository_verification import RepositoryEvidenceVerifier
+            return RepositoryEvidenceVerifier(self.store, self.llm).verify_claim_payload(claim)
         source_ids = [str(value) for value in claim.get("source_packet_ids") or [] if str(value)]
         expected = str(claim.get("verifier_result") or "").lower()
         structured_required = False
@@ -158,23 +172,20 @@ class EvidenceVerifier:
         source_text = " ".join(str(item.get("text") or item.get("caption") or "") for item in evidence)
         overlap = _overlap(evidence_excerpt, source_text)
         cross_script = _is_cross_script(evidence_excerpt, source_text)
-        if evidence_excerpt and overlap < 0.35 and not (
-            cross_script and (self.llm or semantic_preverified)
-        ):
+        if evidence_excerpt and overlap < 0.35 and not (self.llm or semantic_preverified):
             return ClaimVerification(statement=statement, result="unsupported", reason=f"evidence excerpt/source overlap too low ({overlap:.2f})", evidence_ids=evidence_ids, evidence=compact)
 
-        claim_numbers = _numeric_tokens(statement)
-        source_numbers = _numeric_tokens(source_text)
-        if claim_numbers - source_numbers:
-            missing = ", ".join(sorted(claim_numbers - source_numbers))
-            return ClaimVerification(statement=statement, result="unsupported", reason=f"numeric value not found in source evidence: {missing}", evidence_ids=evidence_ids, evidence=compact)
         result = ClaimVerification(statement=statement, result="supported", reason="evidence ids resolved and source span was re-read", evidence_ids=evidence_ids, evidence=compact)
         if self.llm:
             strong_deterministic_binding = overlap >= 0.75 and not cross_script
+            # The display preview is bounded; the review must see the actual
+            # cited span, including conditions or quantities near its tail.
+            review_evidence = [{**self._evidence_view(item), "text": str(item.get("text") or ""),
+                                "metadata": item.get("metadata") or {}} for item in evidence]
             self._semantic_verify(
                 result,
                 statement,
-                compact,
+                review_evidence,
                 fallback_allowed=strong_deterministic_binding,
             )
         return result
@@ -204,7 +215,7 @@ class EvidenceVerifier:
                 result.result = "legacy_unverified"
                 result.reason = (
                     "semantic verification deferred; deterministic evidence-id, "
-                    "text-overlap and numeric checks passed"
+                    "text-overlap checks passed; content review is still pending"
                 )
             else:
                 result.result = "unsupported"
@@ -220,7 +231,7 @@ class EvidenceVerifier:
         result.semantic_result = label
         result.semantic_reason = str(payload.get("reason") or "")[:600]
         result.entailment_score = score
-        if label != "entailed" or score < 0.7:
+        if label != "entailed":
             result.result = "unsupported"
             result.reason = f"semantic entailment {label} ({score:.2f}): {result.semantic_reason}"
 
@@ -258,26 +269,6 @@ def _is_cross_script(left: str, right: str) -> bool:
     right_latin = bool(re.search(r"[A-Za-z]{3,}", right or ""))
     return (left_cjk and right_latin and not right_cjk) or (right_cjk and left_latin and not left_cjk)
 
-
-_NUMBER_WORDS = {
-    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
-    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
-    "fourteen": "14", "fifteen": "15", "sixteen": "16",
-    "seventeen": "17", "eighteen": "18", "nineteen": "19", "twenty": "20",
-}
-
-
-def _numeric_tokens(value: str) -> set[str]:
-    normalized = (value or "").lower().replace("−", "-").replace("﹣", "-")
-    # Layout parsers may serialize a PDF number as `50 . 3 %`; normalize layout
-    # whitespace before comparing it with the claim's `50.3%`.
-    normalized = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", normalized)
-    normalized = re.sub(r"(?<=\d)\s+%", "%", normalized)
-    numbers = set(re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?%?", normalized))
-    words = set(re.findall(r"\b[a-z]+\b", normalized))
-    numbers.update(_NUMBER_WORDS[word] for word in words if word in _NUMBER_WORDS)
-    return numbers
 
 
 def _json_object(value: Any) -> dict[str, Any]:

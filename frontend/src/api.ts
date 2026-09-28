@@ -31,6 +31,14 @@ export interface ReadingItem {
   metadata: Record<string, unknown>
 }
 
+export interface RepositoryReview {
+  policy?: string
+  status: 'complete' | 'incomplete' | 'author_revised' | 'author_checked' | 'not_started' | 'content_changed' | 'not_requested'
+  independent_status: 'passed' | 'changes_requested' | 'incomplete' | 'unknown' | 'not_run'
+  model_calls?: number
+  current_version_reviewed: boolean
+}
+
 export interface WikiCard {
   id: string
   title: string
@@ -42,6 +50,8 @@ export interface WikiCard {
   source_level: string
   related_topics: string[]
   source_urls: string[]
+  current_revision_id?: string | null
+  repository_review?: RepositoryReview | null
 }
 
 export interface LocalPdf {

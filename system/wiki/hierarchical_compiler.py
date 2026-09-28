@@ -101,6 +101,29 @@ class HierarchicalWikiCompiler:
                     incoming["status"] = "conflicting"
                     incoming["conflicts_with_claim_id"] = match.get("id", "")
                     incoming["comparison_reason"] = str(decision.get("reason") or "incoming claim contradicts an existing claim")
+            elif existing_id and relation == "supersedes":
+                # A cross-page supersession cannot mutate the other Markdown
+                # page inside this revision. Preserve the proposed relation and
+                # route it through approval instead of silently losing it.
+                action = "supersede_claim"
+                incoming["status"] = "proposed_supersession"
+                incoming["supersedes_claim_id"] = existing_id
+                incoming["comparison_reason"] = str(
+                    decision.get("reason") or "incoming claim may supersede a Claim on another page"
+                )
+            elif existing_id and relation == "contradicts":
+                action = "challenge_claim"
+                incoming["status"] = "conflicting"
+                incoming["conflicts_with_claim_id"] = existing_id
+                incoming["comparison_reason"] = str(
+                    decision.get("reason") or "incoming claim contradicts a Claim on another page"
+                )
+            if existing_id:
+                incoming["compared_page_id"] = str(decision.get("existing_page_id") or "")
+                incoming["compared_page_title"] = str(decision.get("existing_page_title") or "")
+                incoming["retrieval_routes"] = [
+                    str(item) for item in decision.get("retrieval_routes") or []
+                ]
             incoming["merge_relation"] = relation
             incoming["relation_decision"] = decision
             ledger.append(incoming)
@@ -111,6 +134,7 @@ class HierarchicalWikiCompiler:
                 "compared_claim_id": str(
                     incoming.get("conflicts_with_claim_id")
                     or incoming.get("supersedes_claim_id")
+                    or existing_id
                     or ""
                 ),
                 "relation": relation,

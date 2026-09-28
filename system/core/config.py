@@ -6,9 +6,8 @@
 
 使用方式:
     from system.core.config import (
-        SILICONFLOW_API_KEY,
-        SILICONFLOW_CHAT_MODEL,
-        SILICONFLOW_FAST_MODEL,
+        DEEPSEEK_API_KEY,
+        DEEPSEEK_CHAT_MODEL,
         ...
     )
 """
@@ -20,6 +19,8 @@ from pathlib import Path
 
 def _load_dotenv(env_path: str = None):
     """手动解析 .env 文件 (避免引入额外依赖 python-dotenv)"""
+    if env_path is None and os.environ.get("PAPERWIKI_LOAD_DOTENV", "1").lower() in {"0", "false", "no"}:
+        return
     if env_path is None:
         current_dir = Path(__file__).resolve().parent
         candidates = [
@@ -61,22 +62,11 @@ def _load_dotenv(env_path: str = None):
 # ========== 加载 .env ==========
 _load_dotenv()
 
-# Optional isolated workspace for reproducible evaluation runs. Keeping the
-# database and generated artifacts under one root prevents benchmark traffic
-# from mutating the user's normal PaperWiki workspace.
+# One application data home; the older workspace variable remains an alias.
+# An explicit test home keeps runtime data out of the source checkout.
+PAPERWIKI_HOME = os.environ.get("PAPERWIKI_HOME", "").strip()
 PAPERWIKI_WORKSPACE_ROOT = os.environ.get("PAPERWIKI_WORKSPACE_ROOT", "").strip()
 PAPERWIKI_DB_PATH = os.environ.get("PAPERWIKI_DB_PATH", "").strip()
-
-# ========== 硅基流动 API 配置 ==========
-
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
-
-SILICONFLOW_BASE_URL = os.environ.get(
-    "SILICONFLOW_BASE_URL",
-    "https://api.siliconflow.cn/v1",
-)
-
-SILICONFLOW_CHAT_URL = f"{SILICONFLOW_BASE_URL}/chat/completions"
 
 # ========== DeepSeek official API configuration ==========
 
@@ -96,51 +86,23 @@ DEEPSEEK_CHAT_MODEL = os.environ.get(
     "deepseek-v4-flash",
 )
 
-# ========== 模型分級配置 ==========
-
-# 主力模型: Wiki Chat / 面试评估 / 论文发现排序
-SILICONFLOW_CHAT_MODEL = os.environ.get(
-    "SILICONFLOW_CHAT_MODEL",
-    "deepseek-ai/DeepSeek-V3",
-)
-
-# 轻量模型: 意图路由 / 偏好抽取 / 简单分类
-SILICONFLOW_FAST_MODEL = os.environ.get(
-    "SILICONFLOW_FAST_MODEL",
-    "Qwen/Qwen3.5-9B",
-)
-
-SILICONFLOW_REVIEW_MODEL = os.environ.get(
-    "SILICONFLOW_REVIEW_MODEL",
-    "Qwen/Qwen3.6-27B",
-)
-
-SILICONFLOW_MERGE_MODEL = os.environ.get(
-    "SILICONFLOW_MERGE_MODEL",
-    "Qwen/Qwen3.6-27B",
-)
-
-SILICONFLOW_MAINTENANCE_MODEL = os.environ.get(
-    "SILICONFLOW_MAINTENANCE_MODEL",
-    SILICONFLOW_REVIEW_MODEL,
-)
-
-SILICONFLOW_MAINTENANCE_FAST_MODEL = os.environ.get(
-    "SILICONFLOW_MAINTENANCE_FAST_MODEL",
-    SILICONFLOW_FAST_MODEL,
-)
-
-# Section-level Wiki retrieval. The 0.6B embedding model is intentionally used
-# for recall rather than generation: it is inexpensive, multilingual, and the
-# main chat model still makes the final page selection.
-WIKI_VECTOR_SEARCH_ENABLED = os.environ.get("WIKI_VECTOR_SEARCH_ENABLED", "true").strip().lower() in {
-    "1", "true", "yes", "on",
-}
+# Bailian embeddings are independent of the DeepSeek generation provider.
+BAILIAN_API_KEY = (
+    os.environ.get("BAILIAN_API_KEY", "")
+    or os.environ.get("DASHSCOPE_API_KEY", "")
+    or os.environ.get("aliyunbailian-api-key", "")
+).strip()
+BAILIAN_BASE_URL = os.environ.get(
+    "BAILIAN_BASE_URL", "https://dashscope.aliyuncs.com/api/v1"
+).rstrip("/")
 WIKI_EMBEDDING_MODEL = os.environ.get(
-    "WIKI_EMBEDDING_MODEL",
-    "Qwen/Qwen3-Embedding-0.6B",
-)
-WIKI_EMBEDDING_BATCH_SIZE = int(os.environ.get("WIKI_EMBEDDING_BATCH_SIZE", "16"))
+    "WIKI_EMBEDDING_MODEL", "qwen3.7-text-embedding-flash"
+).strip()
+WIKI_EMBEDDING_DIMENSIONS = int(os.environ.get("WIKI_EMBEDDING_DIMENSIONS", "1024"))
+WIKI_VECTOR_SEARCH_ENABLED = os.environ.get(
+    "WIKI_VECTOR_SEARCH_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+WIKI_EMBEDDING_BATCH_SIZE = max(1, min(20, int(os.environ.get("WIKI_EMBEDDING_BATCH_SIZE", "16"))))
 WIKI_RRF_K = int(os.environ.get("WIKI_RRF_K", "60"))
 
 # ========== Paper parsing ==========
@@ -225,15 +187,20 @@ def get_model_runtime_summary():
     return {
         "chat_provider": "deepseek-official",
         "chat_model": DEEPSEEK_CHAT_MODEL,
-        "fast_model": SILICONFLOW_FAST_MODEL,
+        "fast_model": DEEPSEEK_CHAT_MODEL,
         "summary_provider": "deepseek-official",
         "summary_model": DEEPSEEK_CHAT_MODEL,
-        "review_model": SILICONFLOW_REVIEW_MODEL,
-        "merge_model": SILICONFLOW_MERGE_MODEL,
-        "maintenance_model": SILICONFLOW_MAINTENANCE_MODEL,
-        "maintenance_fast_model": SILICONFLOW_MAINTENANCE_FAST_MODEL,
-        "embedding_model": WIKI_EMBEDDING_MODEL if WIKI_VECTOR_SEARCH_ENABLED else "disabled",
+        "generation_provider": "deepseek-official",
+        "review_model": DEEPSEEK_CHAT_MODEL,
+        "merge_model": DEEPSEEK_CHAT_MODEL,
+        "maintenance_model": DEEPSEEK_CHAT_MODEL,
+        "maintenance_fast_model": DEEPSEEK_CHAT_MODEL,
+        "embedding_provider": "aliyun-bailian" if WIKI_VECTOR_SEARCH_ENABLED and BAILIAN_API_KEY else "disabled",
+        "embedding_model": WIKI_EMBEDDING_MODEL if WIKI_VECTOR_SEARCH_ENABLED and BAILIAN_API_KEY else "disabled",
+        "embedding_dimensions": WIKI_EMBEDDING_DIMENSIONS,
         "paper_parser_mode": PAPER_PARSER_MODE,
+        "mineru_model_version": MINERU_MODEL_VERSION,
+        "retrieval_mode": "catalog+fts+aliases+vector+rrf" if WIKI_VECTOR_SEARCH_ENABLED and BAILIAN_API_KEY else "catalog+fts+aliases",
         "mineru_configured": bool(MINERU_API_TOKEN),
         "web_search_mode": WEB_SEARCH_MODE,
         "storage_backend": STORAGE_BACKEND,
@@ -254,11 +221,10 @@ def print_config():
     print("\n" + "=" * 50)
     print("  当前配置")
     print("=" * 50)
-    print(f"  SiliconFlow Key: {mask(SILICONFLOW_API_KEY)}")
     print(f"  DeepSeek Key:    {mask(DEEPSEEK_API_KEY)}")
     print(f"  Chat Base URL:   {DEEPSEEK_BASE_URL}")
     print(f"  Chat 模型:       {DEEPSEEK_CHAT_MODEL}")
-    print(f"  Fast 模型:    {SILICONFLOW_FAST_MODEL}")
+    print(f"  Fast 模型:    {DEEPSEEK_CHAT_MODEL}")
     print("=" * 50 + "\n")
 
 

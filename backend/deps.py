@@ -11,35 +11,28 @@ from system.wiki.wiki_chat import WikiChatService
 from system.wiki.wiki_resolver import WikiResolver
 from system.wiki.chunk_index import WikiChunkIndex
 from system.wiki.paper_pipeline.store import PaperWikiPipelineStore
-from system.agent_runtime import AgentRunStore, ResearchSourceStore, ResearchTaskLedgerStore
+from system.agent_runtime import AgentRunStore, ResearchSourceStore, ResearchTaskLedgerStore, TaskPlanStore
 from system.search.resource_recommender import LearningResourceRecommender
 from system.search.web_fetch import WebFetchTool
 from system.search.web_search import WebSearchTool
-from system.discovery.arxiv_service import ArxivMcpService
+from system.discovery.arxiv_service import ArxivService
 from system.storage import get_storage_layout
 from system.wiki.local_workspace import LocalWikiWorkspace
 from system.core.config import (
+    BAILIAN_API_KEY,
+    WIKI_VECTOR_SEARCH_ENABLED,
     DEEPSEEK_CHAT_MODEL,
-    SILICONFLOW_FAST_MODEL,
-    SILICONFLOW_MAINTENANCE_FAST_MODEL,
-    SILICONFLOW_MAINTENANCE_MODEL,
-    SILICONFLOW_MERGE_MODEL,
-    SILICONFLOW_REVIEW_MODEL,
     WEB_SEARCH_MAX_RESULTS,
     WEB_SEARCH_MODE,
     WEB_SEARCH_TIMEOUT_SECONDS,
-    WIKI_EMBEDDING_BATCH_SIZE,
-    WIKI_EMBEDDING_MODEL,
     WIKI_RRF_K,
-    WIKI_VECTOR_SEARCH_ENABLED,
 )
+from system.core.bailian_embeddings import BailianEmbeddings
 
 try:
-    from system.core.siliconflow_client import DeepSeekChat, SiliconFlowChat, SiliconFlowEmbeddings
+    from system.core.deepseek_client import DeepSeekChat
 except Exception:
     DeepSeekChat = None
-    SiliconFlowChat = None
-    SiliconFlowEmbeddings = None
 
 
 @lru_cache(maxsize=1)
@@ -85,15 +78,13 @@ def get_chat_llm():
 
 @lru_cache(maxsize=1)
 def get_fast_llm():
-    """轻量模型: 意图路由 / 偏好抽取 / 简单分类"""
-    if SiliconFlowChat is None:
-        return None
+    """Routing and lightweight extraction, using the official DeepSeek endpoint."""
     try:
-        return SiliconFlowChat(model=SILICONFLOW_FAST_MODEL)
+        return DeepSeekChat(model=DEEPSEEK_CHAT_MODEL, temperature=0.0,
+                            max_tokens=1800, max_retries=1)
     except Exception as exc:
-        print(f"[deps] Fast LLM unavailable: {exc}")
-        # 回退到主力模型
-        return get_chat_llm()
+        print(f"[deps] get_fast_llm unavailable: {exc}")
+        return None
 
 
 @lru_cache(maxsize=1)
@@ -110,50 +101,46 @@ def get_summary_llm():
 
 @lru_cache(maxsize=1)
 def get_review_llm():
-    """Dedicated deterministic reviewer model for paper candidates."""
-    if SiliconFlowChat is None:
-        return None
+    """Source evidence verification, using the official DeepSeek endpoint."""
     try:
-        return SiliconFlowChat(model=SILICONFLOW_REVIEW_MODEL, temperature=0.0, max_tokens=2200)
+        return DeepSeekChat(model=DEEPSEEK_CHAT_MODEL, temperature=0.0,
+                            max_retries=1)
     except Exception as exc:
-        print(f"[deps] Review LLM unavailable: {exc}")
+        print(f"[deps] get_review_llm unavailable: {exc}")
         return None
 
 
 @lru_cache(maxsize=1)
 def get_merge_llm():
-    """Dedicated deterministic merge-planning model for paper cards."""
-    if SiliconFlowChat is None:
-        return None
+    """Claim comparison and merge planning, using the official DeepSeek endpoint."""
     try:
-        return SiliconFlowChat(model=SILICONFLOW_MERGE_MODEL, temperature=0.0, max_tokens=3600)
+        return DeepSeekChat(model=DEEPSEEK_CHAT_MODEL, temperature=0.0,
+                            max_tokens=4096, max_retries=1)
     except Exception as exc:
-        print(f"[deps] Merge LLM unavailable: {exc}")
+        print(f"[deps] get_merge_llm unavailable: {exc}")
         return None
 
 
 @lru_cache(maxsize=1)
 def get_maintenance_llm():
-    """Stronger maintenance model for semantic repair and web-update judgment."""
-    if SiliconFlowChat is None:
-        return None
+    """Knowledge maintenance, using the official DeepSeek endpoint."""
     try:
-        return SiliconFlowChat(model=SILICONFLOW_MAINTENANCE_MODEL, temperature=0.0, max_tokens=3200)
+        return DeepSeekChat(model=DEEPSEEK_CHAT_MODEL, temperature=0.0,
+                            max_tokens=4096, max_retries=1)
     except Exception as exc:
-        print(f"[deps] Maintenance LLM unavailable: {exc}")
-        return get_review_llm()
+        print(f"[deps] get_maintenance_llm unavailable: {exc}")
+        return None
 
 
 @lru_cache(maxsize=1)
 def get_maintenance_fast_llm():
-    """Cheap maintenance model for planning and controlled-vocabulary routing."""
-    if SiliconFlowChat is None:
-        return None
+    """Maintenance planning, using the official DeepSeek endpoint."""
     try:
-        return SiliconFlowChat(model=SILICONFLOW_MAINTENANCE_FAST_MODEL, temperature=0.0, max_tokens=1800)
+        return DeepSeekChat(model=DEEPSEEK_CHAT_MODEL, temperature=0.0,
+                            max_tokens=1800, max_retries=1)
     except Exception as exc:
-        print(f"[deps] Maintenance fast LLM unavailable: {exc}")
-        return get_fast_llm()
+        print(f"[deps] get_maintenance_fast_llm unavailable: {exc}")
+        return None
 
 
 @lru_cache(maxsize=1)
@@ -163,16 +150,10 @@ def get_chunk_index() -> WikiChunkIndex:
 
 @lru_cache(maxsize=1)
 def get_wiki_embeddings():
-    if not WIKI_VECTOR_SEARCH_ENABLED or SiliconFlowEmbeddings is None:
+    """One shared, bounded client for Wiki and Claim semantic retrieval."""
+    if not WIKI_VECTOR_SEARCH_ENABLED or not BAILIAN_API_KEY:
         return None
-    try:
-        return SiliconFlowEmbeddings(
-            model=WIKI_EMBEDDING_MODEL,
-            batch_size=WIKI_EMBEDDING_BATCH_SIZE,
-        )
-    except Exception as exc:
-        print(f"[deps] Wiki embeddings unavailable: {exc}")
-        return None
+    return BailianEmbeddings(api_key=BAILIAN_API_KEY)
 
 
 @lru_cache(maxsize=1)
@@ -204,8 +185,8 @@ def get_resource_recommender() -> LearningResourceRecommender:
 
 
 @lru_cache(maxsize=1)
-def get_arxiv_service() -> ArxivMcpService:
-    return ArxivMcpService()
+def get_arxiv_service() -> ArxivService:
+    return ArxivService()
 
 
 @lru_cache(maxsize=1)
@@ -216,6 +197,11 @@ def get_research_ledger() -> ResearchTaskLedgerStore:
 @lru_cache(maxsize=1)
 def get_research_sources() -> ResearchSourceStore:
     return ResearchSourceStore(db_path=get_wiki_store().db_path)
+
+
+@lru_cache(maxsize=1)
+def get_task_plans() -> TaskPlanStore:
+    return get_session_store().task_plans
 
 
 @lru_cache(maxsize=1)
@@ -249,15 +235,14 @@ def get_wiki_chat() -> WikiChatService:
         session_store=get_session_store(),
         llm=get_chat_llm(),
         memory_llm=get_chat_llm(),
+        title_llm=get_chat_llm(),
         chunk_index=get_chunk_index(),
-        web_search=get_web_search(),
-        web_fetch=get_web_fetch(),
-        resource_recommender=get_resource_recommender(),
         wiki_resolver=get_wiki_resolver(),
         evidence_store=pipeline_store,
         runtime=runtime,
         arxiv_service=get_arxiv_service(),
         research_ledger=get_research_ledger(),
         research_sources=get_research_sources(),
+        task_plans=get_task_plans(),
         local_workspace=get_local_wiki_workspace(),
     )

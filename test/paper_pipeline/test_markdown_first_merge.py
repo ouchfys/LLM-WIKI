@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -48,10 +49,68 @@ def make_agent(work_dir: Path, llm=None) -> tuple[PaperMergeAgent, WikiStore]:
     return agent, wiki_store
 
 
+def test_topic_merge_preserves_existing_reader_guide_without_model() -> None:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        agent, _ = make_agent(Path(tmp))
+        guide = "### 直观理解\n\n旧主题导读，包含已有来源的解释。"
+        result = agent._merged_reading_guide(
+            existing={"reading_guide": guide, "source_packet_ids": ["old-paper"]},
+            incoming={"reading_guide": "### 新材料\n\n另一篇论文提供新的证据。"},
+            merged={"definition": "合并后的定义"},
+            packet=SourcePacket(source_id="new-paper", title="New Paper"),
+        )
+        assert result == guide
+
+
+def test_topic_merge_refreshes_reader_guide_from_same_source() -> None:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        agent, _ = make_agent(Path(tmp))
+        result = agent._merged_reading_guide(
+            existing={"reading_guide": "旧导读", "source_packet_ids": ["paper"]},
+            incoming={"reading_guide": "### 更新\n\n同一论文重新编写的导读。"},
+            merged={},
+            packet=SourcePacket(source_id="paper", title="Paper"),
+        )
+        assert "同一论文重新编写" in result
+
+
+def test_topic_merge_synthesizes_guide_when_a_second_source_arrives() -> None:
+    class GuideLLM:
+        def invoke(self, prompt, **_kwargs):
+            assert "existing_guide" in prompt and "incoming_guide" in prompt
+            return json.dumps({"reading_guide": (
+                "### 这个概念是什么\n\n它描述系统怎样保存可复用的执行经验。"
+                "旧研究说明如何记录步骤，新研究补充了核验结果的办法。\n\n"
+                "### 怎样理解\n\n可以把它想成附有检查记录的工作笔记："
+                "笔记帮助下次继续工作，但仍需核对原始证据。这个例子只是解释概念。"
+                "两项研究讨论的任务条件并不完全相同，因此不能把其中一篇报告的结果"
+                "直接当作所有系统都能达到的效果。阅读时应分别查看各自的测试范围。"
+            )}, ensure_ascii=False)
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        agent, _ = make_agent(Path(tmp), llm=GuideLLM())
+        guide = agent._merged_reading_guide(
+            existing={"reading_guide": "### 原有理解\n\n记录执行步骤。", "source_packet_ids": ["old-paper"]},
+            incoming={"reading_guide": "### 新证据\n\n核验执行结果。"},
+            merged={"definition": "保存并核验经验"},
+            packet=SourcePacket(source_id="new-paper", title="New Paper"),
+        )
+        assert "旧研究" in guide and "新研究" in guide
+
+
 def test_create_new_merge_writes_markdown_then_reindexes_sqlite() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         work_dir = Path(tmp)
         agent, wiki_store = make_agent(work_dir)
+        class RelationModel:
+            def invoke(self, prompt, **kwargs):
+                batch = json.loads(prompt.split("Comparison batch:\n", 1)[1])
+                return json.dumps({"decisions": [{**pair, "relation": "complements",
+                    "confidence": .9, "same_entity": True, "same_aspect": False,
+                    "scope_overlap": True} for pair in batch["pairs"]]})
+        # A model-free, unresolved comparison now correctly awaits approval.
+        # This test exercises the successful Markdown commit path instead.
+        agent.relation_resolver.llm = RelationModel()
 
         packet = SourcePacket(
             source_id="packet-smoke",

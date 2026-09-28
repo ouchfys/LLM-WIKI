@@ -6,13 +6,13 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from system.storage.layout import resolve_database_path
 from typing import Any, Dict, List, Optional
 
 
 class MonthlyReadingStore:
     def __init__(self, db_path: str = None):
-        repo_root = Path(__file__).resolve().parents[2]
-        path = Path(db_path) if db_path else repo_root / "sessions.db"
+        path = resolve_database_path(db_path)
         self.db_path = str(path)
         self._init_db()
 

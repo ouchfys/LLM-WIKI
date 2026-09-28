@@ -2,13 +2,22 @@ import hashlib
 import re
 import shutil
 import uuid
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from backend.deps import get_merge_llm, get_paper_index, get_review_llm, get_summary_llm, get_wiki_store, get_chunk_index
+from backend.deps import (
+    get_chunk_index,
+    get_merge_llm,
+    get_paper_index,
+    get_review_llm,
+    get_summary_llm,
+    get_wiki_embeddings,
+    get_wiki_store,
+)
 from backend.task_executor import submit_agent_task
 from system.paper_index.store import PaperIndexStore
 from system.discovery.source_adapters import ArxivAdapter
@@ -22,12 +31,13 @@ from system.wiki.maintenance.runner import WikiMaintenanceRunner
 from system.wiki.raw_source_vault import RawSourceVault
 from system.wiki.wiki_store import WikiStore
 from system.agent_runtime import AgentRunLease, AgentRunStore, TraceRecorder
+from system.agent_runtime.control import RunControl, RunCancelled
 
 
 router = APIRouter()
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 STORAGE_LAYOUT = get_storage_layout()
+REPO_ROOT = STORAGE_LAYOUT.repo_root
 SOURCES_DIR = STORAGE_LAYOUT.sources_dir
 UPLOAD_DIR = STORAGE_LAYOUT.source_dir("papers", "uploads")
 WIKI_COMPILE_PIPELINES = {"wiki_compile", "four_agent"}  # legacy value reads persisted runs
@@ -677,6 +687,7 @@ def _run_pdf_pipeline(
             llm=get_summary_llm(),
             review_llm=get_review_llm(),
             merge_llm=get_merge_llm(),
+            claim_embedder=get_wiki_embeddings(),
             approval_mode=approval_mode,
             stage_callback=stage_callback,
         ))
@@ -696,6 +707,13 @@ def _proposal_risk_reasons(revision: dict[str, Any]) -> list[str]:
     checks = [item for item in verification.get("checks") or [] if isinstance(item, dict)]
     if not claims:
         reasons.append("no_verified_claims")
+    for item in affected:
+        decision = item.get("relation_decision") or {}
+        resolution_status = str(decision.get("resolution_status") or "resolved")
+        if resolution_status != "resolved":
+            reasons.append("claim_relation_" + resolution_status)
+        elif (item.get("requires_review") or decision.get("requires_review")) and str(item.get("action") or "") not in {"challenge_claim", "supersede_claim"}:
+            reasons.append("claim_relation_unresolved")
     if any(
         str(item.get("action") or "") in {"challenge_claim", "supersede_claim"}
         and bool(
@@ -744,6 +762,7 @@ def _run_ingestion_job(
     if not lease.start():
         return
     trace = TraceRecorder(runs, run_id)
+    trace.lease_owner = lease.owner
     normalized_pipeline = (pipeline or "").strip().lower()
     initial_stage = "indexing" if normalized_pipeline in {"paperindex", "fallback", "basic_fallback"} else "extracting"
     jobs.merge_metadata(job_id, {"runner_version": "agent-state-v1", "runner_pipeline": normalized_pipeline, "agent_run_id": run_id, "approval_mode": approval_mode})
@@ -751,6 +770,7 @@ def _run_ingestion_job(
     try:
         progress = {"EXTRACTING": 0.12, "DISTILLING": 0.42, "VERIFYING": 0.64, "COMPILING_PROPOSAL": 0.82}
         def on_stage(state: str, details: dict) -> None:
+            lease.check()
             current = runs.get_run(run_id) or {}
             if current.get("current_state") != state:
                 runs.transition(run_id, state, context_updates=details, reason="paper pipeline stage")
@@ -759,7 +779,10 @@ def _run_ingestion_job(
 
         if normalized_pipeline not in WIKI_COMPILE_PIPELINES:
             on_stage("EXTRACTING", {"pdf_path": pdf_path, "compatibility_pipeline": normalized_pipeline})
-        with trace.bind():
+        control = RunControl(runs, run_id, "")
+        control.lease_owner = lease.owner
+        with control.bind(), trace.bind():
+            lease.check()
             result = _run_pdf_pipeline(
                 pdf_path=Path(pdf_path),
                 source_url=source_url,
@@ -769,6 +792,7 @@ def _run_ingestion_job(
                 approval_mode=approval_mode if normalized_pipeline in WIKI_COMPILE_PIPELINES else "auto",
                 stage_callback=on_stage if normalized_pipeline in WIKI_COMPILE_PIPELINES else None,
             )
+        lease.check()
         if normalized_pipeline not in WIKI_COMPILE_PIPELINES:
             for state in ("DISTILLING", "VERIFYING", "COMPILING_PROPOSAL"):
                 on_stage(state, {"compatibility_pipeline": normalized_pipeline, "detail": "legacy stage boundary"})
@@ -782,7 +806,9 @@ def _run_ingestion_job(
                 output_data={"source_packet_id": result.get("source_packet_id", "")},
             )
         proposals = [item for item in result.get("proposals") or [] if item.get("revision_id")]
-        if proposals and approval_mode in {"manual", "risk"}:
+        # Even auto-mode compilation can defer unsafe writes as proposals.
+        # Never mark that run complete without exposing/deciding its approvals.
+        if proposals:
             approvals = [
                 runs.create_approval(
                     run_id=run_id,
@@ -795,7 +821,7 @@ def _run_ingestion_job(
             auto_accepted_ids: list[str] = []
             manual_approval_ids: list[str] = []
             proposal_store = PaperWikiPipelineStore(db_path=db_path)
-            if approval_mode == "risk":
+            if approval_mode in {"risk", "auto"}:
                 for approval in approvals:
                     revision = proposal_store.get_revision(str(approval["revision_id"])) or {}
                     risk_reasons = _proposal_risk_reasons(revision)
@@ -814,6 +840,8 @@ def _run_ingestion_job(
                             reason="auto-accepted by evidence-closed risk policy",
                         )
                         auto_accepted_ids.append(str(approval["id"]))
+            else:
+                manual_approval_ids = [str(item["id"]) for item in approvals]
             runs.transition(
                 run_id, "AWAITING_APPROVAL",
                 context_updates={
@@ -844,7 +872,7 @@ def _run_ingestion_job(
                     "agent_run_id": run_id,
                 },
             )
-            if approval_mode == "risk" and not manual_approval_ids:
+            if approval_mode in {"risk", "auto"} and not manual_approval_ids:
                 from backend.api.agent_runs import _finalize_run_if_decided
 
                 _finalize_run_if_decided(
@@ -895,8 +923,15 @@ def _run_ingestion_job(
             result={"ok": True, **result, "maintenance": maintenance_result},
             reason="ingestion and maintenance completed",
         )
+    except RunCancelled:
+        # Deletion already persisted cancellation. Lease loss must leave the
+        # task recoverable, not let a stale worker change its new owner's state.
+        return
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc)
+        current = runs.get_run(run_id) or {}
+        if current.get("cancel_requested") or current.get("lease_owner") != lease.owner:
+            return
         jobs.update_job(job_id, status="failed", stage="failed", progress=1.0, error=str(detail))
         try:
             current = runs.get_run(run_id) or {}
@@ -934,8 +969,23 @@ def create_ingestion_job(
     source_url: str = Form(""),
     pipeline: str = Form("wiki_compile"),
     approval_mode: str = Form("risk"),
+    owner_session_id: str = Form(""),
+    parent_run_id: str = Form(""),
+    request_id: str = Form(""),
     store: PaperIndexStore = Depends(get_paper_index),
 ):
+    # Direct Python callers do not resolve FastAPI Form defaults.
+    owner_session_id = owner_session_id if isinstance(owner_session_id, str) else ""
+    parent_run_id = parent_run_id if isinstance(parent_run_id, str) else ""
+    request_id = request_id if isinstance(request_id, str) else ""
+    jobs = IngestionJobStore(db_path=store.db_path)
+    runs = AgentRunStore(db_path=store.db_path)
+    if owner_session_id:
+        try:
+            with closing(runs._connect()) as conn:
+                jobs.validate_owner(conn, owner_session_id, parent_run_id, request_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     if file and file.filename:
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail="Only PDF uploads are supported.")
@@ -952,29 +1002,37 @@ def create_ingestion_job(
 
     existing = _existing_pdf_ingestion(dest, store.db_path)
     if existing:
+        if owner_session_id and existing.get("job_id"):
+            with closing(runs._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                jobs.attach_owner(conn, existing["job_id"], owner_session_id, parent_run_id, request_id)
+                conn.commit()
         return existing
 
-    jobs = IngestionJobStore(db_path=store.db_path)
-    job = jobs.create_job(
-        source_type="paper_pdf",
-        source_uri=source_uri,
-        stage="queued",
-        metadata={
-            "source_url": source_url,
-            "pipeline": pipeline or "wiki_compile",
-            "filename": file.filename if file and file.filename else Path(source_uri).name,
-        },
-    )
-    run = AgentRunStore(db_path=jobs.db_path).create_run(
-        run_type="paper_ingestion",
-        source_uri=source_uri,
-        approval_mode=approval_mode if approval_mode in {"risk", "manual", "auto"} else "risk",
-        ingestion_job_id=job["id"],
-        context={
-            "job_id": job["id"], "pdf_path": str(dest.resolve()),
-            "source_url": source_url, "pipeline": pipeline or "wiki_compile",
-        },
-    )
+    with closing(runs._connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        jobs.validate_owner(conn, owner_session_id, parent_run_id, request_id)
+        previous = conn.execute("SELECT * FROM ingestion_jobs WHERE id=?", (request_id,)).fetchone() if request_id else None
+        if previous:
+            job = jobs._row(previous)
+            run = runs._run_row(conn.execute("SELECT * FROM agent_runs WHERE ingestion_job_id=?", (job["id"],)).fetchone())
+        else:
+            job = jobs.create_job(
+                source_type="paper_pdf", source_uri=source_uri, stage="queued",
+                job_id=request_id if owner_session_id else "", connection=conn,
+                metadata={"source_url": source_url, "pipeline": pipeline or "wiki_compile",
+                          "owner_session_ids": [owner_session_id] if owner_session_id else [],
+                          "independent": not bool(owner_session_id),
+                          "filename": file.filename if file and file.filename else Path(source_uri).name},
+            )
+            run = runs.create_run(
+                run_type="paper_ingestion", source_uri=source_uri, approval_mode=approval_mode,
+                ingestion_job_id=job["id"], connection=conn,
+                context={"job_id": job["id"], "pdf_path": str(dest.resolve()),
+                         "source_url": source_url, "pipeline": pipeline or "wiki_compile"},
+            )
+        jobs.attach_owner(conn, job["id"], owner_session_id, parent_run_id, request_id)
+        conn.commit()
     jobs.merge_metadata(job["id"], {"agent_run_id": run["id"], "approval_mode": run["approval_mode"]})
     dispatch = submit_agent_task(
         run_id=str(run["id"]),

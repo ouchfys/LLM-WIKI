@@ -80,7 +80,7 @@ def test_all_prompt_envelopes_include_tools_and_reserve_output():
     budget = service.context_budget
     budget.check_request(prompt, output_tokens=1200)
     budget.check_request(fallback, output_tokens=900)
-    budget.check_request(native, output_tokens=600, tools=service._native_tool_specs())
+    budget.check_request(native, output_tokens=600, tools=service._default_native_tool_specs())
     for value in [prompt, fallback, json.dumps(native, ensure_ascii=False)]:
         assert "CURRENT-MUST-REMAIN" in value
     with pytest.raises(ContextBudgetExceeded):

@@ -28,7 +28,7 @@ def extract_paper_source(
             and cached.elements
             and cached.blocks
             and cached.parser_used in {"arxiv-html", "mineru-vlm", "pymupdf-fallback"}
-            and cached.metadata.get("extraction_schema_version") == "paper-source-v5"
+            and cached.metadata.get("extraction_schema_version") == "paper-source-v6"
         ):
             cached.metadata = {
                 **cached.metadata,
@@ -39,10 +39,11 @@ def extract_paper_source(
     parsed = _parse_pdf(pdf_path, source_url=source_url, source_key=source_hash)
     title = sanitize_wiki_text(parsed.get("title") or pdf_path.stem).strip() or pdf_path.stem
     summary = sanitize_wiki_text(parsed.get("summary") or "")
+    metadata = dict(parsed.get("metadata") or {})
     if not summary:
         summary = _quick_pdf_abstract(pdf_path)
-    metadata = dict(parsed.get("metadata") or {})
-    metadata["extraction_schema_version"] = "paper-source-v5"
+        metadata["abstract_source"] = "pdf_abstract" if summary else "not_found"
+    metadata["extraction_schema_version"] = "paper-source-v6"
     blocks = parsed.get("blocks") or []
     source_document = parsed.get("source_document") if isinstance(parsed.get("source_document"), dict) else {}
     normalized_elements = parsed.get("elements") if isinstance(parsed.get("elements"), list) else []
@@ -122,8 +123,54 @@ def extract_paper_source(
 def _parse_pdf(pdf_path: Path, *, source_url: str = "", source_key: str = "") -> dict[str, Any]:
     parsed = PaperParserRouter().parse(pdf_path, source_url=source_url, source_key=source_key)
     result = parsed.as_pipeline_dict()
-    result["summary"] = _make_summary(parsed.text or parsed.markdown)
+    abstract, origin = _parsed_abstract(parsed)
+    result["summary"] = abstract
+    result["metadata"] = {**(result.get("metadata") or {}), "abstract_source": origin}
     return result
+
+
+def _parsed_abstract(parsed) -> tuple[str, str]:
+    """Select an identified abstract, never the first N characters of a paper."""
+    metadata = parsed.metadata or {}
+    explicit = sanitize_wiki_text(str(metadata.get("abstract") or "")).strip()
+    if explicit:
+        return explicit, "parser_metadata"
+    abstract = _abstract_section(parsed.markdown or "")
+    if abstract:
+        return abstract, "markdown_abstract"
+    paragraphs = []
+    for block in parsed.elements or parsed.blocks or []:
+        headings = block.get("heading_path") or (block.get("metadata") or {}).get("heading_path") or []
+        heading = str(block.get("section") or (headings[-1] if headings else ""))
+        if not re.fullmatch(r"\s*(?:abstract|摘要)\s*", heading, flags=re.I):
+            continue
+        text = sanitize_wiki_text(str(block.get("text") or "")).strip()
+        if text and not re.fullmatch(r"(?:abstract|摘要)\s*[:：]?", text, flags=re.I):
+            paragraphs.append(text)
+    if paragraphs:
+        return "\n\n".join(dict.fromkeys(paragraphs)), "source_section"
+    abstract = _abstract_section(parsed.text or "")
+    if abstract:
+        return abstract, "text_abstract"
+    return "", "not_found"
+
+
+def _abstract_section(text: str) -> str:
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    marker = re.search(
+        r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?(?:abstract\b|摘要)(?:\*\*|__)?[ \t]*(?:[:：—–-][ \t]*|\n)",
+        text,
+    )
+    if not marker:
+        return ""
+    body = text[marker.end():]
+    end = re.search(
+        r"(?im)^\s*(?:#{1,6}\s+\S|(?:\d+(?:\.\d+)*\.?\s+)?(?:Introduction|Keywords?|References|引言|关键词)\b|(?:Figure|Table)\s+\d+\s*[:.])",
+        body,
+    )
+    if end:
+        body = body[:end.start()]
+    return sanitize_wiki_text(body).strip()
 
 
 def _sections_from_blocks(
@@ -243,12 +290,7 @@ def _quick_pdf_abstract(pdf_path: Path) -> str:
         doc.close()
     except Exception:
         return ""
-    match = re.search(
-        r"\bAbstract\b\s*(.*?)(?:\n\s*(?:1\.?\s*)?Introduction\b|\n\s*Keywords?\b)",
-        text.replace("\r\n", "\n").replace("\r", "\n"),
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    return _make_summary(match.group(1), max_len=900) if match else ""
+    return _abstract_section(text)
 
 
 def _make_summary(text: str, max_len: int = 600) -> str:

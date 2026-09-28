@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 
-from system.core.config import SILICONFLOW_MAINTENANCE_MODEL
-from system.core.siliconflow_client import SiliconFlowChat
+from system.core.config import DEEPSEEK_CHAT_MODEL
+from system.core.deepseek_client import DeepSeekChat
 from system.wiki.maintenance.candidate_processor import MaintenanceCandidateProcessor
 
 
@@ -15,8 +15,8 @@ def main() -> int:
     parser.add_argument("--use-llm", action="store_true", help="Use the maintenance reviewer/merge-planner LLM.")
     args = parser.parse_args()
 
-    llm = SiliconFlowChat(
-        model=SILICONFLOW_MAINTENANCE_MODEL,
+    llm = DeepSeekChat(
+        model=DEEPSEEK_CHAT_MODEL,
         temperature=0.0,
         max_tokens=3200,
     ) if args.use_llm else None

@@ -1,8 +1,7 @@
 """Object storage abstraction for durable source artifacts.
 
-Local files are still kept as a developer cache, but callers can store and read
-`oss://...` URIs directly. Durable user artifacts are organized under
-sources/, wiki/, and queries/ beneath STORAGE_ROOT_PREFIX.
+Local artifacts live in the configured application data home. Callers can also
+store and read `oss://...` URIs directly through the optional remote backend.
 """
 
 from __future__ import annotations
@@ -14,16 +13,14 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from system.core import config
+from system.storage.layout import get_storage_layout
 
 
 class ObjectStorage:
     TENANT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
     def __init__(self, tenant_id: str | None = None):
-        configured_workspace = str(getattr(config, "PAPERWIKI_WORKSPACE_ROOT", "") or "").strip()
-        self.repo_root = (
-            Path(configured_workspace) if configured_workspace else Path(__file__).resolve().parents[2]
-        )
+        self.repo_root = get_storage_layout().data_root
         self.backend = (getattr(config, "STORAGE_BACKEND", "local") or "local").lower()
         configured_tenant = getattr(config, "STORAGE_TENANT_ID", "admin") or "admin"
         selected_tenant = configured_tenant if tenant_id is None else tenant_id

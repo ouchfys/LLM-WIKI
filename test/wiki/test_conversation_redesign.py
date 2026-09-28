@@ -188,19 +188,20 @@ def test_legacy_database_migration_is_idempotent(tmp_path):
     assert store.get_all_preferences_detailed()[0]["source_session_id"] == ""
 
 
-def test_history_tools_reach_both_model_prompt_paths(tmp_path):
+def test_saved_results_reach_both_model_prompt_paths(tmp_path):
     store, sid = populated(tmp_path)
     service = WikiChatService(object(), wiki_resolver=object(), session_store=store, context_budget=small_budget())
     control = RunControl(None, "", "read earlier")
     control.session_id = sid
+    result_id = store.save_tool_result(sid, "local_shell", {}, {"content": "Question-0"})
     for normalize, raw in [
-        (service._normalize_agent_tool_calls, {"tool_calls": [{"name": "read_session_messages", "arguments": {"start_id": 1, "end_id": 2}}]}),
-        (service._normalize_native_tool_calls, {"tool_calls": [{"function": {"name": "read_session_messages", "arguments": '{"start_id": 1, "end_id": 2}'}}]}),
+        (service._normalize_agent_tool_calls, {"tool_calls": [{"name": "read_tool_result", "arguments": {"result_id": result_id}}]}),
+        (service._normalize_native_tool_calls, {"tool_calls": [{"function": {"name": "read_tool_result", "arguments": json.dumps({"result_id": result_id})}}]}),
     ]:
         calls = normalize(raw, "earlier", 4)
-        assert calls[0].arguments["start_id"] == 1
+        assert calls[0].arguments["result_id"] == result_id
     with control.bind():
-        observation = service._execute_agent_tool_call(AgentToolCall("search_session_history", {"query": "Question-0"}), [], [], [], 4)
+        observation = service._execute_agent_tool_call(AgentToolCall("read_tool_result", {"result_id": result_id}), [], [], [], 4)
     assert "Question-0" in service._observation_context([observation])
     assert "Question-0" in service._answer_observation_context([service._observation_payload(observation)])
     assert "result_id=" in observation.summary
@@ -229,6 +230,14 @@ def test_compaction_under_tool_loop_pressure_updates_shared_history(tmp_path):
     observed = []
 
     class Service(WikiChatService):
+        # Keep this 8 KB byte-counting fixture focused on history pressure.
+        # Production instructions and complete tool contracts are covered separately.
+        DEFAULT_AGENT_TOOLS = frozenset({"wiki_open"})
+
+        @staticmethod
+        def _local_agent_rules():
+            return "Use wiki_open when source content is needed.\n"
+
         def _run_tool_loop(self, message, effective_query, history, **kwargs):
             self._tool_loop_prompt(message, effective_query, history, [], 0, 4)
             observed.append(list(history))

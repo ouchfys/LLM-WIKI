@@ -3,7 +3,6 @@ import { createRouter, createWebHistory } from 'vue-router'
 const ChatPage = () => import('./pages/Wiki.vue')
 const CapturePage = () => import('./pages/CaptureNote.vue')
 const KnowledgeVaultPage = () => import('./pages/KnowledgeVault.vue')
-const EvaluationPage = () => import('./pages/EvaluationDashboard.vue')
 const ReviewCenterPage = () => import('./pages/ReviewCenter.vue')
 
 const router = createRouter({
@@ -12,7 +11,7 @@ const router = createRouter({
     { path: '/', component: ChatPage },
     { path: '/capture', component: CapturePage },
     { path: '/vault', component: KnowledgeVaultPage },
-    { path: '/evaluation', component: EvaluationPage },
+    { path: '/evaluation', redirect: '/' },
     { path: '/reviews', component: ReviewCenterPage },
     { path: '/daily', redirect: '/vault' },
     { path: '/monthly-reads', redirect: '/vault' },

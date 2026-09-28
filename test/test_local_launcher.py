@@ -61,8 +61,9 @@ def test_occupied_port_does_not_initialize_project(monkeypatch, capsys):
     assert "--port" in capsys.readouterr().err
 
 
-def test_launch_anchors_project_and_opens_only_when_ready(tmp_path, monkeypatch):
+def test_launch_builds_from_installation_and_runs_in_data_home(tmp_path, monkeypatch, capsys):
     import uvicorn
+    from system.storage.layout import StorageLayout
 
     root = tmp_path / "project"
     root.mkdir()
@@ -70,7 +71,10 @@ def test_launch_anchors_project_and_opens_only_when_ready(tmp_path, monkeypatch)
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
     monkeypatch.setattr(cli, "PROJECT_ROOT", root)
-    monkeypatch.setattr(cli, "ensure_frontend", lambda *args: None)
+    data_root = tmp_path / "应用数据"
+    monkeypatch.setattr(cli, "get_storage_layout", lambda: StorageLayout(data_root))
+    builds = []
+    monkeypatch.setattr(cli, "ensure_frontend", lambda *args: builds.append(args))
     opened = cli.threading.Event()
     observations = []
 
@@ -89,7 +93,9 @@ def test_launch_anchors_project_and_opens_only_when_ready(tmp_path, monkeypatch)
     monkeypatch.setattr(uvicorn, "Server", Server)
     monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.set())
     assert cli.serve(0, True, False) == 0
-    assert observations == [root]
+    assert builds == [(root, False)]
+    assert observations == [data_root]
+    assert str(data_root) in capsys.readouterr().out
 
 
 def test_failed_build_stops_launch(tmp_path, monkeypatch):

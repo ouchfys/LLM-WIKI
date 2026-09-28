@@ -1,0 +1,277 @@
+{
+  "scope": "Frozen original rejected sections and persisted source spans from run 68c69fba-fac3-452e-a334-e208e3f30bc8. Structural regression only; no assertion of semantic correctness.",
+  "cases": [
+    {
+      "revision_id": "e8166e2c-5084-46d1-bb95-0dbd4b603d14",
+      "claim": {
+        "id": "repo-1d0ee676f74eb68605c9ec0e-claim-4",
+        "statement": "综合三处源码，Codex CLI 的记忆系统呈现三个特征：(1) **注入侧有类型与预算**——记忆以两个具名 fragment 进入上下文，各自独立成消息，硬上限 8,900 字节；(2) **就绪侧有显式门控**——v2 记忆上下文只有在 consolidation 线程数达标且 memory_summary.md 有效时才被标记 ready，默认门槛 20 个线程；(3) **接口侧刻意不透明**——状态接口只返回计数与布尔就绪位，不返回记忆内容或持久化细节。\n\n记忆的持久化落在 sqlite state db 的 v2 记忆存储中，摘要文件落在 `codex_home/<v2 目录>/memory_summary.md`。",
+        "evidence_ids": [
+          "repo_fef1f3a2376440a25d994310",
+          "repo_4e53799258e0d45f00463440",
+          "repo_876d047a2ce2f8276b4d7c22"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "3"
+      ]
+    },
+    {
+      "revision_id": "04a1a541-6732-4d0d-87a2-ca2cc7a90381",
+      "claim": {
+        "id": "repo-1d0ee676f74eb68605c9ec0e-claim-3",
+        "statement": "codex-rs/app-server/src/request_processors/memory_status.rs 实现了 ThreadRequestProcessor::memory_status，文件头注释为 \"Reports v2 readiness without exposing memory contents or persistence details to clients\"。其流程为：\n\n1. 取 params.min_consolidated_threads，缺省为 20；若不在 1..=4096 内则返回 invalid_params(\"minConsolidatedThreads must be between 1 and 4096\")。\n2. 取 self.state_db，缺失则返回 internal_error(\"sqlite state db unavailable for memory status\")。\n3. 通过 db.memories_for_version(MemoryVersion::V2) 打开 v2 记忆存储。\n4. 调用 store.max_consolidated_thread_count() 得到已合并线程数 count。\n5. 读取 self.config.codex_home.join(MemoryVersion::V2.directory_name()) 下的 memory_summary.md（读取失败则视为 None）。\n6. ready = count >= minimum && summary 通过 codex_memories_write::workspace::is_valid_v2_summary 校验。\n7. 返回 MemoryStatusResponse { v2_consolidated_threads: count, v2_ready: ready }。\n\n因此 v2 记忆就绪需要同时满足两个条件：已合并线程数达到阈值，且 codex_home 下 v2 目录中的 memory_summary.md 通过有效性校验。",
+        "evidence_ids": [
+          "repo_876d047a2ce2f8276b4d7c22"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7"
+      ]
+    },
+    {
+      "revision_id": "5a38442d-00d8-449b-936f-83417638ed48",
+      "claim": {
+        "id": "repo-b384328ba134413dce7c6527-claim-1",
+        "statement": "该实现持有 now 时钟、storageState = new InMemoryStorageState()、commitQueue: Promise<void> = Promise.resolve()、state: \"open\" | \"closing\" | \"closed\" = \"open\" 与 closePromise。\n\n- commit(writes, _context)：若 state !== \"open\" 抛 \"MemoryStorage is closed\"；否则把提交串到 commitQueue 上，依次执行 storageState.prepareCommit(writes, this.now()) 与 storageState.applyValidated(prepared.writes)，返回 { ...prepared.result, stats }；commitQueue 被替换为吞掉成功/失败的结果，从而保证提交串行化。\n- 读接口：getEntries、getValue、scanValues、readList、scanBranch、scanBranchStructure、scanEntries、scanUsage、getStats，均在 state !== \"open\" 时拒绝或抛错，否则委托给 storageState。\n- fork(options)：注释为 \"Construct a destination storage at one serialized boundary between source commits.\"；它把操作排到 commitQueue 之后，新建 MemoryStorage({ now: this.now })，并用 this.storageState.createFork(options) 作为目标 storageState，从而在提交边界上克隆出一份独立存储。\n\n本轮读取覆盖该文件 L1-120（文件共 453 行），close/关闭流程与 fork 之后的代码未读取。",
+        "evidence_ids": [
+          "repo_22cc40f93657cecfcd751454"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "-120",
+        "453"
+      ]
+    },
+    {
+      "revision_id": "5a38442d-00d8-449b-936f-83417638ed48",
+      "claim": {
+        "id": "repo-b384328ba134413dce7c6527-claim-2",
+        "statement": "该实现以多张 Map 作为表：conversationsById、entriesById、entriesByConversation（升序）、tasksById、inputsById、inputsByRequest，另有 rewindableLog: Map<Id, { seq: Seq; ops: Op[] }[]>（注释：\"Rewindable docs keep their full op history with the seq of each batch, for docAsOf\"）与 stickyLog: Map<Id, Op[][]>，以及 sessionDoc、entrySeq、nextIdValue = 1、seq: Seq = 0、closed = false。\n\n- mintId()：返回 nextIdValue++，提供单调递增 ID；setNextId(n) 取 max 保证不回退。\n- commit(writes, _ctx)：若 closed 抛 \"storage closed\"；计算 seq = this.seq + 1；先调用 this.stage(writes, seq)（注释：\"throws before any mutation\"），成功后再执行返回的 staged() 并更新 this.seq，返回 seq。\n- stage(writes, seq)：先构建 ops 列表并校验整批写入，再返回应用函数。校验包括：claim(id, what) 要求 id 为正的安全整数、同一批内不得重复创建同一 id；conversation/entry/task 写入若 id 已存在则抛错；task.patch 若目标 task 未知则抛错（会同时查找本批中新建的 task）。\n- 文件头注释给出语义保证：\"A batch is validated and staged in full before any table changes: one failed batch changes no table, no document, no ID high-water, no sequence. Committed IDs are never reused; IDs minted but never committed may be reused after reopen.\"\n\n本轮读取覆盖该文件 L1-120（文件共 278 行），input 写入分支之后及读接口未读取。",
+        "evidence_ids": [
+          "repo_e198a2e39f9e6423bebd627a"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "-120",
+        "278"
+      ]
+    },
+    {
+      "revision_id": "5a38442d-00d8-449b-936f-83417638ed48",
+      "claim": {
+        "id": "repo-b384328ba134413dce7c6527-claim-3",
+        "statement": "可确认的是两套内存 Storage 的提交语义、表结构与 ID 策略。以下未取得源码证据，不做断言：\n\n- 这两套实现是否同时被同一运行时使用，以及各自被哪些上层组件实例化。\n- 持久化后端（如 JsonlStorage）的具体实现；pico3 注释仅说明内存实现是其读路径。\n- 会话层 MemoryStorage 的 close/关闭流程与 fork 之后的代码（文件共 453 行，仅读 L1-120）。\n- pico3 的 input 写入分支、读接口与 rewindableLog/stickyLog 的具体使用方式（文件共 278 行，仅读 L1-120）。\n- 是否存在面向模型的「长期记忆」抽取/召回机制；本轮证据只覆盖存储层。",
+        "evidence_ids": [
+          "repo_22cc40f93657cecfcd751454",
+          "repo_e198a2e39f9e6423bebd627a"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "-120",
+        "278",
+        "453"
+      ]
+    },
+    {
+      "revision_id": "d9cc3393-2f97-422f-b76d-1b2b2a5a7734",
+      "claim": {
+        "id": "repo-1d0ee676f74eb68605c9ec0e-claim-0",
+        "statement": "在 openai/codex 仓库（commit e72da2b53805894878023d01949a25a082e0a5cb）中，记忆系统由两部分组成：一是注入模型上下文的「类型化、有界 v2 记忆上下文」（codex-rs/core/src/context/memory.rs 文件头注释即写明 \"Typed, bounded v2 memory context.\"）；二是 app-server v2 协议暴露的「记忆就绪状态」查询（codex-rs/app-server-protocol/src/protocol/v2/memory.rs 文件头注释为 \"Readiness for selecting v2 memory context after background consolidation.\"）。前者决定记忆以什么形态进入对话，后者决定客户端何时可以认为 v2 记忆已可用。",
+        "evidence_ids": [
+          "repo_fef1f3a2376440a25d994310",
+          "repo_4e53799258e0d45f00463440"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "1949",
+        "3805894878023",
+        "5",
+        "82"
+      ]
+    },
+    {
+      "revision_id": "bd9ce718-e2db-4a2d-8e4d-fbb37dc11929",
+      "claim": {
+        "id": "repo-b384328ba134413dce7c6527-claim-0",
+        "statement": "在 badlogic/pi-mono 仓库（commit 2b0a123de98318c2ff8069661721ce0c3794c34e）中，名为 memory 的实现是两套内存版 Storage 后端：packages/agent/src/harness/session/memory.ts 中的 MemoryStorage（会话存储）与 packages/agent/src/harness/pico3/memory.ts 中的 MemoryStorage（pico3 存储）。两者都实现 Storage 接口，但内部数据模型与提交语义不同。",
+        "evidence_ids": [
+          "repo_22cc40f93657cecfcd751454",
+          "repo_e198a2e39f9e6423bebd627a"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "069661721",
+        "2",
+        "23",
+        "4",
+        "794",
+        "8318"
+      ]
+    },
+    {
+      "revision_id": "87f5156d-222b-4fb5-bc0a-b743f87f3425",
+      "claim": {
+        "id": "repo-d743602185f7661e5f61e17f-claim-0",
+        "statement": "在 NousResearch/hermes-agent 仓库（commit 11c50f05d070b2158afdca73f077d2501ecd77fc）中，记忆系统以可插拔 provider 形式存在。agent/memory_provider.py 的文件头注释写明：插件位于 plugins/memory/<name>/，通过 memory.provider 激活，且同一时间只启用一个外部 provider；生命周期由 MemoryManager 驱动，顺序为 initialize → system_prompt_block / prefetch / sync_turn（每轮）→ tool dispatch → shutdown，另有可选的 on_* 钩子。",
+        "evidence_ids": [
+          "repo_21a6938539f578a6f3a75c78"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "11",
+        "158",
+        "3",
+        "5",
+        "501",
+        "7",
+        "70",
+        "77"
+      ]
+    },
+    {
+      "revision_id": "d01c7c18-64bd-45fb-85c6-38838ed59892",
+      "claim": {
+        "id": "repo-1d0ee676f74eb68605c9ec0e-claim-3",
+        "statement": "codex-rs/app-server/src/request_processors/memory_status.rs 的文件注释明确「Reports v2 readiness without exposing memory contents or persistence details to clients」。其 memory_status 实现流程为：\n1. minimum = params.min_consolidated_threads.unwrap_or(20)；若不在 1..=4096 内则返回 invalid_params(\"minConsolidatedThreads must be between 1 and 4096\")。\n2. 取 self.state_db，缺失则 internal_error(\"sqlite state db unavailable for memory status\")。\n3. 通过 db.memories_for_version(MemoryVersion::V2) 打开 v2 记忆存储，失败则 internal_error。\n4. count = store.max_consolidated_thread_count()。\n5. root = self.config.codex_home.join(MemoryVersion::V2.directory_name())，读取 root.join(\"memory_summary.md\")（读取失败以 .ok() 吞掉，得到 None）。\n6. ready = count >= minimum && summary.as_deref().is_some_and(codex_memories_write::workspace::is_valid_v2_summary)。\n7. 返回 MemoryStatusResponse { v2_consolidated_threads: count, v2_ready: ready }。\n即 v2 就绪需要同时满足「已 consolidation 的线程数达到阈值」与「codex_home 下 v2 目录中的 memory_summary.md 通过 is_valid_v2_summary 校验」两个条件。",
+        "evidence_ids": [
+          "repo_876d047a2ce2f8276b4d7c22"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7"
+      ]
+    },
+    {
+      "revision_id": "d01c7c18-64bd-45fb-85c6-38838ed59892",
+      "claim": {
+        "id": "repo-1d0ee676f74eb68605c9ec0e-claim-4",
+        "statement": "本页只覆盖上述三个文件直接可见的内容。记忆的实际写入、consolidation 调度、memory_summary.md 的生成与 is_valid_v2_summary 的具体校验规则位于 codex_memories_write 等模块，本次未读取其源码，因此不做描述。此外，本次检索 codex-rs/core/src/memory.rs 与 codex-rs/core/src/memories/mod.rs 返回 404（访问失败，不构成「不存在」的证据），故不能断言仓库中不存在其他记忆相关模块。",
+        "evidence_ids": [
+          "repo_876d047a2ce2f8276b4d7c22",
+          "repo_fef1f3a2376440a25d994310"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "404"
+      ]
+    },
+    {
+      "revision_id": "78cb055a-43d4-4197-83e1-069ad33219b2",
+      "claim": {
+        "id": "repo-b384328ba134413dce7c6527-claim-3",
+        "statement": "本次仅读取 session/memory.ts 的 L1-120（该文件共 453 行）与 pico3/memory.ts 的 L1-120（共 278 行），因此 close()/closing 状态转换、fork 的后续实现、pico3 的读路径与文档 op 应用细节未直接验证。此外，本页描述的是 harness 层的内存 Storage 实现，未验证 Pi Agent 是否存在跨会话的持久化记忆或面向模型的记忆注入机制。",
+        "evidence_ids": [
+          "repo_22cc40f93657cecfcd751454",
+          "repo_e198a2e39f9e6423bebd627a"
+        ],
+        "verification_profile": "repository"
+      },
+      "old_missing": [
+        "-120",
+        "278",
+        "453"
+      ]
+    }
+  ],
+  "evidence": {
+    "repo_fef1f3a2376440a25d994310": {
+      "id": "repo_fef1f3a2376440a25d994310",
+      "text": "//! Typed, bounded v2 memory context.\n\nuse super::ContextualUserFragment;\nuse codex_protocol::models::ContentItemKind;\nuse codex_utils_output_truncation::TruncationPolicy;\nuse codex_utils_output_truncation::truncate_text;\n\n/// Memory-owned model context, capped below 10k tokens even for byte-heavy text.\npub enum MemoryContextFragment {\n    ReadInstructions(String),\n    ExtractionEvidence(String),\n}\n\nimpl ContextualUserFragment for MemoryContextFragment {\n    fn role(&self) -> &'static str {\n        match self {\n            Self::ReadInstructions(_) => \"developer\",\n            Self::ExtractionEvidence(_) => \"user\",\n        }\n    }\n    fn content_kind(&self) -> ContentItemKind {\n        ContentItemKind(\n            match self {\n                Self::ReadInstructions(_) => \"memories.instructions\",\n                Self::ExtractionEvidence(_) => \"memories.extraction_evidence\",\n            }\n            .to_string(),\n        )\n    }\n    fn requires_separate_message(&self) -> bool {\n        true\n    }\n    fn markers(&self) -> (&'static str, &'static str) {\n        Self::type_markers()\n    }\n    fn type_markers() -> (&'static str, &'static str) {\n        (\"\", \"\")\n    }\n    fn body(&self) -> String {\n        let (Self::ReadInstructions(text) | Self::ExtractionEvidence(text)) = self;\n        truncate_text(text, TruncationPolicy::Bytes(8_900))\n    }\n}",
+      "metadata": {
+        "repository": "openai/codex",
+        "commit": "e72da2b53805894878023d01949a25a082e0a5cb",
+        "path": "codex-rs/core/src/context/memory.rs",
+        "start_line": 1,
+        "end_line": 43,
+        "content_hash": "9504a239e287bd680c10c0721c042592d5f20ce6fa9202c650ac1c8ff3f6f9f4",
+        "total_lines": 43
+      }
+    },
+    "repo_4e53799258e0d45f00463440": {
+      "id": "repo_4e53799258e0d45f00463440",
+      "text": "//! Readiness for selecting v2 memory context after background consolidation.\n\nuse crate::JsonSchema;\nuse crate::TS;\nuse serde::Deserialize;\nuse serde::Serialize;\n\n#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]\n#[serde(rename_all = \"camelCase\")]\n#[ts(export_to = \"v2/\")]\npub struct MemoryStatusParams {\n    /// Required distinct consolidated threads. Defaults to 20; supported range is 1..=4096.\n    #[ts(optional = nullable)]\n    pub min_consolidated_threads: Option<u32>,\n}\n\n#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]\n#[serde(rename_all = \"camelCase\")]\n#[ts(export_to = \"v2/\")]\npub struct MemoryStatusResponse {\n    pub v2_consolidated_threads: u32,\n    pub v2_ready: bool,\n}",
+      "metadata": {
+        "repository": "openai/codex",
+        "commit": "e72da2b53805894878023d01949a25a082e0a5cb",
+        "path": "codex-rs/app-server-protocol/src/protocol/v2/memory.rs",
+        "start_line": 1,
+        "end_line": 23,
+        "content_hash": "7e2dd0864b049f4741bd46aa5dcb22da81c7e1c658c059c81d81e20c7dbd6a4a",
+        "total_lines": 23
+      }
+    },
+    "repo_876d047a2ce2f8276b4d7c22": {
+      "id": "repo_876d047a2ce2f8276b4d7c22",
+      "text": "//! Reports v2 readiness without exposing memory contents or persistence details to clients.\n\nuse super::*;\nuse codex_app_server_protocol::MemoryStatusParams;\nuse codex_app_server_protocol::MemoryStatusResponse;\nuse codex_protocol::MemoryVersion;\n\nimpl ThreadRequestProcessor {\n    pub(crate) async fn memory_status(\n        &self,\n        params: MemoryStatusParams,\n    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {\n        let minimum = params.min_consolidated_threads.unwrap_or(20);\n        if !(1..=4096).contains(&minimum) {\n            return Err(invalid_params(\n                \"minConsolidatedThreads must be between 1 and 4096\",\n            ));\n        }\n        let db = self\n            .state_db\n            .as_ref()\n            .ok_or_else(|| internal_error(\"sqlite state db unavailable for memory status\"))?;\n        let store = db\n            .memories_for_version(MemoryVersion::V2)\n            .await\n            .map_err(|error| internal_error(format!(\"failed to open v2 memory state: {error}\")))?;\n        let count = store\n            .max_consolidated_thread_count()\n            .await\n            .map_err(|error| internal_error(format!(\"failed to read memory progress: {error}\")))?;\n        let root = self\n            .config\n            .codex_home\n            .join(MemoryVersion::V2.directory_name());\n        let summary = tokio::fs::read_to_string(root.join(\"memory_summary.md\"))\n            .await\n            .ok();\n        let ready = count >= minimum\n            && summary\n                .as_deref()\n                .is_some_and(codex_memories_write::workspace::is_valid_v2_summary);\n        Ok(Some(\n            MemoryStatusResponse {\n                v2_consolidated_threads: count,\n                v2_ready: ready,\n            }\n            .into(),\n        ))\n    }\n}",
+      "metadata": {
+        "repository": "openai/codex",
+        "commit": "e72da2b53805894878023d01949a25a082e0a5cb",
+        "path": "codex-rs/app-server/src/request_processors/memory_status.rs",
+        "start_line": 1,
+        "end_line": 50,
+        "content_hash": "2a4fadad26f731128a42bf071f854056c6da9bd894e877c056a23dd9f1393f24",
+        "total_lines": 50
+      }
+    },
+    "repo_22cc40f93657cecfcd751454": {
+      "id": "repo_22cc40f93657cecfcd751454",
+      "text": "import { uuidv7 } from \"@earendil-works/pi-ai/utils/uuid\";\nimport type { Context } from \"../context.ts\";\nimport { InMemoryStorageState } from \"./in-memory-storage-state.ts\";\nimport { StorageBackedSession } from \"./session.ts\";\nimport type {\n\tBranch,\n\tCommitResult,\n\tEntry,\n\tEntryQuery,\n\tEntryScan,\n\tEntryStructure,\n\tForkOptions,\n\tIdGenerator,\n\tSession,\n\tSessionCreateOptions,\n\tSessionMetadata,\n\tSessionMutation,\n\tSessionMutationCallback,\n\tSessionRepo,\n\tSessionStats,\n\tStorage,\n\tStorageBranchScan,\n\tUsageRow,\n\tUsageScan,\n\tWrite,\n} from \"./types.ts\";\nimport type { ListElement, ListReadOptions, StoredValue, Value, ValueList } from \"./values.ts\";\n\nexport interface MemoryStorageOptions {\n\tnow?: () => number;\n}\n\nexport interface MemorySessionRepoOptions {\n\tnow?: () => number;\n}\n\nexport class MemoryStorage implements Storage {\n\tprivate readonly now: () => number;\n\tprivate storageState = new InMemoryStorageState();\n\tprivate commitQueue: Promise<void> = Promise.resolve();\n\tprivate state: \"open\" | \"closing\" | \"closed\" = \"open\";\n\tprivate closePromise: Promise<void> | undefined;\n\n\tconstructor(options: MemoryStorageOptions = {}) {\n\t\tthis.now = options.now ?? Date.now;\n\t}\n\n\tasync commit(writes: Write[], _context: Context): Promise<CommitResult> {\n\t\tif (this.state !== \"open\") throw new Error(\"MemoryStorage is closed\");\n\t\tconst result = this.commitQueue.then(() => {\n\t\t\tconst prepared = this.storageState.prepareCommit(writes, this.now());\n\t\t\tconst stats = this.storageState.applyValidated(prepared.writes);\n\t\t\treturn { ...prepared.result, stats };\n\t\t});\n\t\tthis.commitQueue = result.then(\n\t\t\t() => undefined,\n\t\t\t() => undefined,\n\t\t);\n\t\treturn result;\n\t}\n\n\tgetEntries(ids: string[], _context: Context): Promise<Map<string, Entry>> {\n\t\tif (this.state !== \"open\") return Promise.reject(new Error(\"MemoryStorage is closed\"));\n\t\treturn Promise.resolve(this.storageState.getEntries(ids));\n\t}\n\n\tgetValue<T>(address: Value<T>, _context: Context): Promise<StoredValue<T> | undefined> {\n\t\tif (this.state !== \"open\") return Promise.reject(new Error(\"MemoryStorage is closed\"));\n\t\treturn Promise.resolve(this.storageState.getValue(address));\n\t}\n\n\tscanValues<T>(prefix: Value<T>, _context: Context): Promise<StoredValue<T>[]> {\n\t\tif (this.state !== \"open\") return Promise.reject(new Error(\"MemoryStorage is closed\"));\n\t\treturn Promise.resolve(this.storageState.scanValues(prefix));\n\t}\n\n\tasync readList<T>(\n\t\taddress: ValueList<T>,\n\t\toptions: ListReadOptions | undefined,\n\t\t_context: Context,\n\t): Promise<ListElement<T>[]> {\n\t\tif (this.state !== \"open\") throw new Error(\"MemoryStorage is closed\");\n\t\treturn this.storageState.readList(address, options);\n\t}\n\n\tasync scanBranch(query: StorageBranchScan, _context: Context): Promise<Entry[]> {\n\t\tif (this.state !== \"open\") throw new Error(\"MemoryStorage is closed\");\n\t\treturn this.storageState.scanBranch(query);\n\t}\n\n\tasync scanBranchStructure(query: StorageBranchScan, _context: Context): Promise<EntryStructure[]> {\n\t\tif (this.state !== \"open\") throw new Error(\"MemoryStorage is closed\");\n\t\treturn this.storageState.scanBranchStructure(query);\n\t}\n\n\tscanEntries(query: EntryScan, _context: Context): Promise<Entry[]> {\n\t\tif (this.state !== \"open\") return Promise.reject(new Error(\"MemoryStorage is closed\"));\n\t\treturn Promise.resolve(this.storageState.scanEntries(query));\n\t}\n\n\tscanUsage(query: UsageScan, _context: Context): Promise<UsageRow[]> {\n\t\tif (this.state !== \"open\") return Promise.reject(new Error(\"MemoryStorage is closed\"));\n\t\treturn Promise.resolve(this.storageState.scanUsage(query));\n\t}\n\n\tgetStats(_context: Context): Promise<SessionStats> {\n\t\tif (this.state !== \"open\") return Promise.reject(new Error(\"MemoryStorage is closed\"));\n\t\treturn Promise.resolve(this.storageState.getStats());\n\t}\n\n\t/** Construct a destination storage at one serialized boundary between source commits. */\n\tfork(options: ForkOptions): Promise<MemoryStorage> {\n\t\tif (this.state !== \"open\") return Promise.reject(new Error(\"MemoryStorage is closed\"));\n\t\tconst result = this.commitQueue.then(() => {\n\t\t\tconst destination = new MemoryStorage({ now: this.now });\n\t\t\tdestination.storageState = this.storageState.createFork(options);\n\t\t\treturn destination;\n\t\t});\n\t\tthis.commitQueue = result.then(\n\t\t\t() => undefined,",
+      "metadata": {
+        "repository": "badlogic/pi-mono",
+        "commit": "2b0a123de98318c2ff8069661721ce0c3794c34e",
+        "path": "packages/agent/src/harness/session/memory.ts",
+        "start_line": 1,
+        "end_line": 120,
+        "content_hash": "733c14c12e1c87ed480861eea3d3039b96dc0a1bd44ab8a8dbe239b8ef49d08f",
+        "total_lines": 453
+      }
+    },
+    "repo_e198a2e39f9e6423bebd627a": {
+      "id": "repo_e198a2e39f9e6423bebd627a",
+      "text": "import type { Context } from \"@earendil-works/chord\";\nimport { applyImmutable, isBase, type Op } from \"@earendil-works/chord/delta\";\nimport type {\n\tConversation,\n\tDocRef,\n\tEntry,\n\tEntryScan,\n\tId,\n\tInput,\n\tJsonObject,\n\tSeq,\n\tStorage,\n\tTask,\n\tTaskScan,\n\tWrite,\n} from \"./types.ts\";\n\n/**\n * In-memory Storage. The reference backend, and the read path of JsonlStorage.\n *\n * A batch is validated and staged in full before any table changes: one failed\n * batch changes no table, no document, no ID high-water, no sequence. Committed\n * IDs are never reused; IDs minted but never committed may be reused after reopen.\n */\nexport class MemoryStorage implements Storage {\n\tprotected readonly conversationsById = new Map<Id, Conversation>();\n\tprotected readonly entriesById = new Map<Id, Entry>();\n\tprotected readonly entriesByConversation = new Map<Id, Entry[]>(); // ascending\n\tprotected readonly tasksById = new Map<Id, Task>();\n\tprotected readonly inputsById = new Map<Id, Input>();\n\tprotected readonly inputsByRequest = new Map<string, Input>();\n\t/** Rewindable docs keep their full op history with the seq of each batch, for `docAsOf`. */\n\tprotected readonly rewindableLog = new Map<Id, { seq: Seq; ops: Op[] }[]>();\n\tprotected readonly stickyLog = new Map<Id, Op[][]>();\n\tprotected sessionDoc: JsonObject | undefined;\n\tprotected readonly entrySeq = new Map<Id, Seq>(); // entry id → seq of its batch\n\tprotected nextIdValue = 1;\n\tprotected seq: Seq = 0;\n\tprivate closed = false;\n\n\tmintId(): Id {\n\t\treturn this.nextIdValue++;\n\t}\n\tprotected setNextId(n: Id) {\n\t\tthis.nextIdValue = Math.max(this.nextIdValue, n);\n\t}\n\n\tasync commit(writes: readonly Write[], _ctx: Context): Promise<Seq> {\n\t\tif (this.closed) throw new Error(\"storage closed\");\n\t\tconst seq = this.seq + 1;\n\t\tconst staged = this.stage(writes, seq); // throws before any mutation\n\t\tstaged();\n\t\tthis.seq = seq;\n\t\treturn seq;\n\t}\n\n\t/** Validate the whole batch against the current tables; return a function that applies it. */\n\tprotected stage(writes: readonly Write[], seq: Seq): () => void {\n\t\tconst ops: (() => void)[] = [];\n\t\tconst created = new Set<Id>();\n\t\tlet maxId = 0;\n\t\tconst claim = (id: Id, what: string) => {\n\t\t\tif (!Number.isSafeInteger(id) || id <= 0) throw new Error(`${what}: invalid id ${id}`);\n\t\t\tif (created.has(id)) throw new Error(`${what}: id ${id} created twice in one batch`);\n\t\t\tcreated.add(id);\n\t\t\tmaxId = Math.max(maxId, id);\n\t\t};\n\t\tfor (const w of writes) {\n\t\t\tswitch (w.type) {\n\t\t\t\tcase \"conversation\": {\n\t\t\t\t\tif (this.conversationsById.has(w.conversation.id))\n\t\t\t\t\t\tthrow new Error(`conversation ${w.conversation.id} exists`);\n\t\t\t\t\tclaim(w.conversation.id, \"conversation\");\n\t\t\t\t\tconst c = clone(w.conversation);\n\t\t\t\t\tops.push(() => {\n\t\t\t\t\t\tthis.conversationsById.set(c.id, c);\n\t\t\t\t\t\tthis.entriesByConversation.set(c.id, []);\n\t\t\t\t\t});\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t\tcase \"entry\": {\n\t\t\t\t\tif (this.entriesById.has(w.entry.id)) throw new Error(`entry ${w.entry.id} exists`);\n\t\t\t\t\tclaim(w.entry.id, \"entry\");\n\t\t\t\t\tconst e = clone(w.entry);\n\t\t\t\t\tops.push(() => {\n\t\t\t\t\t\tthis.entriesById.set(e.id, e);\n\t\t\t\t\t\t(\n\t\t\t\t\t\t\tthis.entriesByConversation.get(e.conversationId) ??\n\t\t\t\t\t\t\tthis.entriesByConversation.set(e.conversationId, []).get(e.conversationId)!\n\t\t\t\t\t\t).push(e);\n\t\t\t\t\t\tthis.entrySeq.set(e.id, seq);\n\t\t\t\t\t});\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t\tcase \"task\": {\n\t\t\t\t\tif (this.tasksById.has(w.task.id)) throw new Error(`task ${w.task.id} exists`);\n\t\t\t\t\tclaim(w.task.id, \"task\");\n\t\t\t\t\tconst t = clone(w.task);\n\t\t\t\t\tops.push(() => this.tasksById.set(t.id, t));\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t\tcase \"task.patch\": {\n\t\t\t\t\tconst prev =\n\t\t\t\t\t\tthis.tasksById.get(w.patch.id) ??\n\t\t\t\t\t\t[...writes]\n\t\t\t\t\t\t\t.filter((x): x is Extract<Write, { type: \"task\" }> => x.type === \"task\")\n\t\t\t\t\t\t\t.find((x) => x.task.id === w.patch.id)?.task;\n\t\t\t\t\tif (prev === undefined) throw new Error(`patch for unknown task ${w.patch.id}`);\n\t\t\t\t\tconst p = clone(w.patch);\n\t\t\t\t\tops.push(() => {\n\t\t\t\t\t\tconst cur = this.tasksById.get(p.id)!;\n\t\t\t\t\t\tconst { id: _i, ...fields } = p;\n\t\t\t\t\t\tconst next = { ...cur, ...fields } as Task;\n\t\t\t\t\t\tif (p.checkpoint === null) delete (next as { checkpoint?: unknown }).checkpoint;\n\t\t\t\t\t\tthis.tasksById.set(p.id, next);\n\t\t\t\t\t});\n\t\t\t\t\tbreak;\n\t\t\t\t}\n\t\t\t\tcase \"input\": {\n\t\t\t\t\tconst i = clone(w.input);",
+      "metadata": {
+        "repository": "badlogic/pi-mono",
+        "commit": "2b0a123de98318c2ff8069661721ce0c3794c34e",
+        "path": "packages/agent/src/harness/pico3/memory.ts",
+        "start_line": 1,
+        "end_line": 120,
+        "content_hash": "4c390267e65d9569453001e353169a8b3c14b62c06a7de21c124c2f3164c0244",
+        "total_lines": 278
+      }
+    },
+    "repo_21a6938539f578a6f3a75c78": {
+      "id": "repo_21a6938539f578a6f3a75c78",
+      "text": "\"\"\"Abstract base class for pluggable memory providers.\n\nPlugins ship in ``plugins/memory/<name>/``, activated via ``memory.provider`` (ONE external\nprovider at a time). Lifecycle, driven by MemoryManager: initialize -> system_prompt_block /\nprefetch / sync_turn per turn -> tool dispatch -> shutdown, plus optional ``on_*`` hooks.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport contextvars\nimport logging\nimport re\nimport threading\nfrom abc import ABC, abstractmethod\nfrom dataclasses import dataclass\nfrom typing import Any, Callable, Dict, List, Optional\n\nlogger = logging.getLogger(__name__)\n\n\ndef ctx_bound(fn: Callable[..., Any]) -> Callable[..., Any]:\n    \"\"\"Bind ``fn`` to the CALLER's contextvars for another thread/executor. Profile isolation\n    is a ContextVar-scoped HERMES_HOME override plus the per-turn secret scope; a worker started\n    with an empty context silently lands on the default profile (or fails closed on secrets).\"\"\"\n    ctx = contextvars.copy_context()\n    return lambda *args, **kwargs: ctx.run(fn, *args, **kwargs)\n\n\ndef spawn_context_thread(target: Callable[..., Any], *, name: str, daemon: bool = True,\n                         args: tuple = (), kwargs: Optional[Dict[str, Any]] = None) -> threading.Thread:\n    \"\"\"Unstarted thread running *target* under the spawner's contextvars (see :func:`ctx_bound`).\n    Every memory-provider background job (prefetch, sync, writer loops) must go through this.\"\"\"\n    return threading.Thread(target=ctx_bound(target), args=args, kwargs=kwargs, name=name, daemon=daemon)\n\n# v1 = best-effort on_pre_compress() with the raw message list; v2 = opt-in fail-closed\n# checkpoint (normalized evidence handoff + strict-mode failure propagation).\nPRE_COMPRESS_CHECKPOINT_API_VERSION = 2\n\n# Default glyph for recall indicators; providers may use their own brand mark.\nINDICATOR_GLYPH = \"🧠\"\n\n# ``memory.provider`` values that mean \"the built-in store, no external plugin\". The built-in\n# store is core: doctor, migration and dependency refresh must never look these up as plugins.\nCORE_MEMORY_PROVIDER_SENTINELS = frozenset({\"\", \"default\", \"builtin\", \"built-in\", \"none\"})\n\n\ndef is_core_memory_provider(name: Optional[str]) -> bool:\n    \"\"\"True when ``memory.provider`` selects the built-in store rather than an external plugin.\"\"\"\n    return str(name or \"\").strip().lower() in CORE_MEMORY_PROVIDER_SENTINELS\n\n\n@dataclass(frozen=True)\nclass RecallStatus:\n    \"\"\"What the last prefetch injected, for the deterministic recall indicator\n    (``MemoryManager.describe_recall``). ``count == 0`` means content without a\n    discrete count (e.g. a synthesized reflect answer) and renders generically.\"\"\"\n\n    provider_label: str\n    count: int\n    glyph: str = INDICATOR_GLYPH\n\n\n# Prompts with no semantic signal; single source of truth for the core prefetch gate and\n# provider-side classifiers. Anchored and followed only by whitespace/punctuation, so\n# \"k8s\"/\"yolo\"/\"note\" do NOT match while \"hi!\"/\"thanks :)\"/\"done???\" do.\nTRIVIAL_PROMPT_RE = re.compile(\n    r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'\n    r'hi|hey|hello|yo|sup|'\n    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'\n    r'[\\s!?.:;,\"' + \"'\" + r'~\\u2018\\u2019\\u201c\\u201d\\u2014\\u2013\\u2026()\\[\\]{}<>*&^%$#@!+=`\\u00a0]*$',\n    re.IGNORECASE,\n)\n\n\ndef is_trivial_prompt(text: Optional[str]) -> bool:\n    \"\"\"True for empty input, slash commands and bare greetings/acknowledgements (skipping\n    recall saves a round-trip and keeps stale context from derailing one-word replies).\"\"\"\n    stripped = (text or \"\").strip()\n    if not stripped or stripped.startswith(\"/\"):\n        return True\n    return bool(TRIVIAL_PROMPT_RE.match(stripped))\n\n\nclass MemoryProvider(ABC):\n    \"\"\"Abstract base class for memory providers.\"\"\"\n\n    # Providers that durably checkpoint every successful on_pre_compress() set this to\n    # PRE_COMPRESS_CHECKPOINT_API_VERSION; 1 = best-effort legacy.\n    pre_compress_checkpoint_api_version = 1\n\n    @property\n    @abstractmethod\n    def name(self) -> str:\n        \"\"\"Short identifier for this provider (e.g. 'builtin', 'honcho', 'hindsight').\"\"\"\n\n    # -- Core lifecycle (implement these) ------------------------------------\n\n    @abstractmethod\n    def is_available(self) -> bool:\n        \"\"\"Configured, credentialed and ready? Gates activation; check config/deps only, no network.\"\"\"\n\n    @abstractmethod\n    def initialize(self, session_id: str, **kwargs) -> None:\n        \"\"\"Initialize once at agent startup (connections, resources, threads).\n\n        kwargs always include ``hermes_home`` (profile-scoped storage; never hardcode\n        ``~/.hermes``) and ``platform``; may include ``agent_context`` (\"primary\" |\n        \"subagent\" | \"cron\" | \"flush\" — skip writes for non-primary contexts),\n        ``agent_identity``, ``agent_workspace``, ``parent_session_id``, ``user_id``, ``user_id_alt``.\n        \"\"\"\n\n    def unavailable_reason(self) -> str:\n        \"\"\"User-facing hint for the \"provider unavailable\" warning (``initialize()`` never runs then).\"\"\"\n        return \"\"\n\n    def system_prompt_block(self) -> str:\n        \"\"\"STATIC system-prompt text; \"\" to skip. Recalled context goes through prefetch(), not here.\"\"\"\n        return \"\"\n\n    def prefetch(self, query: str, *, session_id: str = \"\") -> str:",
+      "metadata": {
+        "repository": "NousResearch/hermes-agent",
+        "commit": "11c50f05d070b2158afdca73f077d2501ecd77fc",
+        "path": "agent/memory_provider.py",
+        "start_line": 1,
+        "end_line": 120,
+        "content_hash": "a4e44a293013fff831ac136ab77c556541cd18817f53bd662e97090cd80bd5a6",
+        "total_lines": 206
+      }
+    }
+  }
+}

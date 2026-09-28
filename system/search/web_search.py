@@ -37,14 +37,14 @@ class WebSearchTool:
     def available(self) -> bool:
         return self.mode == "duckduckgo"
 
-    def search(self, query: str, limit: int | None = None) -> List[WebSearchResult]:
+    def search(self, query: str, limit: int | None = None, *, raise_errors: bool = False) -> List[WebSearchResult]:
         if not self.available or not (query or "").strip():
             return []
         if self.mode == "duckduckgo":
-            return self._search_duckduckgo(query, limit or self.max_results)
+            return self._search_duckduckgo(query, limit or self.max_results, raise_errors=raise_errors)
         return []
 
-    def _search_duckduckgo(self, query: str, limit: int) -> List[WebSearchResult]:
+    def _search_duckduckgo(self, query: str, limit: int, *, raise_errors=False) -> List[WebSearchResult]:
         url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
         headers = {
             "User-Agent": (
@@ -56,7 +56,14 @@ class WebSearchTool:
         try:
             response = requests.get(url, timeout=self.timeout_seconds, headers=headers)
             response.raise_for_status()
+            if raise_errors and response.status_code != 200:
+                # A challenge/queued response is not a completed empty search.
+                # Preserve the actual response for the caller instead of parsing
+                # it as a results page or choosing another provider silently.
+                raise requests.HTTPError(f"Search returned HTTP {response.status_code} for {url}", response=response)
         except requests.exceptions.SSLError as exc:
+            if raise_errors:
+                raise
             print(f"[WebSearchTool] DuckDuckGo SSL verification failed, retrying without verification: {exc}")
             try:
                 response = requests.get(url, timeout=self.timeout_seconds, headers=headers, verify=False)
@@ -65,6 +72,8 @@ class WebSearchTool:
                 print(f"[WebSearchTool] DuckDuckGo search failed after SSL fallback: {retry_exc}")
                 return []
         except Exception as exc:
+            if raise_errors:
+                raise
             print(f"[WebSearchTool] DuckDuckGo search failed: {exc}")
             return self._search_bing(query, limit, headers)
 

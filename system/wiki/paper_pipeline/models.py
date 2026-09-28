@@ -98,9 +98,13 @@ class ClaimRelationDecision(BaseModel):
     same_aspect: bool = False
     scope_overlap: bool = True
     requires_review: bool = False
+    resolution_status: Literal["resolved", "model_failed", "retrieval_failed", "model_unavailable"] = "resolved"
     comparison_subject: str = ""
     comparison_aspect: str = ""
     comparison_scope: dict[str, str] = Field(default_factory=dict)
+    existing_page_id: str = ""
+    existing_page_title: str = ""
+    retrieval_routes: list[str] = Field(default_factory=list)
 
 
 class DistilledCandidate(BaseModel):

@@ -372,7 +372,7 @@ class ContextBudget:
             if request_tokens >= min(self.policy.compact_trigger, self.policy.input_limit):
                 # Tool observations are derived views; original results remain in SQLite.
                 sections = [(label, lambda n, text=value: self.prune_tool_text(str(text), n), min(cap, max(512, self.policy.input_limit // 10)))
-                            if label in {"Previous observations", "Tool Observations"} else (label, value, cap)
+                            if label in {"Previous observations", "Tool Observations"} and not callable(value) else (label, value, cap)
                             for label, value, cap in sections]
                 candidate = required + "".join(
                     "\n\n" + label + ":\n" + str(value(cap) if callable(value) else self.counter.clip(str(value), cap))
@@ -396,6 +396,9 @@ class ContextBudget:
         return result
 
     def check_request(self, payload, *, output_tokens, tools=None):
+        # This reservation protects the physical context window; it is never
+        # sent as a generation limit when the provider manages output length.
+        output_tokens = self.policy.output_reserve if output_tokens is None else output_tokens
         text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
         cost = self.counter.count(text) + 64
         if tools:

@@ -19,6 +19,7 @@ def recover_agent_runs(db_path: str = "") -> list[dict[str, Any]]:
     """Dispatch work abandoned by workers whose renewable lease has expired."""
     resolved = db_path or get_session_store().db_path
     runtime = AgentRunStore(db_path=resolved)
+    runtime.expire_chat_runs()
     dispatched: list[dict[str, Any]] = []
     for run in runtime.list_recoverable_runs(limit=200):
         try:

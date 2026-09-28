@@ -12,6 +12,8 @@ import sys
 import threading
 import webbrowser
 
+from system.storage.layout import get_storage_layout
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -54,8 +56,10 @@ def serve(port: int, open_browser: bool, rebuild: bool) -> int:
                 f"Try: paperwiki web --port {port + 1 if port < 65535 else 8000}"
             ) from exc
         ensure_frontend(PROJECT_ROOT, rebuild)
-        # Keep relative paths anchored here even when launched from another folder.
-        os.chdir(PROJECT_ROOT)
+        # Builds use the installation directory; runtime files use the data home.
+        data_root = get_storage_layout().data_root
+        data_root.mkdir(parents=True, exist_ok=True)
+        os.chdir(data_root)
         import uvicorn
 
         url = f"http://127.0.0.1:{port}"
@@ -65,7 +69,7 @@ def serve(port: int, open_browser: bool, rebuild: bool) -> int:
         def on_ready() -> None:
             while not stopped.wait(0.1):
                 if server.started:
-                    print(f"\nPaperWiki: {url}\nPress Ctrl+C to stop.\n", flush=True)
+                    print(f"\nPaperWiki: {url}\nData: {data_root}\nPress Ctrl+C to stop.\n", flush=True)
                     if open_browser:
                         try:
                             webbrowser.open(url)

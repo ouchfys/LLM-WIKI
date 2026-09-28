@@ -73,6 +73,15 @@ class PaperReviewAgent:
         schema_errors = self._schema_errors(candidate)
         packet = self.pipeline_store.get_source_packet(candidate.source_packet_id) if candidate.source_packet_id else None
         schema_errors.extend(paper_coverage_issues(candidate, packet))
+        if schema_errors:
+            # Evidence entailment cannot repair an incomplete/failed page.
+            # Reject before paying for per-claim checks of extraction-only text.
+            report = self._deterministic_report(
+                candidate, schema_errors, [], [], None, "not_checked", [],
+            )
+            self.pipeline_store.insert_review_report(report)
+            self.pipeline_store.update_candidate_status(candidate.id, report.status)
+            return report
         preflight_unsupported = self._unsupported_claims(candidate)
         evidence_results = self.evidence_verifier.bind_and_verify_candidate(candidate)
         verifier_unsupported = [

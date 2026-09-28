@@ -51,9 +51,19 @@ class AgentRunLease:
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=max(1, self.heartbeat_seconds + 1))
-        if self.acquired:
+        if self.owner:
+            # A stopped heartbeat may have cleared acquired before the worker
+            # exits. Release only our own lease; never touch a replacement worker.
             self.store.release_lease(self.run_id, self.owner)
         self.acquired = False
+
+    def check(self):
+        from system.agent_runtime.control import RunCancelled
+        run = self.store.get_run(self.run_id) or {}
+        if (not self.acquired or run.get("lease_owner") != self.owner
+                or run.get("lease_expires_at", "") <= self.store.now_iso()
+                or run.get("cancel_requested") or run.get("current_state") in {"CANCELLED", "CHAT_INTERRUPTED"}):
+            raise RunCancelled("Task cancelled or execution lease lost")
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self.heartbeat_seconds):

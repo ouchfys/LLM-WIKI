@@ -94,20 +94,23 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { darkTheme, NButton, NConfigProvider, NMessageProvider, type GlobalThemeOverrides } from 'naive-ui'
 import { api, apiErrorMessage } from './api'
+import { createRequestGuard } from './lib/requestGuard'
 
 type ChatSession = {
   id: string
   title: string
   created_at: string
+  has_activity?: boolean
 }
 
 const route = useRoute()
 const router = useRouter()
 const recentSessions = ref<ChatSession[]>([])
+const sessionRequests = createRequestGuard()
 const sessionNotice = ref('')
 const sessionNoticeError = ref(false)
 const deletingSessions = ref(false)
@@ -117,7 +120,6 @@ const navItems = [
   { path: '/', label: '对话', hint: '用个人知识库回答问题' },
   { path: '/capture', label: '资料导入', hint: '论文与社媒资料编译入库' },
   { path: '/vault', label: '知识库', hint: '论文卡片与概念网络' },
-  { path: '/evaluation', label: '质量评测', hint: '查看回答质量与失败样例' },
   { path: '/reviews', label: '冲突审批', hint: '查看冲突来源与结论对象' },
 ]
 
@@ -200,22 +202,27 @@ function isActive(path: string) {
 }
 
 async function loadSessions() {
+  const ticket = sessionRequests.begin()
   try {
     const { data } = await api.get('/wiki/sessions')
-    recentSessions.value = (data.items || []).slice(0, 10)
+    if (sessionRequests.isCurrent(ticket)) {
+      recentSessions.value = (data.items || []).filter((item: ChatSession) => item.has_activity !== false).slice(0, 10)
+    }
   } catch (error) {
     console.error('[App] failed to load sessions:', error)
   }
 }
 
 async function deleteSession(sessionId: string) {
-  const ok = window.confirm('删除这条会话记录及其 Agent 运行轨迹？长期记忆和个人 Wiki 不会被删除。')
+  const ok = window.confirm('删除这条会话、工具记录和专属计划，并停止仅属于它的未完成入库任务？已入库论文、长期记忆及其他会话共享的任务会保留。')
   if (!ok) return
 
   try {
     await api.delete(`/wiki/sessions/${sessionId}`)
+    sessionRequests.invalidate()
+    recentSessions.value = recentSessions.value.filter(item => item.id !== sessionId)
     sessionNoticeError.value = false
-    sessionNotice.value = '已删除该会话、全部消息及其 Agent 运行轨迹。'
+    sessionNotice.value = '已清理会话、工具记录和专属计划，并取消独占的未完成入库任务。已入库论文和长期记忆已保留。'
     if (activeSessionId.value === sessionId) {
       localStorage.removeItem('wiki_chat_session_id')
       await router.push({
@@ -233,14 +240,15 @@ async function deleteSession(sessionId: string) {
 
 async function clearAllSessions() {
   if (deletingSessions.value) return
-  const ok = window.confirm('清空所有会话记录及其 Agent 运行轨迹？长期记忆、用户画像和个人 Wiki 会保留。')
+  const ok = window.confirm('清空所有会话、工具记录和会话计划，并停止仅由这些会话创建的未完成入库任务？已入库论文、长期记忆和独立入库任务会保留。')
   if (!ok) return
 
   try {
     deletingSessions.value = true
     const { data } = await api.delete<{ deleted: number }>('/wiki/sessions')
+    sessionRequests.invalidate()
     sessionNoticeError.value = false
-    sessionNotice.value = '已从数据库删除 ' + data.deleted + ' 个会话及其 Agent 运行轨迹。Wiki 和长期记忆已保留。'
+    sessionNotice.value = '已清理 ' + data.deleted + ' 个会话、工具记录和专属计划，并取消相应未完成入库任务。Wiki 和长期记忆已保留。'
     localStorage.removeItem('wiki_chat_session_id')
     recentSessions.value = []
     await router.push({
@@ -300,5 +308,14 @@ watch(
   }
 )
 
-onMounted(loadSessions)
+onMounted(() => {
+  void loadSessions()
+  window.addEventListener('paperwiki:sessions-changed', loadSessions)
+  window.addEventListener('focus', loadSessions)
+})
+onBeforeUnmount(() => {
+  sessionRequests.invalidate()
+  window.removeEventListener('paperwiki:sessions-changed', loadSessions)
+  window.removeEventListener('focus', loadSessions)
+})
 </script>

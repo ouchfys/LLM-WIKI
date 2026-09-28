@@ -16,7 +16,7 @@ import requests
 
 from system.storage import get_object_storage, get_storage_layout
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = get_storage_layout().repo_root
 
 MAX_IMAGES = 12
 DOWNLOAD_TIMEOUT = 30
