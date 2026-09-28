@@ -2,6 +2,7 @@
 
 - [面试讲解与当前能力总览](../README.md)
 - [四仓库实验与 WorkBuddy 公开对照摘要](audits/COMPARISON_PUBLIC_2026-09-28.md)
+- [逐轮分析：WorkBuddy 的时间和费用具体花在哪里](audits/WORKBUDDY_TRACE_CAUSAL_ANALYSIS_2026-09-28.md)
 
 - [论文解析路由](PARSER_ROUTING.md)
 - [arXiv 论文服务](design/ARXIV_SERVICE.md)

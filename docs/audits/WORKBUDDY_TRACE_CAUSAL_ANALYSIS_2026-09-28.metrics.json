@@ -1,0 +1,247 @@
+{
+  "source_trace_file": "trace_168a4ba228fb4935a48760c15fc47135.json",
+  "source_sha256": "8405c69a98ac6177691161eb1a14aea2f00e647eff0608e7fbf65a3767300027",
+  "paperwiki_run_id": "526092a8-a25b-43d1-9f6d-2a949bcb3abf",
+  "interval_method": "Union of startedAt/endedAt intervals per span type; overlapping tools counted once. All timings describe this run, not product guarantees.",
+  "workbuddy_times": {
+    "model_seconds": 461.135,
+    "tool_seconds": 1127.856,
+    "custom_mcp_tools_seconds": 63.393,
+    "total_seconds": 1656.455,
+    "other_seconds": 67.464
+  },
+  "paperwiki_times": {
+    "model_seconds": 349.115,
+    "tool_seconds": 187.026,
+    "total_seconds": 559.006,
+    "other_seconds": 22.865
+  },
+  "workbuddy_model_round_tool_count_distribution": {
+    "0": 1,
+    "1": 88,
+    "2": 20,
+    "4": 1
+  },
+  "workbuddy_phases": [
+    {
+      "label": "发现与准备",
+      "round_start": 1,
+      "round_end": 4,
+      "model_calls": 4,
+      "tool_calls": 7,
+      "wall_seconds": 368.423,
+      "usage": {
+        "input": 183855,
+        "cache_hit_input": 135936,
+        "output": 2238,
+        "reasoning_in_output": 1420,
+        "cache_miss_input": 47919
+      },
+      "cost_cny_historical_basis": 0.119179
+    },
+    {
+      "label": "源码研究与写前补查",
+      "round_start": 5,
+      "round_end": 71,
+      "model_calls": 67,
+      "tool_calls": 87,
+      "wall_seconds": 936.368,
+      "usage": {
+        "input": 8749179,
+        "cache_hit_input": 8630528,
+        "output": 27165,
+        "reasoning_in_output": 12498,
+        "cache_miss_input": 118651
+      },
+      "cost_cny_historical_basis": 0.799843
+    },
+    {
+      "label": "建立目录并写四卡四证据",
+      "round_start": 72,
+      "round_end": 80,
+      "model_calls": 9,
+      "tool_calls": 9,
+      "wall_seconds": 171.229,
+      "usage": {
+        "input": 1859792,
+        "cache_hit_input": 1854336,
+        "output": 36067,
+        "reasoning_in_output": 7932,
+        "cache_miss_input": 5456
+      },
+      "cost_cny_historical_basis": 0.373621
+    },
+    {
+      "label": "写后补查修订与读回",
+      "round_start": 81,
+      "round_end": 104,
+      "model_calls": 24,
+      "tool_calls": 24,
+      "wall_seconds": 151.64,
+      "usage": {
+        "input": 5845764,
+        "cache_hit_input": 5827968,
+        "output": 14313,
+        "reasoning_in_output": 6354,
+        "cache_miss_input": 17796
+      },
+      "cost_cny_historical_basis": 0.383215
+    },
+    {
+      "label": "记忆写入与交付",
+      "round_start": 105,
+      "round_end": 110,
+      "model_calls": 6,
+      "tool_calls": 5,
+      "wall_seconds": 27.76,
+      "usage": {
+        "input": 1548490,
+        "cache_hit_input": 1545856,
+        "output": 3074,
+        "reasoning_in_output": 266,
+        "cache_miss_input": 2634
+      },
+      "cost_cny_historical_basis": 0.091694
+    }
+  ],
+  "slow_workbuddy_commands": [
+    {
+      "function_index": 6,
+      "tool": "Bash",
+      "started_at": "2026-09-28T07:02:55.368Z",
+      "seconds": 320.674,
+      "activity": "一条命令按顺序浅克隆四个仓库"
+    },
+    {
+      "function_index": 21,
+      "tool": "Bash",
+      "started_at": "2026-09-28T07:10:39.930Z",
+      "seconds": 68.156,
+      "activity": "读取文件后在 Codex 的 codex-rs 目录递归搜索调用点"
+    },
+    {
+      "function_index": 46,
+      "tool": "Bash",
+      "started_at": "2026-09-28T07:15:31.191Z",
+      "seconds": 94.444,
+      "activity": "在 DeepSeek Harness 仓库递归搜索，输出含历史设计笔记"
+    },
+    {
+      "function_index": 78,
+      "tool": "Bash",
+      "started_at": "2026-09-28T07:20:50.136Z",
+      "seconds": 99.859,
+      "activity": "在 Hermes 仓库递归搜索，输出含评测、插件与网站目录"
+    }
+  ],
+  "workbuddy_input_checkpoints": [
+    {
+      "round": 1,
+      "input": 37093
+    },
+    {
+      "round": 10,
+      "input": 64223
+    },
+    {
+      "round": 20,
+      "input": 89686
+    },
+    {
+      "round": 40,
+      "input": 143968
+    },
+    {
+      "round": 60,
+      "input": 175300
+    },
+    {
+      "round": 80,
+      "input": 223116
+    },
+    {
+      "round": 100,
+      "input": 250463
+    },
+    {
+      "round": 110,
+      "input": 260107
+    }
+  ],
+  "workbuddy_recorded_input_limit_note": "Many toolInput fields are 100003-character truncated records and cannot be parsed as complete requests. Usage and tool outputs remain the basis of the counts.",
+  "workbuddy_system_prompt_parallel_instruction_found": true,
+  "limitations": [
+    "No CPU/disk/process startup breakdown inside Bash spans.",
+    "One trace cannot identify why the model chose a particular action or prove product-wide scheduling limitations.",
+    "Different deliverable scope and repository commits; no causal ablation.",
+    "No private prompts, reasoning, raw command output, credentials or personal filesystem paths are exported."
+  ],
+  "paperwiki_executed_tools_per_main_round": [
+    5,
+    4,
+    4,
+    8,
+    7,
+    7,
+    8,
+    8,
+    7,
+    8,
+    8,
+    8,
+    8,
+    8,
+    7,
+    7,
+    7,
+    6,
+    6,
+    3,
+    2,
+    2,
+    0
+  ],
+  "paperwiki_phase_counts": [
+    {
+      "phase": "研究",
+      "rounds": [
+        1,
+        19
+      ],
+      "tool_calls": 131
+    },
+    {
+      "phase": "四卡保存",
+      "rounds": [
+        20,
+        21
+      ],
+      "tool_calls": 5
+    },
+    {
+      "phase": "收尾",
+      "rounds": [
+        22,
+        22
+      ],
+      "tool_calls": 2
+    },
+    {
+      "phase": "终答",
+      "rounds": [
+        23,
+        23
+      ],
+      "tool_calls": 0
+    }
+  ],
+  "paperwiki_repository_lock_note": "Current RepositoryReader.run holds one class-level RLock across the complete operation, including network access. Outer tool overlap does not prove concurrent repository I/O.",
+  "paperwiki_context_evidence": {
+    "first_main_input_tokens": 9617,
+    "last_main_input_tokens": 255420,
+    "mean_main_input_tokens_rounded": 115155,
+    "independent_assessment_model_calls_observed": 0,
+    "summary_model_calls_observed": 0,
+    "read_tool_result_calls": 0
+  }
+}
